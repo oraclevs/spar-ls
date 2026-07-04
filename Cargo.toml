@@ -1,7 +1,12 @@
 [package]
-name    = "spar-ls"
-version = "0.1.0"
-edition = "2021"
+name        = "spar-ls"
+version     = "0.1.0"
+edition     = "2021"
+description = "Language server (LSP) for the Spar configuration language"
+license     = "MIT"
+repository  = "https://github.com/oraclevs/spar-ls"
+keywords    = ["lsp", "language-server", "spar", "configuration"]
+categories  = ["development-tools"]
 
 [[bin]]
 name = "spar-ls"
@@ -11,4 +16,4 @@ path = "src/main.rs"
 tower-lsp = "0.20"
 tokio     = { version = "1", features = ["full"] }
 serde_json = "1"
-spar      = { git = "https://github.com/oraclevs/spar", tag = "v0.1.0" }
+spar      = "0.1.0"
