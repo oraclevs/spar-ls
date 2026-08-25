@@ -598,16 +598,7 @@ fn collect_section_items_tokens(
                 }
                 match &fd.value {
                     Some(FieldValue::Expr(e)) => collect_expr_tokens(e, source, out),
-                    Some(FieldValue::Nested(nested)) => {
-                        for nf in nested {
-                            if let Some(tok) = find_ident_token(source, nf.span.start, &nf.name, TT_PROPERTY, MOD_DECLARATION) {
-                                out.push(tok);
-                            }
-                            if let Some(FieldValue::Expr(e)) = &nf.value {
-                                collect_expr_tokens(e, source, out);
-                            }
-                        }
-                    }
+                    Some(FieldValue::Nested(nested)) => collect_section_items_tokens(nested, source, out),
                     None => {}
                 }
             }

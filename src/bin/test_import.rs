@@ -15,7 +15,8 @@ fn check(label: &str, src: &str) {
                                 if let SectionItem::Field(fd) = si {
                                     if fd.name == "replica" {
                                         if let Some(FieldValue::Nested(sub)) = &fd.value {
-                                            for sf in sub {
+                                            for si in sub {
+                                                let SectionItem::Field(sf) = si else { continue };
                                                 if sf.name == "asker" {
                                                     println!("{}: asker.value = {:?}", label, sf.value.as_ref().map(|v| match v {
                                                         FieldValue::Expr(_) => "Expr".to_string(),
