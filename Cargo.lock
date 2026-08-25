@@ -531,8 +531,6 @@ dependencies = [
 [[package]]
 name = "spar"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db88dd480412aa25181e3ec13927697f665184f900051c6a2448c4564d205dc6"
 dependencies = [
  "serde",
  "serde_json",

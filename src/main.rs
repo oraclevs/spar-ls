@@ -8,7 +8,7 @@ use spar::{SparError, Span};
 use spar::evaluator::{EvalResult, Evaluator};
 use spar::formatter::{format_program, format_source, FormatConfig};
 use spar::lexer::Lexer;
-use spar::loader::{ImportLoader, collect_imports, validate_schema_imports};
+use spar::loader::{ImportLoader, collect_imports, expand_imports, validate_schema_imports};
 use spar::parser::Parser;
 use spar::resolver::{FunctionEntry, GlobalEntry, Resolver, SectionEntry, SymbolTable};
 use spar::typechecker::TypeChecker;
@@ -652,7 +652,7 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 }
                 collect_stmts_tokens(&fd.body.stmts, source, out);
             }
-            TL::Import(_) | TL::SchemaSection(_) => {}
+            TL::Import(_) | TL::SchemaSection(_) | TL::Type(_) | TL::SchemaFrom(_) => {}
         }
     }
 }
@@ -729,7 +729,7 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>) -> Vec<
 fn section_field_completions(section: &SectionEntry) -> Vec<CompletionItem> {
     section.fields.iter()
         .map(|(name, entry)| {
-            if entry.ty == SparType::Section {
+            if entry.ty == Some(SparType::Section) {
                 CompletionItem {
                     label:       name.clone(),
                     kind:        Some(CompletionItemKind::MODULE),
@@ -741,7 +741,7 @@ fn section_field_completions(section: &SectionEntry) -> Vec<CompletionItem> {
                 CompletionItem {
                     label:  name.clone(),
                     kind:   Some(CompletionItemKind::FIELD),
-                    detail: Some(format_spar_type(&entry.ty)),
+                    detail: Some(entry.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string())),
                     ..Default::default()
                 }
             }
@@ -771,10 +771,10 @@ fn format_hover_section(path: &[String], section: &SectionEntry) -> String {
     let field_list: String = section.fields
         .iter()
         .map(|(name, fentry)| {
-            if fentry.ty == SparType::Section {
+            if fentry.ty == Some(SparType::Section) {
                 format!("  {}: section  // → {}::{}", name, section_label, name)
             } else {
-                format!("  {}: {}", name, format_spar_type(&fentry.ty))
+                format!("  {}: {}", name, fentry.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()))
             }
         })
         .collect::<Vec<_>>()
@@ -915,10 +915,10 @@ fn analyze_single_file(source: &str, program: Program, mut errors: Vec<SparError
 /// Returns the canonical absolute paths of all non-schema imports declared in `program`,
 /// resolved relative to `base_dir`.
 fn extract_imported_paths(program: &spar::ast::Program, base_dir: &std::path::Path) -> Vec<PathBuf> {
-    use spar::ast::TopLevelItem;
+    use spar::ast::{TopLevelItem, ImportKind};
     program.items.iter().filter_map(|item| {
         if let TopLevelItem::Import(d) = item {
-            if !d.is_schema {
+            if !matches!(d.kind, ImportKind::Schema) {
                 let p = base_dir.join(&d.path);
                 p.canonicalize().ok()
             } else {
@@ -960,7 +960,7 @@ impl KlLanguageServer {
             }
         };
 
-        let program = match Parser::new(tokens).parse() {
+        let mut program = match Parser::new(tokens).parse() {
             Ok(p)  => p,
             Err(e) => {
                 all_errors.push(e);
@@ -976,6 +976,14 @@ impl KlLanguageServer {
                 };
             }
         };
+
+        // Splice selective / import type / asPartOf imports into local scope
+        // before anything else touches `program` — same ordering as the CLI.
+        let mut expand_loader = ImportLoader::new(base_dir);
+        if let Err(e) = expand_imports(&mut program, &mut expand_loader) {
+            all_errors.extend(e);
+            return analyze_single_file(source, program, all_errors);
+        }
 
         let mut loader = ImportLoader::new(base_dir);
         let imports = match collect_imports(&program, &mut loader) {
@@ -1438,7 +1446,7 @@ impl LanguageServer for KlLanguageServer {
                         let sec_path = prefix[1..].to_vec();
                         if let Some(section) = imported_sym.sections.get(&sec_path) {
                             if let Some(field) = section.fields.get(&word) {
-                                let value = format!("```spar\n{}: {}\n```", word, format_spar_type(&field.ty));
+                                let value = format!("```spar\n{}: {}\n```", word, field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()));
                                 return Ok(Some(Hover {
                                     contents: HoverContents::Markup(MarkupContent {
                                         kind: MarkupKind::Markdown, value,
@@ -1463,7 +1471,7 @@ impl LanguageServer for KlLanguageServer {
                             let value = format!(
                                 "```spar\n(field) {}: {} in `[{}]`\n```",
                                 word,
-                                format_spar_type(&field.ty),
+                                field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()),
                                 prefix_owned.join(".")
                             );
                             return Ok(Some(Hover {
@@ -1562,7 +1570,7 @@ impl LanguageServer for KlLanguageServer {
                 let value = format!(
                     "```spar\n(field) {}: {} in `[{}]`\n```",
                     word,
-                    format_spar_type(&field.ty),
+                    field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()),
                     path.join(".")
                 );
                 return Ok(Some(Hover {
