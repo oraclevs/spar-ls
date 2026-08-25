@@ -31,6 +31,55 @@ fn format_spar_type(ty: &SparType) -> String {
     }
 }
 
+// ── Inferred-type resolution ────────────────────────────────────────────────
+//
+// A field under a `-> TypeName` binding can omit its own type — that's not
+// a gap in what's known, just in what's written. The real type always
+// traces back through the binding chain, so hover/completion should show
+// it directly instead of a vague "inferred" placeholder.
+
+/// Walk from `path`'s top-level section's own `-> Type` binding down
+/// through nested `TypeFieldShape::Section`/`Named` entries matching each
+/// remaining path segment, to find the `TypeField` shape governing
+/// whatever's declared at `path`. `None` if nothing in the chain is
+/// type-bound (an unbound section's fields are always explicitly typed,
+/// so this only matters for the `ty: None` case in the first place).
+fn resolve_shape_for_path(symbols: &SymbolTable, path: &[String]) -> Option<Vec<spar::ast::TypeField>> {
+    let top = symbols.sections.get(&vec![path.first()?.clone()])?;
+    let type_name = top.type_binding.as_ref()?;
+    let mut fields = symbols.types.get(type_name)?.fields.clone();
+    for seg in &path[1..] {
+        let tf = fields.iter().find(|f| &f.name == seg)?;
+        fields = match &tf.shape {
+            spar::ast::TypeFieldShape::Section(nested) => nested.clone(),
+            spar::ast::TypeFieldShape::Named(other) => symbols.types.get(other)?.fields.clone(),
+            spar::ast::TypeFieldShape::Primitive(_) => return None,
+        };
+    }
+    Some(fields)
+}
+
+fn format_type_field_shape(shape: &spar::ast::TypeFieldShape) -> String {
+    match shape {
+        spar::ast::TypeFieldShape::Primitive(ty) => format_spar_type(ty),
+        spar::ast::TypeFieldShape::Section(_)     => "section".to_string(),
+        // A Named shape's own type name is more useful than a bare
+        // "section" — e.g. "PostgresType" tells the reader where to look.
+        spar::ast::TypeFieldShape::Named(name)    => name.clone(),
+    }
+}
+
+/// The display string for a field whose `FieldEntry.ty` is `None` —
+/// resolves the real type from the binding chain. Falls back to
+/// "section" only if nothing in the chain can be traced (shouldn't
+/// normally happen for valid code, since `ty: None` only parses under a
+/// binding in the first place).
+fn resolve_field_type_display(symbols: &SymbolTable, path: &[String], field_name: &str) -> String {
+    resolve_shape_for_path(symbols, path)
+        .and_then(|fields| fields.iter().find(|f| f.name == field_name).map(|tf| format_type_field_shape(&tf.shape)))
+        .unwrap_or_else(|| "section".to_string())
+}
+
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
 pub fn error_span(e: &SparError) -> &Span {
@@ -436,6 +485,7 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::PARAMETER,  // 2
     SemanticTokenType::PROPERTY,   // 3
     SemanticTokenType::NAMESPACE,  // 4
+    SemanticTokenType::TYPE,       // 5
 ];
 
 const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -447,6 +497,7 @@ const TT_FUNCTION: u32  = 1;
 const TT_PARAMETER: u32 = 2;
 const TT_PROPERTY: u32  = 3;
 const TT_NAMESPACE: u32 = 4;
+const TT_TYPE: u32      = 5;
 const MOD_NONE: u32        = 0;
 const MOD_DECLARATION: u32 = 1;
 
@@ -632,6 +683,10 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                         search_from = byte_off + seg.len();
                     }
                 }
+                // `[Section] -> TypeName { ... }` — TypeName gets its own token.
+                if let Some(binding) = &sd.type_binding {
+                    out.push(raw_from_span(&binding.span, TT_TYPE, MOD_NONE));
+                }
                 collect_section_items_tokens(&sd.items, source, out);
             }
             TL::Function(fd) => {
@@ -643,7 +698,61 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 }
                 collect_stmts_tokens(&fd.body.stmts, source, out);
             }
-            TL::Import(_) | TL::SchemaSection(_) | TL::Type(_) | TL::SchemaFrom(_) => {}
+            TL::Type(td) => {
+                out.push(raw_from_span(&td.name_span, TT_TYPE, MOD_DECLARATION));
+                collect_type_fields_tokens(&td.fields, source, out);
+            }
+            TL::SchemaSection(sd) => {
+                if let Some(tok) = find_ident_token(source, sd.span.start, &sd.name, TT_TYPE, MOD_DECLARATION) {
+                    out.push(tok);
+                }
+                collect_schema_fields_tokens(&sd.fields, source, out);
+            }
+            TL::SchemaFrom(sf) => {
+                if let Some(tok) = find_ident_token(source, sf.span.start, &sf.name, TT_TYPE, MOD_DECLARATION) {
+                    out.push(tok);
+                }
+                out.push(raw_from_span(&sf.source_type_span, TT_TYPE, MOD_NONE));
+            }
+            TL::Import(_) => {}
+        }
+    }
+}
+
+/// A `type [Name]{ ... }` declaration's own fields — property names, and a
+/// `Named(OtherType)` shape reference gets its own TT_TYPE token (found by
+/// text search from the field's span, same "search near a known offset"
+/// pattern the rest of this file already uses — TypeField carries no
+/// dedicated span for just the type-name portion of `field: OtherType;`).
+fn collect_type_fields_tokens(fields: &[spar::ast::TypeField], source: &str, out: &mut Vec<RawToken>) {
+    use spar::ast::TypeFieldShape;
+    for f in fields {
+        if let Some(tok) = find_ident_token(source, f.span.start, &f.name, TT_PROPERTY, MOD_DECLARATION) {
+            out.push(tok);
+        }
+        match &f.shape {
+            TypeFieldShape::Primitive(_) => {}
+            TypeFieldShape::Named(other) => {
+                if let Some(tok) = find_ident_token(source, f.span.start, other, TT_TYPE, MOD_NONE) {
+                    out.push(tok);
+                }
+            }
+            TypeFieldShape::Section(nested) => collect_type_fields_tokens(nested, source, out),
+        }
+    }
+}
+
+/// Same idea as `collect_type_fields_tokens`, for `Schema [Name]{ ... }`
+/// field bodies (`SchemaFieldShape` has no `Named` variant, so there's no
+/// type-reference token to emit — just property names, recursively).
+fn collect_schema_fields_tokens(fields: &[spar::ast::SchemaField], source: &str, out: &mut Vec<RawToken>) {
+    use spar::ast::SchemaFieldShape;
+    for f in fields {
+        if let Some(tok) = find_ident_token(source, f.span.start, &f.name, TT_PROPERTY, MOD_DECLARATION) {
+            out.push(tok);
+        }
+        if let SchemaFieldShape::Section(nested) = &f.shape {
+            collect_schema_fields_tokens(nested, source, out);
         }
     }
 }
@@ -717,7 +826,7 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>) -> Vec<
         .collect()
 }
 
-fn section_field_completions(section: &SectionEntry) -> Vec<CompletionItem> {
+fn section_field_completions(symbols: &SymbolTable, path: &[String], section: &SectionEntry) -> Vec<CompletionItem> {
     section.fields.iter()
         .map(|(name, entry)| {
             if entry.ty == Some(SparType::Section) {
@@ -732,7 +841,8 @@ fn section_field_completions(section: &SectionEntry) -> Vec<CompletionItem> {
                 CompletionItem {
                     label:  name.clone(),
                     kind:   Some(CompletionItemKind::FIELD),
-                    detail: Some(entry.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string())),
+                    detail: Some(entry.ty.as_ref().map(format_spar_type)
+                        .unwrap_or_else(|| resolve_field_type_display(symbols, path, name))),
                     ..Default::default()
                 }
             }
@@ -757,7 +867,7 @@ fn format_hover_global(name: &str, entry: &GlobalEntry) -> String {
     format!("```spar\n(var) {}: {}\n```", name, ty_str)
 }
 
-fn format_hover_section(path: &[String], section: &SectionEntry) -> String {
+fn format_hover_section(symbols: &SymbolTable, path: &[String], section: &SectionEntry) -> String {
     let section_label = path.join(".");
     let field_list: String = section.fields
         .iter()
@@ -765,7 +875,9 @@ fn format_hover_section(path: &[String], section: &SectionEntry) -> String {
             if fentry.ty == Some(SparType::Section) {
                 format!("  {}: section  // → {}::{}", name, section_label, name)
             } else {
-                format!("  {}: {}", name, fentry.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()))
+                let ty_str = fentry.ty.as_ref().map(format_spar_type)
+                    .unwrap_or_else(|| resolve_field_type_display(symbols, path, name));
+                format!("  {}: {}", name, ty_str)
             }
         })
         .collect::<Vec<_>>()
@@ -1399,7 +1511,7 @@ impl LanguageServer for KlLanguageServer {
                         // hovering on section name: base::[Minor]
                         let sec_path = vec![word.clone()];
                         if let Some(section) = imported_sym.sections.get(&sec_path) {
-                            let value = format_hover_section(&sec_path, section);
+                            let value = format_hover_section(imported_sym, &sec_path, section);
                             return Ok(Some(Hover {
                                 contents: HoverContents::Markup(MarkupContent {
                                     kind: MarkupKind::Markdown, value,
@@ -1437,7 +1549,9 @@ impl LanguageServer for KlLanguageServer {
                         let sec_path = prefix[1..].to_vec();
                         if let Some(section) = imported_sym.sections.get(&sec_path) {
                             if let Some(field) = section.fields.get(&word) {
-                                let value = format!("```spar\n{}: {}\n```", word, field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()));
+                                let ty_str = field.ty.as_ref().map(format_spar_type)
+                                    .unwrap_or_else(|| resolve_field_type_display(imported_sym, &sec_path, &word));
+                                let value = format!("```spar\n{}: {}\n```", word, ty_str);
                                 return Ok(Some(Hover {
                                     contents: HoverContents::Markup(MarkupContent {
                                         kind: MarkupKind::Markdown, value,
@@ -1459,10 +1573,12 @@ impl LanguageServer for KlLanguageServer {
                     let prefix_owned: Vec<String> = prefix.iter().map(|s| s.clone()).collect();
                     if let Some(section) = symbols.sections.get(&prefix_owned) {
                         if let Some(field) = section.fields.get(&word) {
+                            let ty_str = field.ty.as_ref().map(format_spar_type)
+                                .unwrap_or_else(|| resolve_field_type_display(symbols, &prefix_owned, &word));
                             let value = format!(
                                 "```spar\n(field) {}: {} in `[{}]`\n```",
                                 word,
-                                field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()),
+                                ty_str,
                                 prefix_owned.join(".")
                             );
                             return Ok(Some(Hover {
@@ -1495,7 +1611,7 @@ impl LanguageServer for KlLanguageServer {
         if !word.is_empty() {
             let top_key = vec![word.clone()];
             if let Some(section) = symbols.sections.get(&top_key) {
-                let value = format_hover_section(&top_key, section);
+                let value = format_hover_section(symbols, &top_key, section);
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind:  MarkupKind::Markdown,
@@ -1510,7 +1626,7 @@ impl LanguageServer for KlLanguageServer {
         if !word.is_empty() {
             for (path, section) in &symbols.sections {
                 if path.len() > 1 && path.last().map(|s| s.as_str()) == Some(word.as_str()) {
-                    let value = format_hover_section(path, section);
+                    let value = format_hover_section(symbols, path, section);
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind:  MarkupKind::Markdown,
@@ -1558,10 +1674,12 @@ impl LanguageServer for KlLanguageServer {
             });
 
             if let Some((path, field)) = field_hover {
+                let ty_str = field.ty.as_ref().map(format_spar_type)
+                    .unwrap_or_else(|| resolve_field_type_display(symbols, &path, &word));
                 let value = format!(
                     "```spar\n(field) {}: {} in `[{}]`\n```",
                     word,
-                    field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| "inferred".to_string()),
+                    ty_str,
                     path.join(".")
                 );
                 return Ok(Some(Hover {
@@ -1658,7 +1776,7 @@ impl LanguageServer for KlLanguageServer {
         if let Some(path) = path_before_cursor(&state.source, pos) {
             if let Some(section) = symbols.sections.get(&path) {
                 return Ok(Some(CompletionResponse::Array(
-                    section_field_completions(section),
+                    section_field_completions(symbols, &path, section),
                 )));
             }
 
@@ -1674,7 +1792,7 @@ impl LanguageServer for KlLanguageServer {
                         let section_path = path[1..].to_vec();
                         if let Some(section) = imported_sym.sections.get(&section_path) {
                             return Ok(Some(CompletionResponse::Array(
-                                section_field_completions(section),
+                                section_field_completions(imported_sym, &section_path, section),
                             )));
                         }
                     }
@@ -2319,5 +2437,134 @@ mod tests {
             .filter(|t| t.token_type == TT_VARIABLE)
             .collect();
         assert!(var_toks.len() >= 2, "expected x decl + x ref, got {}", var_toks.len());
+    }
+
+    #[test]
+    fn semantic_tokens_type_decl_name_classified_as_type() {
+        let src = "type [PostgresType]{ image: str; }";
+        let tokens = decode_semantic_tokens(src);
+        let tok = find_tok(&tokens, "PostgresType", src).expect("PostgresType not found");
+        assert_eq!(tok.token_type, TT_TYPE);
+    }
+
+    #[test]
+    fn semantic_tokens_named_type_field_reference_classified_as_type() {
+        let src = "type [Border]{ width: int; }\ntype [Decoration]{ border: Border; }";
+        let tokens = decode_semantic_tokens(src);
+        let lines: Vec<&str> = src.lines().collect();
+        let border_type_toks = tokens.iter().filter(|t| {
+            let ln = t.line as usize;
+            if ln >= lines.len() { return false; }
+            let line = lines[ln];
+            let start = t.start_char as usize;
+            let end = start + t.length as usize;
+            end <= line.len() && &line[start..end] == "Border" && t.token_type == TT_TYPE
+        }).count();
+        // One for the `[Border]` declaration, one for the `border: Border;` reference.
+        assert_eq!(border_type_toks, 2, "expected both the Border declaration and its reference to be TT_TYPE");
+    }
+
+    #[test]
+    fn semantic_tokens_section_type_binding_classified_as_type() {
+        let src = "type [Human]{ name: str; }\n[Man] -> Human {\n    name: \"John\";\n};";
+        let tokens = decode_semantic_tokens(src);
+        let tok = find_tok(&tokens, "Human", src).filter(|t| t.token_type == TT_TYPE);
+        assert!(tok.is_some(), "expected the `-> Human` binding to be classified as a type");
+    }
+
+    #[test]
+    fn semantic_tokens_selectively_imported_names_classified_by_real_kind() {
+        // The user's actual ask: "even in the import system" — a
+        // selectively-imported name should get its real semantic color,
+        // not fall through as plain text. After expand_imports splices
+        // the requested names in, they're ordinary Type/Section
+        // declarations positioned at their own spot in the import braces
+        // (see spar's retag_top_level_span), so they get colored exactly
+        // like a locally-declared type/section would.
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("spar_ls_import_tok_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("shared.spar"),
+            "export type [PostgresType]{ image: str; }\nexport [Colors]{ red: str = \"#f00\"; };\n",
+        ).unwrap();
+        let src = "import { PostgresType, Colors } from \"shared.spar\";\n";
+        let tokens = spar::lexer::Lexer::new(src).tokenize().unwrap();
+        let mut program = spar::parser::Parser::new(tokens).parse().unwrap();
+        let mut loader = spar::loader::ImportLoader::new(&dir);
+        spar::loader::expand_imports(&mut program, &mut loader).expect("expand must succeed");
+
+        let mut raw: Vec<RawToken> = Vec::new();
+        collect_tokens_from_program(&program, src, &mut raw);
+        raw.sort_by_key(|t| (t.line, t.start_char));
+
+        assert!(raw.iter().any(|t| t.token_type == TT_TYPE),
+            "expected the imported PostgresType to get a TT_TYPE token");
+        assert!(raw.iter().any(|t| t.token_type == TT_NAMESPACE),
+            "expected the imported Colors section to get a TT_NAMESPACE token");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_tokens_schema_section_name_classified_as_type() {
+        let src = "@SchemaFile\nSchema [Container]{ x?: str; }\n";
+        let tokens = decode_semantic_tokens(src);
+        let tok = find_tok(&tokens, "Container", src).expect("Container not found");
+        assert_eq!(tok.token_type, TT_TYPE);
+    }
+
+    fn resolve_src(src: &str) -> SymbolTable {
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let prog = Parser::new(tokens).parse().expect("parse");
+        Resolver::new().resolve(&prog, &[]).expect("resolve")
+    }
+
+    #[test]
+    fn resolve_field_type_display_resolves_top_level_inferred_field() {
+        let src = concat!(
+            "type [Human]{ name: str; age: int; }\n",
+            "[Man] -> Human {\n",
+            "    name: \"John\";\n",
+            "    age: 29;\n",
+            "};\n",
+        );
+        let symbols = resolve_src(src);
+        let path = vec!["Man".to_string()];
+        assert_eq!(resolve_field_type_display(&symbols, &path, "name"), "str");
+        assert_eq!(resolve_field_type_display(&symbols, &path, "age"), "int");
+    }
+
+    #[test]
+    fn resolve_field_type_display_resolves_nested_inferred_field() {
+        let src = concat!(
+            "type [EnvironmentType]{ nodeEnv: str; port: str; }\n",
+            "type [ServiceType]{ image: str; environment: EnvironmentType; }\n",
+            "[Api] -> ServiceType {\n",
+            "    image: \"my-api\";\n",
+            "    environment: {\n",
+            "        nodeEnv: \"production\";\n",
+            "        port: \"3000\";\n",
+            "    };\n",
+            "};\n",
+        );
+        let symbols = resolve_src(src);
+        let path = vec!["Api".to_string(), "environment".to_string()];
+        assert_eq!(resolve_field_type_display(&symbols, &path, "nodeEnv"), "str");
+        assert_eq!(resolve_field_type_display(&symbols, &path, "port"), "str");
+    }
+
+    #[test]
+    fn resolve_field_type_display_named_shape_shows_type_name() {
+        let src = concat!(
+            "type [Border]{ width: int; }\n",
+            "type [Decoration]{ border: Border; }\n",
+            "[Style] -> Decoration {\n",
+            "    border: { width: 2; };\n",
+            "};\n",
+        );
+        let symbols = resolve_src(src);
+        let path = vec!["Style".to_string()];
+        assert_eq!(resolve_field_type_display(&symbols, &path, "border"), "Border");
     }
 }
