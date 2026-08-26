@@ -748,6 +748,20 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 // token classification — that's deferred LSP feature work.
                 out.push(raw_from_span(&ed.name_span, TT_TYPE, MOD_DECLARATION));
             }
+            TL::FunctionGroup(gd) => {
+                if let Some(tok) = find_ident_token(source, gd.span.start, &gd.name, TT_NAMESPACE, MOD_DECLARATION) {
+                    out.push(tok);
+                }
+                for f in &gd.functions {
+                    out.push(raw_from_span(&f.name_span, TT_FUNCTION, MOD_DECLARATION));
+                    for param in &f.params {
+                        if let Some(tok) = find_ident_token(source, param.span.start, &param.name, TT_PARAMETER, MOD_DECLARATION) {
+                            out.push(tok);
+                        }
+                    }
+                    collect_stmts_tokens(&f.body.stmts, source, out);
+                }
+            }
         }
     }
 }
