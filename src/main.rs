@@ -28,6 +28,7 @@ fn format_spar_type(ty: &SparType) -> String {
         SparType::Bool        => "bool".to_string(),
         SparType::List(inner) => format!("[{}]", format_spar_type(inner)),
         SparType::Section     => "section".to_string(),
+        SparType::Named(name) => name.clone(),
     }
 }
 
@@ -1130,11 +1131,12 @@ impl KlLanguageServer {
             }
         };
 
-        if let Err(e) = TypeChecker::check_with_imports(&program, &sym, &imports) {
-            all_errors.extend(e);
-        }
+        let schema_bindings = match validate_schema_imports(&program, base_dir) {
+            Ok(b) => b,
+            Err(e) => { all_errors.extend(e); HashMap::new() }
+        };
 
-        if let Err(e) = validate_schema_imports(&program, base_dir) {
+        if let Err(e) = TypeChecker::check_with_schema(&program, &sym, schema_bindings) {
             all_errors.extend(e);
         }
 
