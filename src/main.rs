@@ -425,6 +425,16 @@ pub fn find_index_elem_type_at_offset(
                     if let StringPart::Expr(e) = p { expr_index_elem(e, symbols, offset) } else { None }
                 })
             }
+            Expr::Object(items, _) => {
+                use spar::ast::{SectionItem, FieldValue};
+                items.iter().find_map(|item| match item {
+                    SectionItem::Field(f) => match &f.value {
+                        Some(FieldValue::Expr(e)) => expr_index_elem(e, symbols, offset),
+                        _ => None,
+                    },
+                    SectionItem::Spread(sp) => expr_index_elem(&sp.expr, symbols, offset),
+                })
+            }
             Expr::Literal(_) | Expr::NamespaceRef(_) => None,
         }
     }
@@ -602,6 +612,22 @@ fn collect_expr_tokens(expr: &spar::ast::Expr, source: &str, out: &mut Vec<RawTo
                 if let StringPart::Expr(e) = part { collect_expr_tokens(e, source, out); }
             }
         }
+        Expr::Object(items, _) => {
+            use spar::ast::{SectionItem, FieldValue};
+            // Minimal, structurally-correct recursion — no new semantic-token
+            // classification for object-literal field names here; that's
+            // deferred LSP/highlighter work, tracked separately.
+            for item in items {
+                match item {
+                    SectionItem::Field(f) => {
+                        if let Some(FieldValue::Expr(e)) = &f.value {
+                            collect_expr_tokens(e, source, out);
+                        }
+                    }
+                    SectionItem::Spread(sp) => collect_expr_tokens(&sp.expr, source, out),
+                }
+            }
+        }
         Expr::Literal(_) => {}
     }
 }
@@ -716,6 +742,12 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 out.push(raw_from_span(&sf.source_type_span, TT_TYPE, MOD_NONE));
             }
             TL::Import(_) => {}
+            TL::Enum(ed) => {
+                // Minimal: highlight the enum's own name as a type
+                // declaration, mirroring TL::Type above. No variant-level
+                // token classification — that's deferred LSP feature work.
+                out.push(raw_from_span(&ed.name_span, TT_TYPE, MOD_DECLARATION));
+            }
         }
     }
 }
