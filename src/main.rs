@@ -435,6 +435,7 @@ pub fn find_index_elem_type_at_offset(
                     SectionItem::Spread(sp) => expr_index_elem(&sp.expr, symbols, offset),
                 })
             }
+            Expr::FieldAccess { base, .. } => expr_index_elem(base, symbols, offset),
             Expr::Literal(_) | Expr::NamespaceRef(_) => None,
         }
     }
@@ -627,6 +628,10 @@ fn collect_expr_tokens(expr: &spar::ast::Expr, source: &str, out: &mut Vec<RawTo
                     SectionItem::Spread(sp) => collect_expr_tokens(&sp.expr, source, out),
                 }
             }
+        }
+        Expr::FieldAccess { base, field_span, .. } => {
+            collect_expr_tokens(base, source, out);
+            out.push(raw_from_span(field_span, TT_VARIABLE, MOD_NONE));
         }
         Expr::Literal(_) => {}
     }
@@ -2329,7 +2334,7 @@ mod tests {
 
     #[test]
     fn four_segment_namespace_path_produces_no_diagnostics() {
-        let src = "[A]{\n    b: section = {\n        c: section = {\n            d: section = {\n                e: int = 1;\n            };\n        };\n    };\n};\nvar x: int = A::b::c::d::e;";
+        let src = "[A]{\n    b: section = {\n        c: section = {\n            d: section = {\n                e: int = 1;\n            };\n        };\n    };\n};\nvar x: int = A.b.c.d.e;";
         let state = KlLanguageServer::analyze(src, std::path::Path::new("."));
         let diags = state.diagnostics();
         assert!(
