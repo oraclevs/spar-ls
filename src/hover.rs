@@ -1,5 +1,60 @@
 // ── AST hover helpers ─────────────────────────────────────────────────────────
 
+fn expr_span(expr: &spar::ast::Expr) -> &Span {
+    use spar::ast::Expr;
+    match expr {
+        Expr::Literal(l) => match l { spar::ast::Literal::Int(_) | spar::ast::Literal::Float(_) | spar::ast::Literal::Bool(_) => panic!("literal span is carried by its parent") },
+        Expr::String(s) => &s.span,
+        Expr::NamespaceRef(n) => &n.span,
+        Expr::FnCall(f) => &f.span,
+        Expr::BinaryOp(b) => &b.span,
+        Expr::List(_, s) | Expr::Grouped(_, s) | Expr::Object(_, s) => s,
+        Expr::Call { span, .. } | Expr::Unary { span, .. } | Expr::Comprehension { span, .. }
+        | Expr::Index { span, .. } | Expr::FieldAccess { span, .. } => span,
+    }
+}
+
+/// Find the smallest spanned expression containing the cursor. Literal nodes
+/// have no independent span in the AST, so their enclosing expression is used.
+fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::ast::Expr> {
+    use spar::ast::{Expr, FieldValue, ReturnValue, SectionItem, StringPart};
+    fn search(e: &Expr, off: usize) -> Option<&Expr> {
+        let contains = !matches!(e, Expr::Literal(_)) && expr_span(e).start <= off && off <= expr_span(e).end;
+        if !contains { return None; }
+        let child = match e {
+            Expr::BinaryOp(b) => search(&b.lhs, off).or_else(|| search(&b.rhs, off)),
+            Expr::Unary { operand, .. } | Expr::Grouped(operand, _) => search(operand, off),
+            Expr::List(xs, _) => xs.iter().find_map(|x| search(x, off)),
+            Expr::FnCall(f) => f.args.iter().find_map(|x| search(x, off)),
+            Expr::Call { args, .. } => args.iter().find_map(|x| search(&x.value, off)),
+            Expr::Comprehension { source, body, .. } => search(source, off).or_else(|| search(body, off)),
+            Expr::Index { source, index, .. } => search(source, off).or_else(|| search(index, off)),
+            Expr::FieldAccess { base, .. } => search(base, off),
+            Expr::String(s) => s.parts.iter().find_map(|p| if let StringPart::Expr(x)=p { search(x,off) } else { None }),
+            Expr::Object(items, _) => items.iter().find_map(|i| match i { SectionItem::Field(f) => match &f.value { Some(FieldValue::Expr(x)) => search(x,off), _=>None }, SectionItem::Spread(s)=>search(&s.expr,off) }),
+            Expr::Literal(_) | Expr::NamespaceRef(_) => None,
+        };
+        child.or(Some(e))
+    }
+    fn stmts(ss: &[FuncStmt], off: usize) -> Option<&Expr> {
+        ss.iter().find_map(|s| match s {
+            FuncStmt::LocalVar(v) => search(&v.value,off),
+            FuncStmt::Return(ReturnValue::Expr(e),_) => search(e,off),
+            FuncStmt::Return(ReturnValue::SectionBlock(fs),_) => fs.iter().find_map(|f|search(&f.value,off)),
+            FuncStmt::If(i) => search(&i.condition,off).or_else(||stmts(&i.then_stmts,off)).or_else(||stmts(&i.else_stmts,off)),
+            FuncStmt::For { iterable, body, .. } => search(iterable,off).or_else(||stmts(body,off)),
+        })
+    }
+    program.items.iter().find_map(|item| match item {
+        TopLevelItem::Var(v) => v.value.as_ref().and_then(|e|search(e,offset)),
+        TopLevelItem::Dynamic(v) => v.value.as_ref().and_then(|e|search(e,offset)),
+        TopLevelItem::Section(s) => s.items.iter().find_map(|i| match i { SectionItem::Field(f)=>match &f.value {Some(FieldValue::Expr(e))=>search(e,offset), _=>None}, SectionItem::Spread(s)=>search(&s.expr,offset)}),
+        TopLevelItem::Function(f) => stmts(&f.body.stmts,offset),
+        TopLevelItem::FunctionGroup(g) => g.functions.iter().find_map(|f|stmts(&f.body.stmts,offset)),
+        _ => None,
+    })
+}
+
 /// Walk all function bodies in `program` and return `Some(has_else)` if any
 /// `IfStmt` whose span contains `offset` is found.
 pub fn find_if_at_offset(program: &Program, offset: usize) -> Option<bool> {

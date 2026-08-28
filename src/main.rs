@@ -323,6 +323,7 @@ pub fn lsp_pos_to_byte_offset(source: &str, pos: Position) -> usize {
 
 include!("hover.rs");
 include!("completion.rs");
+include!("definition.rs");
 include!("semantic_tokens.rs");
 // ── Import hover / completion helpers ────────────────────────────────────────
 
@@ -518,6 +519,7 @@ impl LanguageServer for SparLanguageServer {
                     },
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![":".to_string()]),
                     resolve_provider: Some(false),
@@ -1054,7 +1056,24 @@ impl LanguageServer for SparLanguageServer {
             }));
         }
 
-        // Case 8: index expression — find `[...]` at cursor and return element type
+        // Case 8: any expression whose type the typechecker can infer.
+        if let Some(ast) = &state.ast {
+            let offset = lsp_pos_to_byte_offset(&state.source, pos);
+            if let Some(expr) = find_expression_at_offset(ast, offset) {
+                if let Some(ty) = TypeChecker::infer_expression(expr, symbols) {
+                    let value = format!("```spar\n(expression): {}\n```", format_spar_type(&ty));
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+        }
+
+        // Case 9: index expression — find `[...]` at cursor and return element type
         if let Some(ast) = &state.ast {
             let offset = lsp_pos_to_byte_offset(&state.source, pos);
             if let Some(elem_ty) = find_index_elem_type_at_offset(ast, symbols, offset) {
@@ -1166,6 +1185,19 @@ impl LanguageServer for SparLanguageServer {
         }
 
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(definition_at(&uri, state, pos).map(GotoDefinitionResponse::Scalar))
     }
 
     async fn semantic_tokens_full(
@@ -1918,11 +1950,11 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tokens_section_name_classified_as_namespace() {
+    fn semantic_tokens_section_name_classified_as_section() {
         let src = "[Server]{ host: str = \"x\"; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Server", src).expect("Server not found");
-        assert_eq!(tok.token_type, TT_NAMESPACE);
+        assert_eq!(tok.token_type, TT_SECTION);
     }
 
     #[test]
@@ -2033,11 +2065,52 @@ mod tests {
             "expected the imported PostgresType to get a TT_TYPE token"
         );
         assert!(
-            raw.iter().any(|t| t.token_type == TT_NAMESPACE),
-            "expected the imported Colors section to get a TT_NAMESPACE token"
+            raw.iter().any(|t| t.token_type == TT_SECTION),
+            "expected the imported Colors section to get a TT_SECTION token"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_tokens_keywords_and_builtin_types_are_distinct() {
+        let src = "export var port: int = 8080;";
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(
+            find_tok(&tokens, "export", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(
+            find_tok(&tokens, "var", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(find_tok(&tokens, "int", src).unwrap().token_type, TT_TYPE);
+    }
+
+    #[test]
+    fn definition_resolves_local_global_reference() {
+        let src = "var answer: int = 42;\nvar copy: int = answer;\n";
+        let dir = std::env::temp_dir();
+        let uri = Url::from_file_path(dir.join("definition_local.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        let location = definition_at(&uri, &state, Position::new(1, 18)).expect("definition");
+        assert_eq!(location.uri, uri);
+        assert_eq!(location.range.start.line, 0);
+    }
+
+    #[test]
+    fn definition_resolves_imported_function_cross_file() {
+        let dir = std::env::temp_dir().join(format!("spar_ls_definition_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let imported_path = dir.join("base.spar");
+        std::fs::write(&imported_path, "function make() -> int { return 1; }\n").unwrap();
+        let src = "import \"base.spar\";\nvar value: int = base::make();\n";
+        let uri = Url::from_file_path(dir.join("main.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        let location = definition_at(&uri, &state, Position::new(1, 24)).expect("definition");
+        assert_eq!(location.uri, Url::from_file_path(&imported_path).unwrap());
+        assert_eq!(location.range.start.line, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

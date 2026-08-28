@@ -7,6 +7,8 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::PROPERTY,  // 3
     SemanticTokenType::NAMESPACE, // 4
     SemanticTokenType::TYPE,      // 5
+    SemanticTokenType::new("section"), // 6
+    SemanticTokenType::KEYWORD,   // 7
 ];
 
 const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -19,6 +21,8 @@ const TT_PARAMETER: u32 = 2;
 const TT_PROPERTY: u32 = 3;
 const TT_NAMESPACE: u32 = 4;
 const TT_TYPE: u32 = 5;
+const TT_SECTION: u32 = 6;
+const TT_KEYWORD: u32 = 7;
 const MOD_NONE: u32 = 0;
 const MOD_DECLARATION: u32 = 1;
 
@@ -188,7 +192,7 @@ fn collect_expr_tokens(expr: &spar::ast::Expr, source: &str, out: &mut Vec<RawTo
             base, field_span, ..
         } => {
             collect_expr_tokens(base, source, out);
-            out.push(raw_from_span(field_span, TT_VARIABLE, MOD_NONE));
+            out.push(raw_from_span(field_span, TT_PROPERTY, MOD_NONE));
         }
         Expr::Literal(_) => {}
     }
@@ -313,7 +317,7 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                             line,
                             start_char: col,
                             length: seg.len() as u32,
-                            token_type: TT_NAMESPACE,
+                            token_type: TT_SECTION,
                             modifiers: MOD_DECLARATION,
                         });
                         search_from = byte_off + seg.len();
@@ -395,6 +399,46 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
             }
         }
     }
+    collect_language_words(source, out);
+}
+
+fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
+    const KEYWORDS: &[&str] = &[
+        "var", "export", "import", "dynamic", "as", "private", "if", "else", "for",
+        "in", "return", "function", "type", "Schema", "SchemaFrom", "asPartOf", "from",
+    ];
+    const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "section"];
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &source[start..i];
+            let token_type = if KEYWORDS.contains(&word) {
+                Some(TT_KEYWORD)
+            } else if BUILTIN_TYPES.contains(&word) {
+                Some(TT_TYPE)
+            } else {
+                None
+            };
+            if let Some(token_type) = token_type {
+                let (line, col) = byte_to_lsp_pos(source, start);
+                out.push(RawToken {
+                    line,
+                    start_char: col,
+                    length: word.len() as u32,
+                    token_type,
+                    modifiers: MOD_NONE,
+                });
+            }
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// A `type [Name]{ ... }` declaration's own fields — property names, and a
@@ -447,4 +491,3 @@ fn collect_schema_fields_tokens(
         }
     }
 }
-
