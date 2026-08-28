@@ -1,12 +1,16 @@
-use spar::ast::{TopLevelItem, SectionItem, FieldValue};
+use spar::ast::{FieldValue, SectionItem, TopLevelItem};
 use spar::lexer::Lexer;
 use spar::parser::Parser;
 
 fn check(label: &str, src: &str) {
     match Lexer::new(src).tokenize() {
-        Err(e) => { println!("{}: LEX ERROR: {:?}", label, e); return; }
+        Err(e) => {
+            println!("{}: LEX ERROR: {:?}", label, e);
+        }
         Ok(tokens) => match Parser::new(tokens).parse() {
-            Err(e) => { println!("{}: PARSE ERROR: {:?}", label, e); return; }
+            Err(e) => {
+                println!("{}: PARSE ERROR: {:?}", label, e);
+            }
             Ok(program) => {
                 for item in &program.items {
                     if let TopLevelItem::Section(s) = item {
@@ -18,14 +22,23 @@ fn check(label: &str, src: &str) {
                                             for si in sub {
                                                 let SectionItem::Field(sf) = si else { continue };
                                                 if sf.name == "asker" {
-                                                    println!("{}: asker.value = {:?}", label, sf.value.as_ref().map(|v| match v {
-                                                        FieldValue::Expr(_) => "Expr".to_string(),
-                                                        FieldValue::Nested(n) => format!("Nested({})", n.len()),
-                                                    }));
+                                                    println!(
+                                                        "{}: asker.value = {:?}",
+                                                        label,
+                                                        sf.value.as_ref().map(|v| match v {
+                                                            FieldValue::Expr(_) =>
+                                                                "Expr".to_string(),
+                                                            FieldValue::Nested(n) =>
+                                                                format!("Nested({})", n.len()),
+                                                        })
+                                                    );
                                                     return;
                                                 }
                                             }
-                                            println!("{}: asker NOT FOUND in replica sub-fields", label);
+                                            println!(
+                                                "{}: asker NOT FOUND in replica sub-fields",
+                                                label
+                                            );
                                         }
                                     }
                                 }
@@ -35,13 +48,17 @@ fn check(label: &str, src: &str) {
                 }
                 println!("{}: Database section or replica field not found", label);
             }
-        }
+        },
     }
 }
 
 fn main() {
-    // Slice from validated.kl with exactly the fields around the problem
-    let src = std::fs::read_to_string("/home/occ/Projects/temp/keel_temp/validated.kl").unwrap();
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: test_import <file.spar>");
+        std::process::exit(2);
+    });
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
     // Get just the Database section block
     let db_start = src.find("[Database]").unwrap();
     let db_end = src[db_start..].find("\n};").unwrap() + db_start + 3;

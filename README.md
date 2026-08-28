@@ -69,8 +69,8 @@ local lspconfig = require('lspconfig')
 local configs   = require('lspconfig.configs')
 
 -- Register spar-ls (not yet in upstream lspconfig)
-if not configs.keel_ls then
-  configs.keel_ls = {
+if not configs.spar_ls then
+  configs.spar_ls = {
     default_config = {
       cmd       = { 'spar-ls' },
       filetypes = { 'spar' },
@@ -83,7 +83,7 @@ end
 -- Associate .spar files with the 'spar' filetype
 vim.filetype.add({ extension = { spar = 'spar' } })
 
-lspconfig.keel_ls.setup {}
+lspconfig.spar_ls.setup {}
 ```
 
 > Neovim integration has not been formally tested by the project — contributions and bug reports are welcome.
