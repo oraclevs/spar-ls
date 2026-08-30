@@ -1437,7 +1437,7 @@ mod tests {
             "    quiet: true;\n",
             "    /* complete here */\n",
             "    run { echo deploy; };\n",
-            "}\n",
+            "};\n",
         );
         let labels = task_completion_labels(src, "/* complete here */");
         assert!(labels.contains(&"dependsOn".to_string()));
@@ -1450,9 +1450,9 @@ mod tests {
     #[test]
     fn completion_suggests_other_tasks_inside_depends_on() {
         let src = concat!(
-            "task [Build] { run { cargo build; }; }\n",
-            "task [Test] { run { cargo test; }; }\n",
-            "task [Deploy] { dependsOn: [Build]; run { echo deploy; }; }\n",
+            "task [Build] { run { cargo build; }; };\n",
+            "task [Test] { run { cargo test; }; };\n",
+            "task [Deploy] { dependsOn: [Build]; run { echo deploy; }; };\n",
         );
         let offset = src.find("Build]; run").expect("dependency") + "Build".len();
         let tokens = Lexer::new(src).tokenize().expect("lex");
@@ -1473,7 +1473,7 @@ mod tests {
         let src = concat!(
             "var environment: str = \"global\";\n",
             "var region: str = \"west\";\n",
-            "task [Deploy](environment: str) { run { echo ${environment}; }; }\n",
+            "task [Deploy](environment: str) { run { echo ${environment}; }; };\n",
         );
         let offset = src.rfind("environment}").expect("interpolation") + 2;
         let tokens = Lexer::new(src).tokenize().expect("lex");
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn completion_recovers_task_params_immediately_after_interpolation_start() {
-        let valid = "task [Deploy](environment: str, *extra: str) { run { echo ok; }; }\n";
+        let valid = "task [Deploy](environment: str, *extra: str) { run { echo ok; }; };\n";
         let symbols = resolve_src(valid);
         let src = "task [Deploy](environment: str, *extra: str) { run { echo ${";
         let items = task_completion_items(None, src, &symbols, src.len())
@@ -1516,12 +1516,12 @@ mod tests {
     #[test]
     fn hover_on_task_name_shows_signature_and_description() {
         let src = concat!(
-            "task [Build] { run { cargo build; }; }\n",
+            "task [Build] { run { cargo build; }; };\n",
             "task [Deploy](environment: str = \"staging\", *extra: str) {\n",
             "    description: \"Deploy to an environment\";\n",
             "    dependsOn: [Build];\n",
             "    run { ./deploy.sh ${environment} ${extra}; };\n",
-            "}\n",
+            "};\n",
         );
         let hover = task_hover(src, "Deploy", 0);
         assert!(hover.contains("task [Deploy](environment: str = \"staging\", *extra: str)"));
@@ -1534,7 +1534,7 @@ mod tests {
         let src = concat!(
             "task [Deploy](environment: str = \"staging\", *extra: str) {\n",
             "    run { ./deploy.sh ${environment} ${extra}; };\n",
-            "}\n",
+            "};\n",
         );
         let environment = task_hover(src, "environment", 0);
         assert!(environment.contains("environment: str = \"staging\""));
@@ -1547,7 +1547,7 @@ mod tests {
         let src = concat!(
             "task [Deploy](environment: str = \"staging\") {\n",
             "    run { ./deploy.sh ${environment}; };\n",
-            "}\n",
+            "};\n",
         );
         assert_eq!(
             task_hover(src, "environment", 0),
@@ -1954,7 +1954,7 @@ mod tests {
 
     #[test]
     fn find_if_detects_then_else_branch_presence() {
-        let src = "function f(x: bool) -> int {\n    if x {\n        return 1;\n    } else {\n        return 0;\n    }\n}";
+        let src = "function f(x: bool) -> int {\n    if x {\n        return 1;\n    } else {\n        return 0;\n    }\n};";
         let tokens = spar::lexer::Lexer::new(src).tokenize().unwrap();
         let program = spar::parser::Parser::new(tokens).parse().unwrap();
         // "if" keyword is at byte offset 29 (line 1, col 4)
@@ -1966,7 +1966,7 @@ mod tests {
     #[test]
     fn find_if_detects_then_only_no_else() {
         let src =
-            "function f(x: bool) -> int {\n    if x {\n        return 1;\n    }\n    return 0;\n}";
+            "function f(x: bool) -> int {\n    if x {\n        return 1;\n    }\n    return 0;\n};";
         let tokens = spar::lexer::Lexer::new(src).tokenize().unwrap();
         let program = spar::parser::Parser::new(tokens).parse().unwrap();
         let if_offset = src.find("if x").unwrap();
@@ -2102,7 +2102,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_function_decl_classified_as_function() {
-        let src = "function pickPort(debug: bool) -> int { return 9000; }";
+        let src = "function pickPort(debug: bool) -> int { return 9000; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "pickPort", src).expect("pickPort not found");
         assert_eq!(tok.token_type, TT_FUNCTION);
@@ -2110,7 +2110,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_task_name_uses_registered_task_type() {
-        let src = "task [Deploy] { run { echo deploy; }; }";
+        let src = "task [Deploy] { run { echo deploy; }; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Deploy", src).expect("Deploy not found");
         assert_eq!(tok.token_type, TT_TASK);
@@ -2129,7 +2129,7 @@ mod tests {
             "    dependsOn: [];\n",
             "    env: { TARGET: \"prod\"; };\n",
             "    run { echo ${environment}; };\n",
-            "}\n",
+            "};\n",
         );
         let tokens = decode_semantic_tokens(src);
         assert_eq!(
@@ -2165,7 +2165,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_function_call_site_classified_as_function() {
-        let src = "function f(x: int) -> int { return x; }\nvar y: int = f(x: 1);";
+        let src = "function f(x: int) -> int { return x; };\nvar y: int = f(x: 1);";
         let tokens = decode_semantic_tokens(src);
         let fn_toks: Vec<_> = tokens
             .iter()
@@ -2196,7 +2196,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_param_classified_as_parameter() {
-        let src = "function f(myParam: int) -> int { return myParam; }";
+        let src = "function f(myParam: int) -> int { return myParam; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "myParam", src).expect("myParam not found");
         assert_eq!(tok.token_type, TT_PARAMETER);
@@ -2219,7 +2219,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_type_decl_name_classified_as_type() {
-        let src = "type [PostgresType]{ image: str; }";
+        let src = "type [PostgresType]{ image: str; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "PostgresType", src).expect("PostgresType not found");
         assert_eq!(tok.token_type, TT_TYPE);
@@ -2227,7 +2227,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_named_type_field_reference_classified_as_type() {
-        let src = "type [Border]{ width: int; }\ntype [Decoration]{ border: Border; }";
+        let src = "type [Border]{ width: int; };\ntype [Decoration]{ border: Border; };";
         let tokens = decode_semantic_tokens(src);
         let lines: Vec<&str> = src.lines().collect();
         let border_type_toks = tokens
@@ -2252,7 +2252,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_section_type_binding_classified_as_type() {
-        let src = "type [Human]{ name: str; }\n[Man] -> Human {\n    name: \"John\";\n};";
+        let src = "type [Human]{ name: str; };\n[Man] -> Human {\n    name: \"John\";\n};";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Human", src).filter(|t| t.token_type == TT_TYPE);
         assert!(
@@ -2276,7 +2276,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("shared.spar"),
-            "export type [PostgresType]{ image: str; }\nexport [Colors]{ red: str = \"#f00\"; };\n",
+            "export type [PostgresType]{ image: str; };\nexport [Colors]{ red: str = \"#f00\"; };\n",
         )
         .unwrap();
         let src = "import { PostgresType, Colors } from \"shared.spar\";\n";
@@ -2332,7 +2332,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spar_ls_definition_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let imported_path = dir.join("base.spar");
-        std::fs::write(&imported_path, "function make() -> int { return 1; }\n").unwrap();
+        std::fs::write(&imported_path, "function make() -> int { return 1; };\n").unwrap();
         let src = "import \"base.spar\";\nvar value: int = base::make();\n";
         let uri = Url::from_file_path(dir.join("main.spar")).unwrap();
         let state = SparLanguageServer::analyze(src, &dir);
@@ -2371,7 +2371,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spar_ls_references_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let base_path = dir.join("base.spar");
-        std::fs::write(&base_path, "function make() -> int { return 1; }\n").unwrap();
+        std::fs::write(&base_path, "function make() -> int { return 1; };\n").unwrap();
         let main_src = "import \"base.spar\";\nvar value: int = base::make();\n";
         let main_path = dir.join("main.spar");
         std::fs::write(&main_path, main_src).unwrap();
@@ -2390,7 +2390,7 @@ mod tests {
         let refs = compute_references(
             "make",
             location,
-            "function make() -> int { return 1; }\n".to_string(),
+            "function make() -> int { return 1; };\n".to_string(),
             &importers,
             false,
         );
@@ -2405,11 +2405,11 @@ mod tests {
         let src = concat!(
             "task [Build] {\n",
             "    run { echo build; };\n",
-            "}\n",
+            "};\n",
             "task [Test] {\n",
             "    dependsOn: [Build];\n",
             "    run { echo test; };\n",
-            "}\n",
+            "};\n",
         );
         let dir = std::env::temp_dir();
         let uri = Url::from_file_path(dir.join("references_task.spar")).unwrap();
@@ -2424,7 +2424,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_schema_section_name_classified_as_type() {
-        let src = "@SchemaFile\nSchema [Container]{ x?: str; }\n";
+        let src = "@SchemaFile\nSchema [Container]{ x?: str; };\n";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Container", src).expect("Container not found");
         assert_eq!(tok.token_type, TT_TYPE);
@@ -2439,7 +2439,7 @@ mod tests {
     #[test]
     fn resolve_field_type_display_resolves_top_level_inferred_field() {
         let src = concat!(
-            "type [Human]{ name: str; age: int; }\n",
+            "type [Human]{ name: str; age: int; };\n",
             "[Man] -> Human {\n",
             "    name: \"John\";\n",
             "    age: 29;\n",
@@ -2454,8 +2454,8 @@ mod tests {
     #[test]
     fn resolve_field_type_display_resolves_nested_inferred_field() {
         let src = concat!(
-            "type [EnvironmentType]{ nodeEnv: str; port: str; }\n",
-            "type [ServiceType]{ image: str; environment: EnvironmentType; }\n",
+            "type [EnvironmentType]{ nodeEnv: str; port: str; };\n",
+            "type [ServiceType]{ image: str; environment: EnvironmentType; };\n",
             "[Api] -> ServiceType {\n",
             "    image: \"my-api\";\n",
             "    environment: {\n",
@@ -2476,8 +2476,8 @@ mod tests {
     #[test]
     fn resolve_field_type_display_named_shape_shows_type_name() {
         let src = concat!(
-            "type [Border]{ width: int; }\n",
-            "type [Decoration]{ border: Border; }\n",
+            "type [Border]{ width: int; };\n",
+            "type [Decoration]{ border: Border; };\n",
             "[Style] -> Decoration {\n",
             "    border: { width: 2; };\n",
             "};\n",
