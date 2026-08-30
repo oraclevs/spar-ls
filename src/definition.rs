@@ -63,12 +63,25 @@ fn local_decl_span(program: &Program, offset: usize, word: &str) -> Option<Span>
     None
 }
 
+/// Tasks aren't resolved into `SymbolTable` (unlike globals/functions/
+/// types/enums/sections), so this scans the AST directly — same reason
+/// `local_decl_span` doesn't go through `SymbolTable` either.
+fn task_decl_span(program: &Program, word: &str) -> Option<Span> {
+    program.items.iter().find_map(|item| {
+        let TopLevelItem::Task(task) = item else { return None };
+        (task.name == word).then(|| task.name_span.clone())
+    })
+}
+
 fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Location> {
     let word = word_at_position(&state.source, pos);
     if word.is_empty() { return None; }
     let program = state.ast.as_ref()?;
     let offset = lsp_pos_to_byte_offset(&state.source, pos);
     if let Some(span) = local_decl_span(program, offset, &word) {
+        return Some(span_location(uri.clone(), &state.source, &span));
+    }
+    if let Some(span) = task_decl_span(program, &word) {
         return Some(span_location(uri.clone(), &state.source, &span));
     }
     let prefix = path_prefix_before_word(&state.source, pos).unwrap_or_default();

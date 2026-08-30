@@ -324,6 +324,7 @@ pub fn lsp_pos_to_byte_offset(source: &str, pos: Position) -> usize {
 include!("hover.rs");
 include!("completion.rs");
 include!("definition.rs");
+include!("references.rs");
 include!("semantic_tokens.rs");
 // ── Import hover / completion helpers ────────────────────────────────────────
 
@@ -520,6 +521,7 @@ impl LanguageServer for SparLanguageServer {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![":".to_string(), "{".to_string()]),
                     resolve_provider: Some(false),
@@ -1220,6 +1222,18 @@ impl LanguageServer for SparLanguageServer {
             return Ok(None);
         };
         Ok(definition_at(&uri, state, pos).map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        let locations = self.references_at(&uri, pos, include_declaration).await;
+        Ok(if locations.is_empty() {
+            None
+        } else {
+            Some(locations)
+        })
     }
 
     async fn semantic_tokens_full(
@@ -2326,6 +2340,86 @@ mod tests {
         assert_eq!(location.uri, Url::from_file_path(&imported_path).unwrap());
         assert_eq!(location.range.start.line, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn references_finds_same_file_uses_and_optionally_the_declaration() {
+        let src = "var answer: int = 42;\nvar copy: int = answer;\nvar other: int = answer;\n";
+        let dir = std::env::temp_dir();
+        let uri = Url::from_file_path(dir.join("references_local.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        let location = definition_at(&uri, &state, Position::new(1, 18)).expect("definition");
+
+        let without_decl = compute_references(
+            "answer",
+            location.clone(),
+            src.to_string(),
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(without_decl.len(), 2, "the two uses, not the declaration");
+        assert!(without_decl.iter().all(|l| l.range.start.line != 0));
+
+        let with_decl =
+            compute_references("answer", location, src.to_string(), &HashMap::new(), true);
+        assert_eq!(with_decl.len(), 3, "two uses plus the declaration");
+        assert!(with_decl.iter().any(|l| l.range.start.line == 0));
+    }
+
+    #[test]
+    fn references_finds_cross_file_uses_through_an_aliased_import() {
+        let dir = std::env::temp_dir().join(format!("spar_ls_references_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.spar");
+        std::fs::write(&base_path, "function make() -> int { return 1; }\n").unwrap();
+        let main_src = "import \"base.spar\";\nvar value: int = base::make();\n";
+        let main_path = dir.join("main.spar");
+        std::fs::write(&main_path, main_src).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+
+        let state = SparLanguageServer::analyze(main_src, &dir);
+        let location = definition_at(&main_uri, &state, Position::new(1, 24)).expect("definition");
+        assert_eq!(location.uri, Url::from_file_path(&base_path).unwrap());
+
+        let mut importers = HashMap::new();
+        importers.insert(
+            base_path.canonicalize().unwrap(),
+            HashSet::from([main_path.canonicalize().unwrap()]),
+        );
+
+        let refs = compute_references(
+            "make",
+            location,
+            "function make() -> int { return 1; }\n".to_string(),
+            &importers,
+            false,
+        );
+        assert_eq!(refs.len(), 1, "the one cross-file use in main.spar");
+        assert_eq!(refs[0].uri, main_uri);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn references_finds_task_dependson_reference() {
+        let src = concat!(
+            "task [Build] {\n",
+            "    run { echo build; };\n",
+            "}\n",
+            "task [Test] {\n",
+            "    dependsOn: [Build];\n",
+            "    run { echo test; };\n",
+            "}\n",
+        );
+        let dir = std::env::temp_dir();
+        let uri = Url::from_file_path(dir.join("references_task.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        // Position on `Build` in `task [Build] {`.
+        let location = definition_at(&uri, &state, Position::new(0, 7)).expect("definition");
+
+        let refs = compute_references("Build", location, src.to_string(), &HashMap::new(), false);
+        assert_eq!(refs.len(), 1, "the dependsOn reference");
+        assert_eq!(refs[0].range.start.line, 4);
     }
 
     #[test]
