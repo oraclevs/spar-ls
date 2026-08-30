@@ -308,6 +308,11 @@ fn member_completion_items(
         return Some(function_completion_items(&group.functions));
     }
 
+    let section_path = vec![base.to_string()];
+    if let Some(section) = symbols.sections.get(&section_path) {
+        return Some(section_field_completions(symbols, &section_path, section));
+    }
+
     let named_kind = match symbols.globals.get(base) {
         Some(GlobalEntry::Var {
             ty: SparType::Named(name),

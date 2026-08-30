@@ -1554,6 +1554,29 @@ mod tests {
     }
 
     #[test]
+    fn completion_after_dot_suggests_fields_of_a_section() {
+        // Regression: a section reference (as opposed to a var typed with a
+        // named type) fell through member_completion_items entirely — it
+        // never checked symbols.sections, so `Environment.` (a very common
+        // real-world pattern: `[Environment] -> SomeType { ... }` then
+        // `Environment.field` elsewhere) silently returned an empty
+        // completion list instead of the section's own fields.
+        let symbols = resolve_src(concat!(
+            "export type [HyprlandEnvironmentType]{ terminal: str; launcher: str; };\n",
+            "[Environment] -> HyprlandEnvironmentType {\n",
+            "    terminal: \"kitty\";\n",
+            "    launcher: \"wofi\";\n",
+            "};\n",
+        ));
+        let items = member_completion_items("Environment.", "Environment.".len(), &symbols)
+            .expect("member completion context");
+
+        let mut labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["launcher", "terminal"]);
+    }
+
+    #[test]
     fn completion_after_dot_suggests_variants_of_enum_typed_value() {
         let symbols = resolve_src(concat!(
             "enum Device { Ios, Android };\n",
