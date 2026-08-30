@@ -102,13 +102,12 @@ fn task_field_is_present(source: &str, body_start: usize, body_end: usize, name:
         let prefix = line_prefix.trim_end();
         let after = &body[offset + name.len()..];
         (prefix.is_empty() || prefix.ends_with('{') || prefix.ends_with(';'))
-            && after
-                .trim_start()
-                .starts_with(if name == "run" { '{' } else { ':' })
+            && after.trim_start().starts_with(':')
     })
 }
 
 fn task_metadata_completion_items(
+    task: &spar::ast::TaskDecl,
     source: &str,
     body_start: usize,
     body_end: usize,
@@ -120,7 +119,6 @@ fn task_metadata_completion_items(
         ("private", "Hide the task from public listings", "private: ${1:true};"),
         ("group", "Group shown in task listings", "group: \"$1\";"),
         ("confirm", "Confirmation prompt before running", "confirm: \"$1\";"),
-        ("os", "Operating systems allowed to run the task", "os: [$1];"),
         ("dependsOn", "Tasks that must run first", "dependsOn: [$1];"),
         ("env", "Environment variables for commands", "env: {\n\t$0\n};"),
         ("cwd", "Working directory for commands", "cwd: \"$1\";"),
@@ -128,7 +126,16 @@ fn task_metadata_completion_items(
         ("run", "Shell commands executed by the task", "run {\n\t$0\n};"),
     ]
     .into_iter()
-    .filter(|(name, _, _)| !task_field_is_present(source, body_start, body_end, name))
+    .filter(|(name, _, _)| {
+        if *name == "run" {
+            // A task can now carry any number of labeled `run <os>` blocks
+            // alongside at most one bare default — only offer the `run`
+            // snippet while that default block is still missing.
+            !task.run_blocks.iter().any(|block| block.os.is_none())
+        } else {
+            !task_field_is_present(source, body_start, body_end, name)
+        }
+    })
     .map(|(label, detail, insert_text)| CompletionItem {
         label: label.to_string(),
         kind: Some(CompletionItemKind::FIELD),
@@ -161,10 +168,14 @@ fn task_interpolation_at_offset(
     task: &spar::ast::TaskDecl,
     offset: usize,
 ) -> Option<&spar::ast::Expr> {
-    task.run.iter().find_map(|command| {
-        command.parts.iter().find_map(|part| match part {
-            spar::ast::ShellTemplatePart::Expr(expr) if offset_in_expr(expr, offset) => Some(expr),
-            _ => None,
+    task.run_blocks.iter().find_map(|block| {
+        block.commands.iter().find_map(|command| {
+            command.parts.iter().find_map(|part| match part {
+                spar::ast::ShellTemplatePart::Expr(expr) if offset_in_expr(expr, offset) => {
+                    Some(expr)
+                }
+                _ => None,
+            })
         })
     })
 }
@@ -273,7 +284,70 @@ fn task_completion_items(
     if cursor_in_task_run(source, body_start, body_end, offset) {
         return Some(Vec::new());
     }
-    Some(task_metadata_completion_items(source, body_start, body_end))
+    Some(task_metadata_completion_items(task, source, body_start, body_end))
+}
+
+fn member_completion_items(
+    source: &str,
+    offset: usize,
+    symbols: &SymbolTable,
+) -> Option<Vec<CompletionItem>> {
+    let before_cursor = source.get(..offset)?;
+    let before_dot = before_cursor.strip_suffix('.')?;
+    let base_start = before_dot
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_alphanumeric() && *ch != '_')
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    let base = before_dot.get(base_start..)?;
+    if base.is_empty() {
+        return Some(Vec::new());
+    }
+
+    if let Some(group) = symbols.function_groups.get(base) {
+        return Some(function_completion_items(&group.functions));
+    }
+
+    let named_kind = match symbols.globals.get(base) {
+        Some(GlobalEntry::Var {
+            ty: SparType::Named(name),
+            ..
+        }) => Some(name.as_str()),
+        _ if symbols.types.contains_key(base) || symbols.enums.contains_key(base) => Some(base),
+        _ => None,
+    };
+    let Some(name) = named_kind else {
+        return Some(Vec::new());
+    };
+
+    if let Some(entry) = symbols.types.get(name) {
+        return Some(
+            entry
+            .fields
+            .iter()
+            .map(|field| CompletionItem {
+                label: field.name.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(format_type_field_shape(&field.shape)),
+                ..Default::default()
+            })
+            .collect(),
+        );
+    }
+
+    Some(
+        symbols
+            .enums
+            .get(name)
+            .into_iter()
+            .flat_map(|entry| &entry.variants)
+            .map(|variant| CompletionItem {
+                label: variant.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                ..Default::default()
+            })
+            .collect(),
+    )
 }
 
 fn type_keyword_items() -> Vec<CompletionItem> {
@@ -329,6 +403,30 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>) -> Vec<
             }
         })
         .collect()
+}
+
+/// `Devices::` and `EdgeInsect::` completions — enum variant access and
+/// function-group member access are both `::`-namespaced in Spar (see
+/// `Devices::Android`, `EdgeInsect::only()`), never `.`, so this lives
+/// alongside `section_field_completions` rather than `member_completion_items`.
+fn enum_or_group_path_completions(symbols: &SymbolTable, name: &str) -> Option<Vec<CompletionItem>> {
+    if let Some(entry) = symbols.enums.get(name) {
+        return Some(
+            entry
+                .variants
+                .iter()
+                .map(|variant| CompletionItem {
+                    label: variant.clone(),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+    }
+    if let Some(group) = symbols.function_groups.get(name) {
+        return Some(function_completion_items(&group.functions));
+    }
+    None
 }
 
 fn section_field_completions(

@@ -211,7 +211,6 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
                     &td.private,
                     &td.group,
                     &td.confirm,
-                    &td.os,
                     &td.cwd,
                     &td.shell,
                 ]
@@ -230,10 +229,12 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
                 for (_, value) in &td.env {
                     collect_expr_refs(value, target, out);
                 }
-                for command in &td.run {
-                    for part in &command.parts {
-                        if let ShellTemplatePart::Expr(e) = part {
-                            collect_expr_refs(e, target, out);
+                for block in &td.run_blocks {
+                    for command in &block.commands {
+                        for part in &command.parts {
+                            if let ShellTemplatePart::Expr(e) = part {
+                                collect_expr_refs(e, target, out);
+                            }
                         }
                     }
                 }

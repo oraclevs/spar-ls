@@ -11,6 +11,8 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::new("task"), // 7
     SemanticTokenType::new("taskField"), // 8
     SemanticTokenType::KEYWORD,   // 9
+    SemanticTokenType::ENUM,      // 10
+    SemanticTokenType::new("functionGroup"), // 11
 ];
 
 const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -21,12 +23,13 @@ const TT_VARIABLE: u32 = 0;
 const TT_FUNCTION: u32 = 1;
 const TT_PARAMETER: u32 = 2;
 const TT_PROPERTY: u32 = 3;
-const TT_NAMESPACE: u32 = 4;
 const TT_TYPE: u32 = 5;
 const TT_SECTION: u32 = 6;
 const TT_TASK: u32 = 7;
 const TT_TASK_FIELD: u32 = 8;
 const TT_KEYWORD: u32 = 9;
+const TT_ENUM: u32 = 10;
+const TT_FUNCTION_GROUP: u32 = 11;
 const MOD_NONE: u32 = 0;
 const MOD_DECLARATION: u32 = 1;
 
@@ -36,6 +39,51 @@ struct RawToken {
     length: u32,
     token_type: u32,
     modifiers: u32,
+}
+
+struct SemanticKinds {
+    enums: HashSet<String>,
+    function_groups: HashSet<String>,
+}
+
+impl SemanticKinds {
+    fn from_program(program: &Program) -> Self {
+        use spar::ast::TopLevelItem;
+        let mut kinds = Self {
+            enums: HashSet::new(),
+            function_groups: HashSet::new(),
+        };
+        for item in &program.items {
+            match item {
+                TopLevelItem::Enum(decl) => {
+                    kinds.enums.insert(decl.name.clone());
+                }
+                TopLevelItem::FunctionGroup(decl) => {
+                    kinds.function_groups.insert(decl.name.clone());
+                }
+                _ => {}
+            }
+        }
+        kinds
+    }
+
+    fn named_type_token(&self, name: &str) -> u32 {
+        if self.enums.contains(name) {
+            TT_ENUM
+        } else {
+            TT_TYPE
+        }
+    }
+
+    fn qualifier_token(&self, name: &str) -> Option<u32> {
+        if self.enums.contains(name) {
+            Some(TT_ENUM)
+        } else if self.function_groups.contains(name) {
+            Some(TT_FUNCTION_GROUP)
+        } else {
+            None
+        }
+    }
 }
 
 fn byte_to_lsp_pos(source: &str, byte_offset: usize) -> (u32, u32) {
@@ -107,25 +155,78 @@ fn find_ident_token(
     })
 }
 
-fn collect_expr_tokens(expr: &spar::ast::Expr, source: &str, out: &mut Vec<RawToken>) {
+fn find_qualifier_token_before(
+    source: &str,
+    member_start: usize,
+    qualifier: &str,
+    token_type: u32,
+) -> Option<RawToken> {
+    let member_start = member_start.min(source.len());
+    let line_start = source[..member_start]
+        .rfind('\n')
+        .map_or(0, |position| position + 1);
+    let relative = source[line_start..member_start].rfind(qualifier)?;
+    let byte_off = line_start + relative;
+    let (line, start_char) = byte_to_lsp_pos(source, byte_off);
+    Some(RawToken {
+        line,
+        start_char,
+        length: qualifier.len() as u32,
+        token_type,
+        modifiers: MOD_NONE,
+    })
+}
+
+fn collect_expr_tokens(
+    expr: &spar::ast::Expr,
+    source: &str,
+    kinds: &SemanticKinds,
+    out: &mut Vec<RawToken>,
+) {
     use spar::ast::{Expr, StringPart};
     match expr {
         Expr::Call {
-            name_span, args, ..
+            name,
+            name_span,
+            args,
+            ..
         } => {
             out.push(raw_from_span(name_span, TT_FUNCTION, MOD_NONE));
+            if let Some((qualifier, _)) = name.split_once("::") {
+                if let Some(token_type) = kinds.qualifier_token(qualifier) {
+                    if let Some(tok) = find_qualifier_token_before(
+                        source,
+                        name_span.start,
+                        qualifier,
+                        token_type,
+                    ) {
+                        out.push(tok);
+                    }
+                }
+            }
             for arg in args {
-                collect_expr_tokens(&arg.value, source, out);
+                collect_expr_tokens(&arg.value, source, kinds, out);
             }
         }
         Expr::FnCall(fc) => {
-            if let Some(tok) =
-                find_ident_token(source, fc.span.start, &fc.name, TT_FUNCTION, MOD_NONE)
-            {
+            let member = fc.name.rsplit("::").next().unwrap_or(&fc.name);
+            if let Some(tok) = find_ident_token(source, fc.span.start, member, TT_FUNCTION, MOD_NONE) {
                 out.push(tok);
             }
+            if let Some((qualifier, _)) = fc.name.split_once("::") {
+                if let Some(token_type) = kinds.qualifier_token(qualifier) {
+                    if let Some(tok) = find_qualifier_token_before(
+                        source,
+                        fc.span.start,
+                        qualifier,
+                        token_type,
+                    ) {
+                        out.push(tok);
+                    }
+                }
+            }
             for arg in &fc.args {
-                collect_expr_tokens(arg, source, out);
+                collect_expr_tokens(arg, source, kinds, out);
             }
         }
         Expr::NamespaceRef(nr) if nr.segments.len() == 1 => {
@@ -139,18 +240,32 @@ fn collect_expr_tokens(expr: &spar::ast::Expr, source: &str, out: &mut Vec<RawTo
                 out.push(tok);
             }
         }
-        Expr::NamespaceRef(_) => {}
-        Expr::BinaryOp(b) => {
-            collect_expr_tokens(&b.lhs, source, out);
-            collect_expr_tokens(&b.rhs, source, out);
-        }
-        Expr::Unary { operand, .. } => collect_expr_tokens(operand, source, out),
-        Expr::List(items, _) => {
-            for item in items {
-                collect_expr_tokens(item, source, out);
+        Expr::NamespaceRef(nr) => {
+            if let Some(qualifier) = nr.segments.first() {
+                if let Some(token_type) = kinds.qualifier_token(qualifier) {
+                    if let Some(tok) = find_ident_token(
+                        source,
+                        nr.span.start,
+                        qualifier,
+                        token_type,
+                        MOD_NONE,
+                    ) {
+                        out.push(tok);
+                    }
+                }
             }
         }
-        Expr::Grouped(inner, _) => collect_expr_tokens(inner, source, out),
+        Expr::BinaryOp(b) => {
+            collect_expr_tokens(&b.lhs, source, kinds, out);
+            collect_expr_tokens(&b.rhs, source, kinds, out);
+        }
+        Expr::Unary { operand, .. } => collect_expr_tokens(operand, source, kinds, out),
+        Expr::List(items, _) => {
+            for item in items {
+                collect_expr_tokens(item, source, kinds, out);
+            }
+        }
+        Expr::Grouped(inner, _) => collect_expr_tokens(inner, source, kinds, out),
         Expr::Comprehension {
             var_name_span,
             source: comp_src,
@@ -158,21 +273,21 @@ fn collect_expr_tokens(expr: &spar::ast::Expr, source: &str, out: &mut Vec<RawTo
             ..
         } => {
             out.push(raw_from_span(var_name_span, TT_VARIABLE, MOD_DECLARATION));
-            collect_expr_tokens(comp_src, source, out);
-            collect_expr_tokens(body, source, out);
+            collect_expr_tokens(comp_src, source, kinds, out);
+            collect_expr_tokens(body, source, kinds, out);
         }
         Expr::Index {
             source: src_expr,
             index,
             ..
         } => {
-            collect_expr_tokens(src_expr, source, out);
-            collect_expr_tokens(index, source, out);
+            collect_expr_tokens(src_expr, source, kinds, out);
+            collect_expr_tokens(index, source, kinds, out);
         }
         Expr::String(s) => {
             for part in &s.parts {
                 if let StringPart::Expr(e) = part {
-                    collect_expr_tokens(e, source, out);
+                    collect_expr_tokens(e, source, kinds, out);
                 }
             }
         }
@@ -185,24 +300,29 @@ fn collect_expr_tokens(expr: &spar::ast::Expr, source: &str, out: &mut Vec<RawTo
                 match item {
                     SectionItem::Field(f) => {
                         if let Some(FieldValue::Expr(e)) = &f.value {
-                            collect_expr_tokens(e, source, out);
+                            collect_expr_tokens(e, source, kinds, out);
                         }
                     }
-                    SectionItem::Spread(sp) => collect_expr_tokens(&sp.expr, source, out),
+                    SectionItem::Spread(sp) => collect_expr_tokens(&sp.expr, source, kinds, out),
                 }
             }
         }
         Expr::FieldAccess {
             base, field_span, ..
         } => {
-            collect_expr_tokens(base, source, out);
+            collect_expr_tokens(base, source, kinds, out);
             out.push(raw_from_span(field_span, TT_PROPERTY, MOD_NONE));
         }
         Expr::Literal(_) => {}
     }
 }
 
-fn collect_stmts_tokens(stmts: &[FuncStmt], source: &str, out: &mut Vec<RawToken>) {
+fn collect_stmts_tokens(
+    stmts: &[FuncStmt],
+    source: &str,
+    kinds: &SemanticKinds,
+    out: &mut Vec<RawToken>,
+) {
     use spar::ast::{FuncStmt as FS, ReturnValue};
     for stmt in stmts {
         match stmt {
@@ -216,20 +336,20 @@ fn collect_stmts_tokens(stmts: &[FuncStmt], source: &str, out: &mut Vec<RawToken
                 ) {
                     out.push(tok);
                 }
-                collect_expr_tokens(&lv.value, source, out);
+                collect_expr_tokens(&lv.value, source, kinds, out);
             }
             FS::Return(rv, _) => match rv {
-                ReturnValue::Expr(e) => collect_expr_tokens(e, source, out),
+                ReturnValue::Expr(e) => collect_expr_tokens(e, source, kinds, out),
                 ReturnValue::SectionBlock(fields) => {
                     for rf in fields {
-                        collect_expr_tokens(&rf.value, source, out);
+                        collect_expr_tokens(&rf.value, source, kinds, out);
                     }
                 }
             },
             FS::If(if_stmt) => {
-                collect_expr_tokens(&if_stmt.condition, source, out);
-                collect_stmts_tokens(&if_stmt.then_stmts, source, out);
-                collect_stmts_tokens(&if_stmt.else_stmts, source, out);
+                collect_expr_tokens(&if_stmt.condition, source, kinds, out);
+                collect_stmts_tokens(&if_stmt.then_stmts, source, kinds, out);
+                collect_stmts_tokens(&if_stmt.else_stmts, source, kinds, out);
             }
             FS::For {
                 var_name,
@@ -242,8 +362,8 @@ fn collect_stmts_tokens(stmts: &[FuncStmt], source: &str, out: &mut Vec<RawToken
                 {
                     out.push(tok);
                 }
-                collect_expr_tokens(iterable, source, out);
-                collect_stmts_tokens(body, source, out);
+                collect_expr_tokens(iterable, source, kinds, out);
+                collect_stmts_tokens(body, source, kinds, out);
             }
         }
     }
@@ -252,6 +372,7 @@ fn collect_stmts_tokens(stmts: &[FuncStmt], source: &str, out: &mut Vec<RawToken
 fn collect_section_items_tokens(
     items: &[spar::ast::SectionItem],
     source: &str,
+    kinds: &SemanticKinds,
     out: &mut Vec<RawToken>,
 ) {
     use spar::ast::{FieldValue, SectionItem};
@@ -267,15 +388,18 @@ fn collect_section_items_tokens(
                 ) {
                     out.push(tok);
                 }
+                if let Some(ty) = &fd.ty {
+                    collect_named_type_token(ty, source, fd.span.start, kinds, out);
+                }
                 match &fd.value {
-                    Some(FieldValue::Expr(e)) => collect_expr_tokens(e, source, out),
+                    Some(FieldValue::Expr(e)) => collect_expr_tokens(e, source, kinds, out),
                     Some(FieldValue::Nested(nested)) => {
-                        collect_section_items_tokens(nested, source, out)
+                        collect_section_items_tokens(nested, source, kinds, out)
                     }
                     None => {}
                 }
             }
-            SectionItem::Spread(ss) => collect_expr_tokens(&ss.expr, source, out),
+            SectionItem::Spread(ss) => collect_expr_tokens(&ss.expr, source, kinds, out),
         }
     }
 }
@@ -284,15 +408,22 @@ fn collect_named_type_token(
     ty: &SparType,
     source: &str,
     from_byte: usize,
+    kinds: &SemanticKinds,
     out: &mut Vec<RawToken>,
 ) {
     match ty {
         SparType::Named(name) => {
-            if let Some(token) = find_ident_token(source, from_byte, name, TT_TYPE, MOD_NONE) {
+            if let Some(token) = find_ident_token(
+                source,
+                from_byte,
+                name,
+                kinds.named_type_token(name),
+                MOD_NONE,
+            ) {
                 out.push(token);
             }
         }
-        SparType::List(inner) => collect_named_type_token(inner, source, from_byte, out),
+        SparType::List(inner) => collect_named_type_token(inner, source, from_byte, kinds, out),
         _ => {}
     }
 }
@@ -330,6 +461,7 @@ fn collect_task_tokens(
     index: usize,
     task: &spar::ast::TaskDecl,
     source: &str,
+    kinds: &SemanticKinds,
     out: &mut Vec<RawToken>,
 ) {
     use spar::ast::ShellTemplatePart;
@@ -345,9 +477,9 @@ fn collect_task_tokens(
         ) {
             out.push(token);
         }
-        collect_named_type_token(&param.ty, source, param.span.start, out);
+        collect_named_type_token(&param.ty, source, param.span.start, kinds, out);
         if let Some(default) = &param.default {
-            collect_expr_tokens(default, source, out);
+            collect_expr_tokens(default, source, kinds, out);
         }
     }
 
@@ -358,7 +490,6 @@ fn collect_task_tokens(
         ("private", task.private.as_ref()),
         ("group", task.group.as_ref()),
         ("confirm", task.confirm.as_ref()),
-        ("os", task.os.as_ref()),
         ("cwd", task.cwd.as_ref()),
         ("shell", task.shell.as_ref()),
     ];
@@ -371,7 +502,7 @@ fn collect_task_tokens(
             if let Some(token) = find_task_field_token(source, body_start, body_end, name) {
                 out.push(token);
             }
-            collect_expr_tokens(expression, source, out);
+            collect_expr_tokens(expression, source, kinds, out);
         }
     }
     for name in ["dependsOn", "env", "run"] {
@@ -395,24 +526,26 @@ fn collect_task_tokens(
                 ..token
             });
         }
-        collect_expr_tokens(value, source, out);
+        collect_expr_tokens(value, source, kinds, out);
     }
-    for command in &task.run {
-        for part in &command.parts {
-            if let ShellTemplatePart::Expr(expression) = part {
-                let token_start = out.len();
-                collect_expr_tokens(expression, source, out);
-                for token in &mut out[token_start..] {
-                    if token.token_type != TT_VARIABLE {
-                        continue;
-                    }
-                    let line = source.lines().nth(token.line as usize).unwrap_or_default();
-                    let start = token.start_char as usize;
-                    let end = start + token.length as usize;
-                    if line.get(start..end).is_some_and(|name| {
-                        task.params.iter().any(|param| param.name == name)
-                    }) {
-                        token.token_type = TT_PARAMETER;
+    for block in &task.run_blocks {
+        for command in &block.commands {
+            for part in &command.parts {
+                if let ShellTemplatePart::Expr(expression) = part {
+                    let token_start = out.len();
+                    collect_expr_tokens(expression, source, kinds, out);
+                    for token in &mut out[token_start..] {
+                        if token.token_type != TT_VARIABLE {
+                            continue;
+                        }
+                        let line = source.lines().nth(token.line as usize).unwrap_or_default();
+                        let start = token.start_char as usize;
+                        let end = start + token.length as usize;
+                        if line.get(start..end).is_some_and(|name| {
+                            task.params.iter().any(|param| param.name == name)
+                        }) {
+                            token.token_type = TT_PARAMETER;
+                        }
                     }
                 }
             }
@@ -422,6 +555,7 @@ fn collect_task_tokens(
 
 fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<RawToken>) {
     use spar::ast::TopLevelItem as TL;
+    let kinds = SemanticKinds::from_program(program);
     for (index, item) in program.items.iter().enumerate() {
         match item {
             TL::Var(vd) => {
@@ -434,8 +568,9 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 ) {
                     out.push(tok);
                 }
+                collect_named_type_token(&vd.ty, source, vd.span.start, &kinds, out);
                 if let Some(expr) = &vd.value {
-                    collect_expr_tokens(expr, source, out);
+                    collect_expr_tokens(expr, source, &kinds, out);
                 }
             }
             TL::Dynamic(dd) => {
@@ -449,7 +584,7 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                     out.push(tok);
                 }
                 if let Some(expr) = &dd.value {
-                    collect_expr_tokens(expr, source, out);
+                    collect_expr_tokens(expr, source, &kinds, out);
                 }
             }
             TL::Section(sd) => {
@@ -471,7 +606,7 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 if let Some(binding) = &sd.type_binding {
                     out.push(raw_from_span(&binding.span, TT_TYPE, MOD_NONE));
                 }
-                collect_section_items_tokens(&sd.items, source, out);
+                collect_section_items_tokens(&sd.items, source, &kinds, out);
             }
             TL::Function(fd) => {
                 out.push(raw_from_span(&fd.name_span, TT_FUNCTION, MOD_DECLARATION));
@@ -485,15 +620,17 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                     ) {
                         out.push(tok);
                     }
+                    collect_named_type_token(&param.ty, source, param.span.start, &kinds, out);
                 }
-                collect_stmts_tokens(&fd.body.stmts, source, out);
+                collect_named_type_token(&fd.ret, source, fd.ret_span.start, &kinds, out);
+                collect_stmts_tokens(&fd.body.stmts, source, &kinds, out);
             }
             TL::Task(td) => {
-                collect_task_tokens(program, index, td, source, out);
+                collect_task_tokens(program, index, td, source, &kinds, out);
             }
             TL::Type(td) => {
                 out.push(raw_from_span(&td.name_span, TT_TYPE, MOD_DECLARATION));
-                collect_type_fields_tokens(&td.fields, source, out);
+                collect_type_fields_tokens(&td.fields, source, &kinds, out);
             }
             TL::SchemaSection(sd) => {
                 if let Some(tok) =
@@ -513,17 +650,14 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
             }
             TL::Import(_) => {}
             TL::Enum(ed) => {
-                // Minimal: highlight the enum's own name as a type
-                // declaration, mirroring TL::Type above. No variant-level
-                // token classification — that's deferred LSP feature work.
-                out.push(raw_from_span(&ed.name_span, TT_TYPE, MOD_DECLARATION));
+                out.push(raw_from_span(&ed.name_span, TT_ENUM, MOD_DECLARATION));
             }
             TL::FunctionGroup(gd) => {
                 if let Some(tok) = find_ident_token(
                     source,
                     gd.span.start,
                     &gd.name,
-                    TT_NAMESPACE,
+                    TT_FUNCTION_GROUP,
                     MOD_DECLARATION,
                 ) {
                     out.push(tok);
@@ -540,8 +674,16 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                         ) {
                             out.push(tok);
                         }
+                        collect_named_type_token(
+                            &param.ty,
+                            source,
+                            param.span.start,
+                            &kinds,
+                            out,
+                        );
                     }
-                    collect_stmts_tokens(&f.body.stmts, source, out);
+                    collect_named_type_token(&f.ret, source, f.ret_span.start, &kinds, out);
+                    collect_stmts_tokens(&f.body.stmts, source, &kinds, out);
                 }
             }
         }
@@ -596,13 +738,14 @@ fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
 }
 
 /// A `type [Name]{ ... }` declaration's own fields — property names, and a
-/// `Named(OtherType)` shape reference gets its own TT_TYPE token (found by
+/// `Named(OtherType)` shape reference gets its own type/enum token (found by
 /// text search from the field's span, same "search near a known offset"
 /// pattern the rest of this file already uses — TypeField carries no
 /// dedicated span for just the type-name portion of `field: OtherType;`).
 fn collect_type_fields_tokens(
     fields: &[spar::ast::TypeField],
     source: &str,
+    kinds: &SemanticKinds,
     out: &mut Vec<RawToken>,
 ) {
     use spar::ast::TypeFieldShape;
@@ -615,12 +758,19 @@ fn collect_type_fields_tokens(
         match &f.shape {
             TypeFieldShape::Primitive(_) => {}
             TypeFieldShape::Named(other) => {
-                if let Some(tok) = find_ident_token(source, f.span.start, other, TT_TYPE, MOD_NONE)
-                {
+                if let Some(tok) = find_ident_token(
+                    source,
+                    f.span.start,
+                    other,
+                    kinds.named_type_token(other),
+                    MOD_NONE,
+                ) {
                     out.push(tok);
                 }
             }
-            TypeFieldShape::Section(nested) => collect_type_fields_tokens(nested, source, out),
+            TypeFieldShape::Section(nested) => {
+                collect_type_fields_tokens(nested, source, kinds, out)
+            }
         }
     }
 }

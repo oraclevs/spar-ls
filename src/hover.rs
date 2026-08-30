@@ -309,17 +309,16 @@ fn formatted_task_param(param: &spar::ast::TaskParam) -> String {
         private: None,
         group: None,
         confirm: None,
-        os: None,
         depends_on: Vec::new(),
         env: Vec::new(),
         cwd: None,
         shell: None,
-        run: Vec::new(),
+        run_blocks: Vec::new(),
         span: param.span.clone(),
     };
     let program = Program {
         is_schema_file: false,
-        dotenv_load: false,
+        load_env: None,
         items: vec![TopLevelItem::Task(Box::new(task.clone()))],
     };
     let formatted = format_program(&program, &FormatConfig::default());
@@ -346,10 +345,10 @@ fn format_hover_task(task: &spar::ast::TaskDecl) -> String {
     if task.description.is_some() {
         let mut description_task = task.clone();
         description_task.params.clear();
-        description_task.run.clear();
+        description_task.run_blocks.clear();
         let program = Program {
             is_schema_file: false,
-            dotenv_load: false,
+            load_env: None,
             items: vec![TopLevelItem::Task(Box::new(description_task))],
         };
         let formatted = format_program(&program, &FormatConfig::default());
