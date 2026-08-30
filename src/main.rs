@@ -523,7 +523,11 @@ impl LanguageServer for SparLanguageServer {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![":".to_string(), "{".to_string()]),
+                    trigger_characters: Some(vec![
+                        ":".to_string(),
+                        "{".to_string(),
+                        ".".to_string(),
+                    ]),
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
@@ -1128,18 +1132,28 @@ impl LanguageServer for SparLanguageServer {
         };
 
         let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(items) = member_completion_items(&state.source, offset, symbols) {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
         if let Some(items) =
             task_completion_items(state.ast.as_ref(), &state.source, symbols, offset)
         {
             return Ok(Some(CompletionResponse::Array(items)));
         }
 
-        // Case 1: after `path::` — enumerate section fields or imported symbols
+        // Case 1: after `path::` — enumerate section fields, enum variants,
+        // function-group members, or imported symbols
         if let Some(path) = path_before_cursor(&state.source, pos) {
             if let Some(section) = symbols.sections.get(&path) {
                 return Ok(Some(CompletionResponse::Array(section_field_completions(
                     symbols, &path, section,
                 ))));
+            }
+
+            if path.len() == 1 {
+                if let Some(items) = enum_or_group_path_completions(symbols, &path[0]) {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
             }
 
             if symbols.imports.contains_key(&path[0]) {
@@ -1448,6 +1462,22 @@ mod tests {
     }
 
     #[test]
+    fn completion_still_offers_run_when_only_labeled_blocks_exist() {
+        let src = concat!(
+            "task [Deploy] {\n",
+            "    description: \"Deploy the app\";\n",
+            "    /* complete here */\n",
+            "    run windows { echo win; };\n",
+            "};\n",
+        );
+        let labels = task_completion_labels(src, "/* complete here */");
+        assert!(
+            labels.contains(&"run".to_string()),
+            "a task with only a labeled run block and no bare default must still offer 'run'"
+        );
+    }
+
+    #[test]
     fn completion_suggests_other_tasks_inside_depends_on() {
         let src = concat!(
             "task [Build] { run { cargo build; }; };\n",
@@ -1500,6 +1530,117 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["environment", "extra"]
         );
+    }
+
+    #[test]
+    fn completion_after_dot_suggests_fields_of_named_type() {
+        let symbols = resolve_src(concat!(
+            "type [Human]{ name: str; age: int; };\n",
+            "var person: Human = { name: \"Ada\"; age: 36; };\n",
+        ));
+        let items = member_completion_items("person.", "person.".len(), &symbols)
+            .expect("member completion context");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.label.as_str(), item.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("name", Some(CompletionItemKind::FIELD)),
+                ("age", Some(CompletionItemKind::FIELD)),
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_after_dot_suggests_variants_of_enum_typed_value() {
+        let symbols = resolve_src(concat!(
+            "enum Device { Ios, Android };\n",
+            "var device: Device = Device::Ios;\n",
+        ));
+        let items = member_completion_items("device.", "device.".len(), &symbols)
+            .expect("member completion context");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.label.as_str(), item.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("Ios", Some(CompletionItemKind::ENUM_MEMBER)),
+                ("Android", Some(CompletionItemKind::ENUM_MEMBER)),
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_after_dot_suggests_function_group_members() {
+        let symbols = resolve_src(concat!(
+            "functionGroup Convert {\n",
+            "    function toText(value: int) -> str { return str(value); }\n",
+            "    function toBool(value: str) -> bool { return bool(value); }\n",
+            "};\n",
+        ));
+        let items = member_completion_items("Convert.", "Convert.".len(), &symbols)
+            .expect("member completion context");
+
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| {
+            item.label == "toText" && item.kind == Some(CompletionItemKind::FUNCTION)
+        }));
+        assert!(items.iter().any(|item| {
+            item.label == "toBool" && item.kind == Some(CompletionItemKind::FUNCTION)
+        }));
+    }
+
+    #[test]
+    fn completion_after_double_colon_suggests_enum_variants() {
+        let symbols = resolve_src(concat!(
+            "export enum Devices {\n",
+            "    Ios,\n",
+            "    Android,\n",
+            "};\n",
+        ));
+        let items = enum_or_group_path_completions(&symbols, "Devices")
+            .expect("enum path completion context");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.label.as_str(), item.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("Ios", Some(CompletionItemKind::ENUM_MEMBER)),
+                ("Android", Some(CompletionItemKind::ENUM_MEMBER)),
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_after_double_colon_suggests_function_group_members() {
+        let symbols = resolve_src(concat!(
+            "functionGroup EdgeInsect {\n",
+            "    function only() -> [int] { return [1]; }\n",
+            "    function semantic(hor: float) -> [int] { return [1]; }\n",
+            "};\n",
+        ));
+        let items = enum_or_group_path_completions(&symbols, "EdgeInsect")
+            .expect("function group path completion context");
+
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| {
+            item.label == "only" && item.kind == Some(CompletionItemKind::FUNCTION)
+        }));
+        assert!(items.iter().any(|item| {
+            item.label == "semantic" && item.kind == Some(CompletionItemKind::FUNCTION)
+        }));
+    }
+
+    #[test]
+    fn completion_after_double_colon_on_unknown_name_is_none() {
+        let symbols = resolve_src("export var port: int = 8080;\n");
+        assert!(enum_or_group_path_completions(&symbols, "NotAThing").is_none());
     }
 
     fn task_hover(src: &str, needle: &str, occurrence: usize) -> String {
@@ -2262,6 +2403,63 @@ mod tests {
     }
 
     #[test]
+    fn semantic_tokens_named_var_and_section_field_types_classified_as_type() {
+        let src = concat!(
+            "type [HyprlandEnvironmentType]{ name: str; };\n",
+            "var environment: HyprlandEnvironmentType;\n",
+            "[Config]{ environment: HyprlandEnvironmentType = {}; };\n",
+        );
+        let tokens = decode_semantic_tokens(src);
+        let lines: Vec<&str> = src.lines().collect();
+        let references = tokens
+            .iter()
+            .filter(|token| {
+                let line = lines[token.line as usize];
+                let start = token.start_char as usize;
+                let end = start + token.length as usize;
+                line.get(start..end) == Some("HyprlandEnvironmentType")
+                    && token.token_type == TT_TYPE
+            })
+            .count();
+
+        assert_eq!(
+            references, 3,
+            "expected declaration plus both type references"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_enum_and_function_group_value_qualifiers_keep_their_kinds() {
+        let src = concat!(
+            "enum LbAlgorithm { LeastConn };\n",
+            "type [Balancer]{ algorithm: LbAlgorithm; };\n",
+            "functionGroup EdgeInsect {\n",
+            "    function only() -> [int] { return [1]; }\n",
+            "};\n",
+            "var algorithm: LbAlgorithm = LbAlgorithm::LeastConn;\n",
+            "var padding: [int] = EdgeInsect::only();\n",
+        );
+        let tokens = decode_semantic_tokens(src);
+        let lines: Vec<&str> = src.lines().collect();
+        let count = |name: &str, token_type: u32| {
+            tokens
+                .iter()
+                .filter(|token| {
+                    let line = lines[token.line as usize];
+                    let start = token.start_char as usize;
+                    let end = start + token.length as usize;
+                    line.get(start..end) == Some(name) && token.token_type == token_type
+                })
+                .count()
+        };
+
+        assert_eq!(count("LbAlgorithm", TT_ENUM), 4);
+        assert_eq!(count("EdgeInsect", TT_FUNCTION_GROUP), 2);
+        assert_ne!(TT_ENUM, TT_TYPE);
+        assert_ne!(TT_FUNCTION_GROUP, TT_ENUM);
+    }
+
+    #[test]
     fn semantic_tokens_selectively_imported_names_classified_by_real_kind() {
         // The user's actual ask: "even in the import system" — a
         // selectively-imported name should get its real semantic color,
@@ -2296,6 +2494,65 @@ mod tests {
         assert!(
             raw.iter().any(|t| t.token_type == TT_SECTION),
             "expected the imported Colors section to get a TT_SECTION token"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_tokens_selective_import_type_enum_and_function_group_are_distinct() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!(
+            "spar_ls_import_kind_tok_test_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("other.spar"),
+            concat!(
+                "export type [ImportedType]{ value: str; };\n",
+                "export enum ImportedEnum { First };\n",
+                "functionGroup ImportedGroup {\n",
+                "    function make() -> int { return 1; }\n",
+                "};\n",
+            ),
+        )
+        .unwrap();
+        let src = concat!(
+            "import { ImportedType, ImportedEnum, ImportedGroup } ",
+            "from \"other.spar\";\n",
+        );
+        let state = SparLanguageServer::analyze(src, &dir);
+        assert!(
+            state.errors.is_empty(),
+            "analysis errors: {:?}",
+            state.errors
+        );
+        let program = state.ast.as_ref().expect("expanded program");
+        let mut raw = Vec::new();
+        collect_tokens_from_program(program, src, &mut raw);
+        raw.sort_by_key(|token| (token.line, token.start_char));
+        let decoded = raw
+            .iter()
+            .map(|token| DecodedToken {
+                line: token.line,
+                start_char: token.start_char,
+                length: token.length,
+                token_type: token.token_type,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            find_tok(&decoded, "ImportedType", src).unwrap().token_type,
+            TT_TYPE
+        );
+        assert_eq!(
+            find_tok(&decoded, "ImportedEnum", src).unwrap().token_type,
+            TT_ENUM
+        );
+        assert_eq!(
+            find_tok(&decoded, "ImportedGroup", src).unwrap().token_type,
+            TT_FUNCTION_GROUP
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -2434,6 +2691,21 @@ mod tests {
         let tokens = Lexer::new(src).tokenize().expect("lex");
         let prog = Parser::new(tokens).parse().expect("parse");
         Resolver::new().resolve(&prog, &[]).expect("resolve")
+    }
+
+    #[test]
+    fn section_double_colon_completion_resolves_registered_fields() {
+        let src = "[MainCont]{\n    padding: int = 1;\n    margin: int = 2;\n};\n";
+        let symbols = resolve_src(src);
+        let path = vec!["MainCont".to_string()];
+        let section = symbols
+            .sections
+            .get(&path)
+            .expect("MainCont section must be registered");
+        let items = section_field_completions(&symbols, &path, section);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| item.label == "padding"));
+        assert!(items.iter().any(|item| item.label == "margin"));
     }
 
     #[test]
