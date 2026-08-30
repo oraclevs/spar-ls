@@ -344,6 +344,25 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 }
                 collect_stmts_tokens(&fd.body.stmts, source, out);
             }
+            TL::Task(td) => {
+                // Minimal: highlight the task's own name and its
+                // parameters, mirroring TL::Function above. No token
+                // classification inside `run { ... }` shell bodies or
+                // metadata expressions yet — that's deferred LSP feature
+                // work.
+                out.push(raw_from_span(&td.name_span, TT_FUNCTION, MOD_DECLARATION));
+                for param in &td.params {
+                    if let Some(tok) = find_ident_token(
+                        source,
+                        param.span.start,
+                        &param.name,
+                        TT_PARAMETER,
+                        MOD_DECLARATION,
+                    ) {
+                        out.push(tok);
+                    }
+                }
+            }
             TL::Type(td) => {
                 out.push(raw_from_span(&td.name_span, TT_TYPE, MOD_DECLARATION));
                 collect_type_fields_tokens(&td.fields, source, out);
