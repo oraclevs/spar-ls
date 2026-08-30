@@ -297,3 +297,132 @@ fn format_hover_function(name: &str, entry: &FunctionEntry) -> String {
         format_spar_type(&entry.ret)
     )
 }
+
+fn formatted_task_param(param: &spar::ast::TaskParam) -> String {
+    let task = spar::ast::TaskDecl {
+        name: "Hover".to_string(),
+        name_span: param.span.clone(),
+        params: vec![param.clone()],
+        description: None,
+        default: None,
+        quiet: None,
+        private: None,
+        group: None,
+        confirm: None,
+        os: None,
+        depends_on: Vec::new(),
+        env: Vec::new(),
+        cwd: None,
+        shell: None,
+        run: Vec::new(),
+        span: param.span.clone(),
+    };
+    let program = Program {
+        is_schema_file: false,
+        dotenv_load: false,
+        items: vec![TopLevelItem::Task(Box::new(task.clone()))],
+    };
+    let formatted = format_program(&program, &FormatConfig::default());
+    formatted
+        .lines()
+        .next()
+        .and_then(|line| line.split_once('('))
+        .and_then(|(_, rest)| rest.rsplit_once(')'))
+        .map(|(param, _)| param.to_string())
+        .unwrap_or_else(|| {
+            let variadic = if param.variadic { "*" } else { "" };
+            format!("{variadic}{}: {}", param.name, format_spar_type(&param.ty))
+        })
+}
+
+fn format_hover_task(task: &spar::ast::TaskDecl) -> String {
+    let params = task
+        .params
+        .iter()
+        .map(formatted_task_param)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut value = format!("```spar\ntask [{}]({})\n```", task.name, params);
+    if task.description.is_some() {
+        let mut description_task = task.clone();
+        description_task.params.clear();
+        description_task.run.clear();
+        let program = Program {
+            is_schema_file: false,
+            dotenv_load: false,
+            items: vec![TopLevelItem::Task(Box::new(description_task))],
+        };
+        let formatted = format_program(&program, &FormatConfig::default());
+        if let Some(description) = formatted.lines().find_map(|line| {
+            line.trim_start()
+                .strip_prefix("description: ")
+                .map(|text| text.trim_end_matches(';').trim_matches('"'))
+                .filter(|text| !text.is_empty())
+        }) {
+            value.push_str("\n\n");
+            value.push_str(description);
+        }
+    }
+    if !task.depends_on.is_empty() {
+        value.push_str("\n\nDepends on: `");
+        value.push_str(
+            &task
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.name.as_str())
+                .collect::<Vec<_>>()
+                .join("`, `"),
+        );
+        value.push('`');
+    }
+    value
+}
+
+fn format_hover_task_param(param: &spar::ast::TaskParam) -> String {
+    format!(
+        "```spar\n(task parameter) {}\n```",
+        formatted_task_param(param)
+    )
+}
+
+fn cursor_on_task_param_declaration(
+    source: &str,
+    param: &spar::ast::TaskParam,
+    offset: usize,
+) -> bool {
+    find_ident_byte(source, param.span.start, &param.name)
+        .is_some_and(|start| start <= offset && offset <= start + param.name.len())
+}
+
+fn task_hover_at_offset(
+    program: &Program,
+    source: &str,
+    offset: usize,
+    word: &str,
+) -> Option<String> {
+    for item in &program.items {
+        let TopLevelItem::Task(task) = item else {
+            continue;
+        };
+        if task.name == word && task.name_span.start <= offset && offset <= task.name_span.end {
+            return Some(format_hover_task(task));
+        }
+        if let Some(param) = task.params.iter().find(|param| {
+            param.name == word && cursor_on_task_param_declaration(source, param, offset)
+        }) {
+            return Some(format_hover_task_param(param));
+        }
+    }
+
+    let (task, _, _) = task_at_offset(program, source, offset)?;
+    let spar::ast::Expr::NamespaceRef(reference) = task_interpolation_at_offset(task, offset)? else {
+        return None;
+    };
+    if reference.segments.len() != 1 || reference.segments[0] != word {
+        return None;
+    }
+    task.params
+        .iter()
+        .find(|param| param.name == word)
+        .map(format_hover_task_param)
+}
