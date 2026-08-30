@@ -521,7 +521,7 @@ impl LanguageServer for SparLanguageServer {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![":".to_string()]),
+                    trigger_characters: Some(vec![":".to_string(), "{".to_string()]),
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
@@ -773,6 +773,21 @@ impl LanguageServer for SparLanguageServer {
         };
 
         let word = word_at_position(&state.source, pos);
+
+        if !word.is_empty() {
+            if let Some(program) = &state.ast {
+                let offset = lsp_pos_to_byte_offset(&state.source, pos);
+                if let Some(value) = task_hover_at_offset(program, &state.source, offset, &word) {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+        }
 
         // Case 0: import alias hover
         if !word.is_empty() {
@@ -1110,6 +1125,13 @@ impl LanguageServer for SparLanguageServer {
             None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
         };
 
+        let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(items) =
+            task_completion_items(state.ast.as_ref(), &state.source, symbols, offset)
+        {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
+
         // Case 1: after `path::` — enumerate section fields or imported symbols
         if let Some(path) = path_before_cursor(&state.source, pos) {
             if let Some(section) = symbols.sections.get(&path) {
@@ -1379,6 +1401,144 @@ mod tests {
     fn block_comment_detection_slash_star_in_line_comment_ignored() {
         let src = "// /* not block\nvar x";
         assert!(!is_cursor_in_block_comment(src, pos(1, 3)));
+    }
+
+    fn task_completion_labels(src: &str, marker: &str) -> Vec<String> {
+        let offset = src.find(marker).expect("completion marker");
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let program = Parser::new(tokens).parse().expect("parse");
+        let symbols = Resolver::new().resolve(&program, &[]).expect("resolve");
+        task_completion_items(Some(&program), src, &symbols, offset)
+            .expect("task completion context")
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
+    #[test]
+    fn completion_suggests_missing_task_metadata_fields() {
+        let src = concat!(
+            "task [Deploy] {\n",
+            "    description: \"Deploy the app\";\n",
+            "    quiet: true;\n",
+            "    /* complete here */\n",
+            "    run { echo deploy; };\n",
+            "}\n",
+        );
+        let labels = task_completion_labels(src, "/* complete here */");
+        assert!(labels.contains(&"dependsOn".to_string()));
+        assert!(labels.contains(&"env".to_string()));
+        assert!(!labels.contains(&"description".to_string()));
+        assert!(!labels.contains(&"quiet".to_string()));
+        assert!(!labels.contains(&"run".to_string()));
+    }
+
+    #[test]
+    fn completion_suggests_other_tasks_inside_depends_on() {
+        let src = concat!(
+            "task [Build] { run { cargo build; }; }\n",
+            "task [Test] { run { cargo test; }; }\n",
+            "task [Deploy] { dependsOn: [Build]; run { echo deploy; }; }\n",
+        );
+        let offset = src.find("Build]; run").expect("dependency") + "Build".len();
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let program = Parser::new(tokens).parse().expect("parse");
+        let symbols = Resolver::new().resolve(&program, &[]).expect("resolve");
+        let labels = task_completion_items(Some(&program), src, &symbols, offset)
+            .expect("dependsOn completion")
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"Build".to_string()));
+        assert!(labels.contains(&"Test".to_string()));
+        assert!(!labels.contains(&"Deploy".to_string()));
+    }
+
+    #[test]
+    fn completion_only_suggests_task_params_in_run_interpolation() {
+        let src = concat!(
+            "var environment: str = \"global\";\n",
+            "var region: str = \"west\";\n",
+            "task [Deploy](environment: str) { run { echo ${environment}; }; }\n",
+        );
+        let offset = src.rfind("environment}").expect("interpolation") + 2;
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let program = Parser::new(tokens).parse().expect("parse");
+        let symbols = Resolver::new().resolve(&program, &[]).expect("resolve");
+        let items = task_completion_items(Some(&program), src, &symbols, offset)
+            .expect("interpolation completion");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "environment");
+        assert!(!items.iter().any(|item| item.label == "region"));
+    }
+
+    #[test]
+    fn completion_recovers_task_params_immediately_after_interpolation_start() {
+        let valid = "task [Deploy](environment: str, *extra: str) { run { echo ok; }; }\n";
+        let symbols = resolve_src(valid);
+        let src = "task [Deploy](environment: str, *extra: str) { run { echo ${";
+        let items = task_completion_items(None, src, &symbols, src.len())
+            .expect("incomplete interpolation completion");
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["environment", "extra"]
+        );
+    }
+
+    fn task_hover(src: &str, needle: &str, occurrence: usize) -> String {
+        let offset = src
+            .match_indices(needle)
+            .nth(occurrence)
+            .map(|(offset, _)| offset + 1)
+            .expect("hover target");
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let program = Parser::new(tokens).parse().expect("parse");
+        task_hover_at_offset(&program, src, offset, needle).expect("task hover")
+    }
+
+    #[test]
+    fn hover_on_task_name_shows_signature_and_description() {
+        let src = concat!(
+            "task [Build] { run { cargo build; }; }\n",
+            "task [Deploy](environment: str = \"staging\", *extra: str) {\n",
+            "    description: \"Deploy to an environment\";\n",
+            "    dependsOn: [Build];\n",
+            "    run { ./deploy.sh ${environment} ${extra}; };\n",
+            "}\n",
+        );
+        let hover = task_hover(src, "Deploy", 0);
+        assert!(hover.contains("task [Deploy](environment: str = \"staging\", *extra: str)"));
+        assert!(hover.contains("Deploy to an environment"));
+        assert!(hover.contains("Depends on: `Build`"));
+    }
+
+    #[test]
+    fn hover_on_task_param_declaration_shows_default_and_variadic_marker() {
+        let src = concat!(
+            "task [Deploy](environment: str = \"staging\", *extra: str) {\n",
+            "    run { ./deploy.sh ${environment} ${extra}; };\n",
+            "}\n",
+        );
+        let environment = task_hover(src, "environment", 0);
+        assert!(environment.contains("environment: str = \"staging\""));
+        let extra = task_hover(src, "extra", 0);
+        assert!(extra.contains("*extra: str"));
+    }
+
+    #[test]
+    fn hover_on_task_param_interpolation_matches_declaration_hover() {
+        let src = concat!(
+            "task [Deploy](environment: str = \"staging\") {\n",
+            "    run { ./deploy.sh ${environment}; };\n",
+            "}\n",
+        );
+        assert_eq!(
+            task_hover(src, "environment", 0),
+            task_hover(src, "environment", 1)
+        );
     }
 
     fn span(line: u32, col: u32, start: usize, end: usize) -> Span {
@@ -1932,6 +2092,61 @@ mod tests {
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "pickPort", src).expect("pickPort not found");
         assert_eq!(tok.token_type, TT_FUNCTION);
+    }
+
+    #[test]
+    fn semantic_tokens_task_name_uses_registered_task_type() {
+        let src = "task [Deploy] { run { echo deploy; }; }";
+        let tokens = decode_semantic_tokens(src);
+        let tok = find_tok(&tokens, "Deploy", src).expect("Deploy not found");
+        assert_eq!(tok.token_type, TT_TASK);
+        assert_eq!(
+            TOKEN_TYPES[TT_TASK as usize],
+            SemanticTokenType::new("task")
+        );
+        assert_eq!(TOKEN_TYPES[TT_KEYWORD as usize], SemanticTokenType::KEYWORD);
+    }
+
+    #[test]
+    fn semantic_tokens_task_fields_and_interpolations_are_classified() {
+        let src = concat!(
+            "task [Deploy](environment: str) {\n",
+            "    description: \"Deploy\";\n",
+            "    dependsOn: [];\n",
+            "    env: { TARGET: \"prod\"; };\n",
+            "    run { echo ${environment}; };\n",
+            "}\n",
+        );
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(
+            find_tok(&tokens, "description", src).unwrap().token_type,
+            TT_TASK_FIELD
+        );
+        assert_eq!(
+            find_tok(&tokens, "dependsOn", src).unwrap().token_type,
+            TT_TASK_FIELD
+        );
+        assert_eq!(
+            find_tok(&tokens, "env", src).unwrap().token_type,
+            TT_TASK_FIELD
+        );
+        assert_eq!(
+            find_tok(&tokens, "TARGET", src).unwrap().token_type,
+            TT_PROPERTY
+        );
+        assert!(tokens.iter().any(|token| {
+            token.token_type == TT_PARAMETER
+                && src.lines().nth(token.line as usize).is_some_and(|line| {
+                    let start = token.start_char as usize;
+                    let end = start + token.length as usize;
+                    line.get(start..end) == Some("environment")
+                })
+        }));
+        assert_eq!(
+            find_tok(&tokens, "run", src).unwrap().token_type,
+            TT_TASK_FIELD
+        );
+        assert!(find_tok(&tokens, "echo", src).is_none());
     }
 
     #[test]

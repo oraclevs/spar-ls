@@ -8,7 +8,9 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::NAMESPACE, // 4
     SemanticTokenType::TYPE,      // 5
     SemanticTokenType::new("section"), // 6
-    SemanticTokenType::KEYWORD,   // 7
+    SemanticTokenType::new("task"), // 7
+    SemanticTokenType::new("taskField"), // 8
+    SemanticTokenType::KEYWORD,   // 9
 ];
 
 const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -22,7 +24,9 @@ const TT_PROPERTY: u32 = 3;
 const TT_NAMESPACE: u32 = 4;
 const TT_TYPE: u32 = 5;
 const TT_SECTION: u32 = 6;
-const TT_KEYWORD: u32 = 7;
+const TT_TASK: u32 = 7;
+const TT_TASK_FIELD: u32 = 8;
+const TT_KEYWORD: u32 = 9;
 const MOD_NONE: u32 = 0;
 const MOD_DECLARATION: u32 = 1;
 
@@ -276,9 +280,149 @@ fn collect_section_items_tokens(
     }
 }
 
+fn collect_named_type_token(
+    ty: &SparType,
+    source: &str,
+    from_byte: usize,
+    out: &mut Vec<RawToken>,
+) {
+    match ty {
+        SparType::Named(name) => {
+            if let Some(token) = find_ident_token(source, from_byte, name, TT_TYPE, MOD_NONE) {
+                out.push(token);
+            }
+        }
+        SparType::List(inner) => collect_named_type_token(inner, source, from_byte, out),
+        _ => {}
+    }
+}
+
+fn find_task_field_token(
+    source: &str,
+    body_start: usize,
+    body_end: usize,
+    name: &str,
+) -> Option<RawToken> {
+    let body = source.get(body_start..body_end)?;
+    let offset = body.match_indices(name).find_map(|(offset, _)| {
+        let before = &body[..offset];
+        let line_prefix = before.rsplit_once('\n').map_or(before, |(_, line)| line);
+        let prefix = line_prefix.trim_end();
+        let after = &body[offset + name.len()..];
+        ((prefix.is_empty() || prefix.ends_with('{') || prefix.ends_with(';'))
+            && after
+                .trim_start()
+                .starts_with(if name == "run" { '{' } else { ':' }))
+        .then_some(offset)
+    })?;
+    let (line, start_char) = byte_to_lsp_pos(source, body_start + offset);
+    Some(RawToken {
+        line,
+        start_char,
+        length: name.len() as u32,
+        token_type: TT_TASK_FIELD,
+        modifiers: MOD_DECLARATION,
+    })
+}
+
+fn collect_task_tokens(
+    program: &Program,
+    index: usize,
+    task: &spar::ast::TaskDecl,
+    source: &str,
+    out: &mut Vec<RawToken>,
+) {
+    use spar::ast::ShellTemplatePart;
+
+    out.push(raw_from_span(&task.name_span, TT_TASK, MOD_DECLARATION));
+    for param in &task.params {
+        if let Some(token) = find_ident_token(
+            source,
+            param.span.start,
+            &param.name,
+            TT_PARAMETER,
+            MOD_DECLARATION,
+        ) {
+            out.push(token);
+        }
+        collect_named_type_token(&param.ty, source, param.span.start, out);
+        if let Some(default) = &param.default {
+            collect_expr_tokens(default, source, out);
+        }
+    }
+
+    let expressions = [
+        ("description", task.description.as_ref()),
+        ("default", task.default.as_ref()),
+        ("quiet", task.quiet.as_ref()),
+        ("private", task.private.as_ref()),
+        ("group", task.group.as_ref()),
+        ("confirm", task.confirm.as_ref()),
+        ("os", task.os.as_ref()),
+        ("cwd", task.cwd.as_ref()),
+        ("shell", task.shell.as_ref()),
+    ];
+    let Some((body_start, body_end)) = task_body_bounds(program, source, index, task) else {
+        return;
+    };
+    // Task metadata is its own visual category, distinct from section properties.
+    for (name, expression) in expressions {
+        if let Some(expression) = expression {
+            if let Some(token) = find_task_field_token(source, body_start, body_end, name) {
+                out.push(token);
+            }
+            collect_expr_tokens(expression, source, out);
+        }
+    }
+    for name in ["dependsOn", "env", "run"] {
+        if let Some(token) = find_task_field_token(source, body_start, body_end, name) {
+            out.push(token);
+        }
+    }
+    for dependency in &task.depends_on {
+        out.push(raw_from_span(&dependency.span, TT_TASK, MOD_NONE));
+    }
+    let mut env_search = find_ident_byte(source, body_start, "env")
+        .map(|start| start + "env".len())
+        .unwrap_or(body_start);
+    for (name, value) in &task.env {
+        if let Some(token) = find_task_field_token(source, env_search, body_end, name) {
+            if let Some(start) = find_ident_byte(source, env_search, name) {
+                env_search = start + name.len();
+            }
+            out.push(RawToken {
+                token_type: TT_PROPERTY,
+                ..token
+            });
+        }
+        collect_expr_tokens(value, source, out);
+    }
+    for command in &task.run {
+        for part in &command.parts {
+            if let ShellTemplatePart::Expr(expression) = part {
+                let token_start = out.len();
+                collect_expr_tokens(expression, source, out);
+                for token in &mut out[token_start..] {
+                    if token.token_type != TT_VARIABLE {
+                        continue;
+                    }
+                    let line = source.lines().nth(token.line as usize).unwrap_or_default();
+                    let start = token.start_char as usize;
+                    let end = start + token.length as usize;
+                    if line.get(start..end).is_some_and(|name| {
+                        task.params.iter().any(|param| param.name == name)
+                    }) {
+                        token.token_type = TT_PARAMETER;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<RawToken>) {
     use spar::ast::TopLevelItem as TL;
-    for item in &program.items {
+    for (index, item) in program.items.iter().enumerate() {
         match item {
             TL::Var(vd) => {
                 if let Some(tok) = find_ident_token(
@@ -345,23 +489,7 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 collect_stmts_tokens(&fd.body.stmts, source, out);
             }
             TL::Task(td) => {
-                // Minimal: highlight the task's own name and its
-                // parameters, mirroring TL::Function above. No token
-                // classification inside `run { ... }` shell bodies or
-                // metadata expressions yet — that's deferred LSP feature
-                // work.
-                out.push(raw_from_span(&td.name_span, TT_FUNCTION, MOD_DECLARATION));
-                for param in &td.params {
-                    if let Some(tok) = find_ident_token(
-                        source,
-                        param.span.start,
-                        &param.name,
-                        TT_PARAMETER,
-                        MOD_DECLARATION,
-                    ) {
-                        out.push(tok);
-                    }
-                }
+                collect_task_tokens(program, index, td, source, out);
             }
             TL::Type(td) => {
                 out.push(raw_from_span(&td.name_span, TT_TYPE, MOD_DECLARATION));
@@ -424,7 +552,7 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
 fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
     const KEYWORDS: &[&str] = &[
         "var", "export", "import", "dynamic", "as", "private", "if", "else", "for",
-        "in", "return", "function", "type", "Schema", "SchemaFrom", "asPartOf", "from",
+        "in", "return", "function", "task", "type", "Schema", "SchemaFrom", "asPartOf", "from",
     ];
     const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "section"];
     let bytes = source.as_bytes();
@@ -446,6 +574,13 @@ fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
             };
             if let Some(token_type) = token_type {
                 let (line, col) = byte_to_lsp_pos(source, start);
+                if out.iter().any(|token| {
+                    token.line == line
+                        && token.start_char == col
+                        && token.length == word.len() as u32
+                }) {
+                    continue;
+                }
                 out.push(RawToken {
                     line,
                     start_char: col,
