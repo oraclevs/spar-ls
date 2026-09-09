@@ -298,6 +298,93 @@ fn format_hover_function(name: &str, entry: &FunctionEntry) -> String {
     )
 }
 
+fn format_hover_type(name: &str, entry: &TypeEntry) -> String {
+    let field_list: String = entry
+        .fields
+        .iter()
+        .map(|f| {
+            format!(
+                "  {}{}: {}",
+                f.name,
+                if f.optional { "?" } else { "" },
+                format_type_field_shape(&f.shape)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("```spar\ntype [{name}] {{\n{field_list}\n}}\n```")
+}
+
+fn format_hover_enum(name: &str, entry: &EnumEntry) -> String {
+    format!(
+        "```spar\nenum {name} {{ {} }}\n```",
+        entry.variants.join(", ")
+    )
+}
+
+fn format_hover_enum_variant(enum_name: &str, variant: &str) -> String {
+    format!("```spar\n{enum_name}::{variant}  // variant of enum {enum_name}\n```")
+}
+
+/// `type [Name]`/`enum Name`/`functionGroup Name` — bare declaration hover,
+/// or a qualified `Name::member` reference (`EnumName::Variant`,
+/// `GroupName::function`). Pulled out of the main `hover()` dispatch so it's
+/// directly unit-testable without a `SparLanguageServer`/`Client` instance.
+fn hover_type_enum_group(
+    symbols: &SymbolTable,
+    source: &str,
+    pos: Position,
+    word: &str,
+) -> Option<String> {
+    if let Some(entry) = symbols.types.get(word) {
+        return Some(format_hover_type(word, entry));
+    }
+    if let Some(entry) = symbols.enums.get(word) {
+        return Some(format_hover_enum(word, entry));
+    }
+    if let Some(entry) = symbols.function_groups.get(word) {
+        return Some(format_hover_function_group(word, entry));
+    }
+    let prefix = path_prefix_before_word(source, pos)?;
+    if prefix.len() != 1 {
+        return None;
+    }
+    if let Some(entry) = symbols.enums.get(&prefix[0]) {
+        if entry.variants.iter().any(|v| v == word) {
+            return Some(format_hover_enum_variant(&prefix[0], word));
+        }
+    }
+    if let Some(entry) = symbols.function_groups.get(&prefix[0]) {
+        if let Some(member) = entry.functions.get(word) {
+            return Some(format_hover_function(word, member));
+        }
+    }
+    None
+}
+
+fn format_hover_function_group(name: &str, entry: &FunctionGroupEntry) -> String {
+    let mut member_names: Vec<&String> = entry.functions.keys().collect();
+    member_names.sort();
+    let members: String = member_names
+        .iter()
+        .map(|member_name| {
+            let f = &entry.functions[member_name.as_str()];
+            let params = f
+                .params
+                .iter()
+                .map(|(pname, pty)| format!("{}: {}", pname, format_spar_type(pty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "  function {member_name}({params}) -> {}",
+                format_spar_type(&f.ret)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("```spar\nfunctionGroup {name} {{\n{members}\n}}\n```")
+}
+
 fn formatted_task_param(param: &spar::ast::TaskParam) -> String {
     let task = spar::ast::TaskDecl {
         name: "Hover".to_string(),
@@ -315,6 +402,8 @@ fn formatted_task_param(param: &spar::ast::TaskParam) -> String {
         shell: None,
         run_blocks: Vec::new(),
         span: param.span.clone(),
+        field_spans: Vec::new(),
+        closing_span: param.span.clone(),
     };
     let program = Program {
         is_schema_file: false,
@@ -410,6 +499,20 @@ fn task_hover_at_offset(
             param.name == word && cursor_on_task_param_declaration(source, param, offset)
         }) {
             return Some(format_hover_task_param(param));
+        }
+        // Hovering a `dependsOn: [Build]` entry shows the referenced task's
+        // own signature, same as hovering its declaration would.
+        if let Some(dep) = task
+            .depends_on
+            .iter()
+            .find(|dep| dep.name == word && dep.span.start <= offset && offset <= dep.span.end)
+        {
+            if let Some(referenced) = program.items.iter().find_map(|it| match it {
+                TopLevelItem::Task(t) if t.name == dep.name => Some(t.as_ref()),
+                _ => None,
+            }) {
+                return Some(format_hover_task(referenced));
+            }
         }
     }
 

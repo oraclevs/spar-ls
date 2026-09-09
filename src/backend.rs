@@ -38,11 +38,51 @@ impl SparLanguageServer {
                 import_symbols.insert(alias.clone(), symbols);
             }
         }
+
+        // A fresh, pre-splice parse of `source` to recover the
+        // Selective/TypeSelective/AsPartOf import declarations
+        // `expand_imports` already consumed out of `compilation.program` —
+        // needed so go-to-definition/references can redirect a spliced-in
+        // symbol to its real origin file/line instead of the local
+        // (possibly retagged) span baked into the compiled AST.
+        let mut spliced_import_decls = Vec::new();
+        let mut spliced_import_symbols = HashMap::new();
+        if let Ok(tokens) = Lexer::new(source).tokenize() {
+            if let Ok(raw_program) = Parser::new(tokens).parse() {
+                for item in raw_program.items {
+                    let spar::ast::TopLevelItem::Import(decl) = item else {
+                        continue;
+                    };
+                    if matches!(
+                        decl.kind,
+                        spar::ast::ImportKind::Aliased(_) | spar::ast::ImportKind::Schema
+                    ) {
+                        continue;
+                    }
+                    let full_path = base_dir.join(&decl.path);
+                    if let Ok(target_source) = std::fs::read_to_string(&full_path) {
+                        let target = Compiler::new(CompileOptions {
+                            base_dir: base_dir.to_path_buf(),
+                            evaluate: false,
+                            ..CompileOptions::default()
+                        })
+                        .compile(&target_source);
+                        if let Some(symbols) = target.symbols {
+                            spliced_import_symbols.insert(decl.path.clone(), symbols);
+                        }
+                    }
+                    spliced_import_decls.push(decl);
+                }
+            }
+        }
+
         DocumentState {
             source: source.to_string(),
             ast: compilation.program,
             symbols: compilation.symbols,
             import_symbols,
+            spliced_import_decls,
+            spliced_import_symbols,
             result: compilation.result,
             errors: compilation.errors,
             last_good_symbols: None,
@@ -63,6 +103,8 @@ impl SparLanguageServer {
                     ast: None,
                     symbols: None,
                     import_symbols: HashMap::new(),
+                    spliced_import_decls: Vec::new(),
+                    spliced_import_symbols: HashMap::new(),
                     result: None,
                     errors: all_errors,
                     last_good_symbols: None,
@@ -80,6 +122,8 @@ impl SparLanguageServer {
                     ast: None,
                     symbols: None,
                     import_symbols: HashMap::new(),
+                    spliced_import_decls: Vec::new(),
+                    spliced_import_symbols: HashMap::new(),
                     result: None,
                     errors: all_errors,
                     last_good_symbols: None,
@@ -130,6 +174,8 @@ impl SparLanguageServer {
                     ast: Some(program),
                     symbols: None,
                     import_symbols,
+                    spliced_import_decls: Vec::new(),
+                    spliced_import_symbols: HashMap::new(),
                     result: None,
                     errors: all_errors,
                     last_good_symbols: None,
@@ -167,6 +213,8 @@ impl SparLanguageServer {
             ast: Some(program),
             symbols: Some(sym),
             import_symbols,
+            spliced_import_decls: Vec::new(),
+            spliced_import_symbols: HashMap::new(),
             result: eval_result,
             errors: all_errors,
             last_good_symbols: None,

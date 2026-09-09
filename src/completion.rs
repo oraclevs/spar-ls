@@ -115,7 +115,7 @@ fn task_metadata_completion_items(
     [
         ("description", "Human-readable task description", "description: \"$1\";"),
         ("default", "Run when no task name is supplied", "default: ${1:true};"),
-        ("quiet", "Suppress command echoing", "quiet: ${1:true};"),
+        ("quiet", "Command echoing (quiet by default; set false to show commands)", "quiet: ${1:false};"),
         ("private", "Hide the task from public listings", "private: ${1:true};"),
         ("group", "Group shown in task listings", "group: \"$1\";"),
         ("confirm", "Confirmation prompt before running", "confirm: \"$1\";"),

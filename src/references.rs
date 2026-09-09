@@ -11,14 +11,18 @@
 // Precision limits, deliberate (same latitude given to `definition_at`'s
 // own section-field fallback): a `.field` access matches by field name
 // alone, not by base-expression type, so an unrelated object with a field
-// of the same name is not ruled out. A `Selective`/`TypeSelective`/
-// `AsPartOf` import splices the target file's symbols into the importing
-// file under their own bare name, so those files are searched as bare-word
-// matches too without checking a `Selective` import's item list actually
-// names this particular symbol — an accepted rare over-match rather than a
-// silent miss. Type references (a `type [Foo]` used as a field's type
-// elsewhere) are not walked — this covers the same value/task symbol kinds
-// `definition_at` resolves, not structural type usages.
+// of the same name is not ruled out. An `AsPartOf` import splices every
+// export of the target file in bare, so those files are always searched as
+// bare-word matches too. A `Selective`/`TypeSelective` import only searches
+// a file bare when its import statement actually requested that specific
+// name (see `SpliceRelationship::Named`) — an aliased request
+// (`import { foo as bar }`) is still matched against the *original* name
+// `foo`, even though occurrences in that file were renamed to `bar` at
+// splice time, so a locally-aliased selective import's usages are a known
+// gap (a false miss, not a false match). Type references (a `type [Foo]`
+// used as a field's type elsewhere) are not walked — this covers the same
+// value/task symbol kinds `definition_at` resolves, not structural type
+// usages.
 
 #[derive(Clone, Copy)]
 enum RefTarget<'a> {
@@ -244,6 +248,21 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
     }
 }
 
+/// The name of the local `functionGroup` declaring `member` as one of its
+/// functions, if any — lets same-file `Group::member()` call sites be found
+/// even though the search word itself is just `member` (bare), since
+/// `RefTarget::Bare` alone never matches a qualified `Group::member` call.
+fn local_function_group_owning<'a>(program: &'a Program, member: &str) -> Option<&'a str> {
+    program.items.iter().find_map(|item| {
+        let TopLevelItem::FunctionGroup(group) = item else { return None };
+        group
+            .functions
+            .iter()
+            .any(|f| f.name == member)
+            .then_some(group.name.as_str())
+    })
+}
+
 /// Every file transitively reachable by walking `importers` backwards from
 /// `defining_file` (i.e. every file that imports it, directly or through a
 /// chain of `asPartOf`/aliased/selective imports) — including
@@ -267,43 +286,76 @@ fn reachable_files(
     seen
 }
 
-/// Whichever alias (if any) `program` (the AST of `file_uri`) uses to
-/// import `defining_file`, plus whether it also splices the target's
-/// symbols in bare (`Selective`/`TypeSelective`/`AsPartOf`).
+/// How `program` (the AST of `file_uri`) reaches `defining_file`'s symbols
+/// bare, if at all.
+enum SpliceRelationship {
+    /// Not spliced (e.g. this file doesn't import `defining_file`, or does
+    /// so only via `Aliased`/`Schema`).
+    None,
+    /// `Selective`/`TypeSelective` — every *originally-declared* name it
+    /// requested (before any `as` alias renames it locally). Only a word
+    /// that's actually in this list was truly brought into scope here;
+    /// anything else is an unrelated same-named local symbol, not a
+    /// reference to the thing being searched for.
+    Named(Vec<String>),
+    /// `AsPartOf` — every export is implicitly pulled in, so any bare word
+    /// occurring in this file is fair game to search.
+    Everything,
+}
+
+/// Whichever alias (if any) `state`'s file uses to import `defining_file`,
+/// plus how (if at all) it splices the target's symbols in bare
+/// (`Selective`/`TypeSelective`/`AsPartOf`).
+///
+/// `Aliased`/`Schema` imports are read off `state.ast` — `expand_imports`
+/// leaves those import statements in place. `Selective`/`TypeSelective`/
+/// `AsPartOf` imports are spliced away entirely (replaced by their target's
+/// items) by the time `state.ast` exists, so those are read off
+/// `state.spliced_import_decls` instead — a fresh, pre-splice parse kept
+/// around for exactly this purpose (see `DocumentState`).
 fn import_relationship(
-    program: &Program,
+    state: &DocumentState,
     file_uri: &Url,
     defining_file: &std::path::Path,
-) -> (Option<String>, bool) {
+) -> (Option<String>, SpliceRelationship) {
     use spar::ast::ImportKind;
     let Some(base) = file_uri.to_file_path().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) else {
-        return (None, false);
+        return (None, SpliceRelationship::None);
     };
     let Ok(defining_canon) = defining_file.canonicalize() else {
-        return (None, false);
+        return (None, SpliceRelationship::None);
     };
-    for item in &program.items {
-        let TopLevelItem::Import(decl) = item else { continue };
+    if let Some(program) = &state.ast {
+        for item in &program.items {
+            let TopLevelItem::Import(decl) = item else { continue };
+            let ImportKind::Aliased(explicit) = &decl.kind else { continue };
+            let Ok(candidate) = base.join(&decl.path).canonicalize() else { continue };
+            if candidate != defining_canon {
+                continue;
+            }
+            let derived = std::path::Path::new(&decl.path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            return (Some(explicit.clone().unwrap_or(derived)), SpliceRelationship::None);
+        }
+    }
+    for decl in &state.spliced_import_decls {
         let Ok(candidate) = base.join(&decl.path).canonicalize() else { continue };
         if candidate != defining_canon {
             continue;
         }
         return match &decl.kind {
-            ImportKind::Aliased(explicit) => {
-                let derived = std::path::Path::new(&decl.path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                (Some(explicit.clone().unwrap_or(derived)), false)
-            }
-            ImportKind::Selective(_) | ImportKind::TypeSelective(_) | ImportKind::AsPartOf => {
-                (None, true)
-            }
-            ImportKind::Schema => (None, false),
+            ImportKind::Selective(items) | ImportKind::TypeSelective(items) => (
+                None,
+                SpliceRelationship::Named(items.iter().map(|i| i.name.clone()).collect()),
+            ),
+            ImportKind::AsPartOf => (None, SpliceRelationship::Everything),
+            ImportKind::Aliased(_) | ImportKind::Schema => (None, SpliceRelationship::None),
         };
     }
-    (None, false)
+    (None, SpliceRelationship::None)
 }
 
 /// The synchronous core: given who's being asked about (`word`, resolved
@@ -340,18 +392,28 @@ fn compute_references(
         let mut spans = Vec::new();
         if is_defining_file {
             collect_program_refs(program, RefTarget::Bare(word), &mut spans);
+            if let Some(group_name) = local_function_group_owning(program, word) {
+                collect_program_refs(program, RefTarget::Aliased(group_name, word), &mut spans);
+            }
         } else {
-            let (alias, spliced) = import_relationship(program, &candidate_uri, &defining_file);
+            let (alias, splice) = import_relationship(&state, &candidate_uri, &defining_file);
             if let Some(alias) = &alias {
                 collect_program_refs(program, RefTarget::Aliased(alias, word), &mut spans);
             }
-            if spliced {
+            let is_spliced = match &splice {
+                SpliceRelationship::Everything => true,
+                SpliceRelationship::Named(names) => names.iter().any(|n| n == word),
+                SpliceRelationship::None => false,
+            };
+            if is_spliced {
                 collect_program_refs(program, RefTarget::Bare(word), &mut spans);
             }
-            if alias.is_none() && !spliced {
+            if alias.is_none() && !is_spliced {
                 // Not actually related to the defining file through any
                 // import this file declares (reached only via a longer
-                // chain elsewhere in `importers`) — nothing to search.
+                // chain elsewhere in `importers`), or a Selective import
+                // exists but never actually requested this symbol —
+                // nothing to search.
                 continue;
             }
         }

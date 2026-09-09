@@ -1,6 +1,6 @@
 [package]
 name        = "spar-ls"
-version     = "0.1.0"
+version     = "0.2.0"
 edition     = "2021"
 description = "Language server (LSP) for the Spar configuration language"
 license     = "MIT"
@@ -16,4 +16,4 @@ path = "src/main.rs"
 tower-lsp = "0.20"
 tokio     = { version = "1", features = ["full"] }
 serde_json = "1"
-spar      = { path = "../spar" }
+spar      = { path = "../spar", version = "0.2.0" }

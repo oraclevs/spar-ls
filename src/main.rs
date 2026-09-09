@@ -12,7 +12,10 @@ use spar::formatter::{format_program, format_source, FormatConfig};
 use spar::lexer::Lexer;
 use spar::loader::{collect_imports, expand_imports, validate_schema_imports, ImportLoader};
 use spar::parser::Parser;
-use spar::resolver::{FunctionEntry, GlobalEntry, Resolver, SectionEntry, SymbolTable};
+use spar::resolver::{
+    EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, Resolver, SectionEntry,
+    SymbolTable, TypeEntry,
+};
 use spar::typechecker::TypeChecker;
 use spar::{Compilation, CompileOptions, Compiler, Span, SparError};
 
@@ -441,6 +444,8 @@ fn analyze_single_file(
                 ast: Some(program),
                 symbols: None,
                 import_symbols: HashMap::new(),
+                spliced_import_decls: Vec::new(),
+                spliced_import_symbols: HashMap::new(),
                 result: None,
                 errors,
                 last_good_symbols: None,
@@ -456,6 +461,8 @@ fn analyze_single_file(
         ast: Some(program),
         symbols: Some(sym),
         import_symbols: HashMap::new(),
+        spliced_import_decls: Vec::new(),
+        spliced_import_symbols: HashMap::new(),
         result: None,
         errors,
         last_good_symbols: None,
@@ -969,9 +976,13 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
-        // Case 4: section field — word matches a field name in a section.
-        // Use AST to find which section the cursor is actually inside, to avoid
-        // returning the wrong section when multiple sections share a field name.
+        // Case 4: section field — word matches a field name in the section the
+        // cursor is textually inside. Deliberately does NOT fall back to an
+        // ambiguous scan across every section sharing that field name here —
+        // more precise mechanisms (function/type/enum names, then type-checker
+        // expression inference) get a chance first; seeing the wrong section's
+        // field type is worse than briefly falling through. The ambiguous
+        // fallback still runs, as an actual last resort, right before `Ok(None)`.
         if !word.is_empty() {
             let offset = lsp_pos_to_byte_offset(&state.source, pos);
             // Find the innermost section whose span contains the cursor.
@@ -993,19 +1004,11 @@ impl LanguageServer for SparLanguageServer {
                     .next_back() // innermost (last) enclosing section
             });
 
-            // First try the specific containing section, then fall back to any match.
-            let field_hover = if let Some(ref path) = containing_path {
+            let field_hover = containing_path.as_ref().and_then(|path| {
                 symbols
                     .sections
                     .get(path)
                     .and_then(|sec| sec.fields.get(&word).map(|field| (path.clone(), field)))
-            } else {
-                None
-            };
-            let field_hover = field_hover.or_else(|| {
-                symbols.sections.iter().find_map(|(path, sec)| {
-                    sec.fields.get(&word).map(|field| (path.clone(), field))
-                })
             });
 
             if let Some((path, field)) = field_hover {
@@ -1034,6 +1037,21 @@ impl LanguageServer for SparLanguageServer {
         if !word.is_empty() {
             if let Some(entry) = symbols.functions.get(&word) {
                 let value = format_hover_function(&word, entry);
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 5b/5c/5d: `type [Name] { ... }`, `enum Name { ... }` (bare or
+        // `Name::Variant`), and `functionGroup Name { ... }` (bare or
+        // `Name::member`) declarations/references.
+        if !word.is_empty() {
+            if let Some(value) = hover_type_enum_group(symbols, &state.source, pos, &word) {
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1099,6 +1117,38 @@ impl LanguageServer for SparLanguageServer {
             let offset = lsp_pos_to_byte_offset(&state.source, pos);
             if let Some(elem_ty) = find_index_elem_type_at_offset(ast, symbols, offset) {
                 let value = format!("```spar\n: {}\n```", format_spar_type(&elem_ty));
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 10 (last resort): a field name matching some section, anywhere
+        // in the program, when nothing more precise recognized the cursor.
+        // Ambiguous when multiple sections share a field name — kept as the
+        // lowest-priority fallback rather than deleted outright, since a
+        // possibly-wrong section beats no hover at all.
+        if !word.is_empty() {
+            if let Some((path, field)) = symbols
+                .sections
+                .iter()
+                .find_map(|(path, sec)| sec.fields.get(&word).map(|field| (path.clone(), field)))
+            {
+                let ty_str = field
+                    .ty
+                    .as_ref()
+                    .map(format_spar_type)
+                    .unwrap_or_else(|| resolve_field_type_display(symbols, &path, &word));
+                let value = format!(
+                    "```spar\n(field) {}: {} in `[{}]`\n```",
+                    word,
+                    ty_str,
+                    path.join(".")
+                );
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1717,6 +1767,258 @@ mod tests {
             task_hover(src, "environment", 0),
             task_hover(src, "environment", 1)
         );
+    }
+
+    #[test]
+    fn hover_on_task_dependson_shows_referenced_task_signature() {
+        let src = concat!(
+            "task [Build] { description: \"Compile\"; run { cargo build; }; };\n",
+            "task [Test] {\n",
+            "    dependsOn: [Build];\n",
+            "    run { cargo test; };\n",
+            "};\n",
+        );
+        // `Build` inside `dependsOn: [Build];` — the second occurrence of "Build".
+        let hover = task_hover(src, "Build", 1);
+        assert!(hover.contains("task [Build]"), "{hover}");
+        assert!(hover.contains("Compile"), "{hover}");
+    }
+
+    fn pos_at(src: &str, byte_offset: usize) -> Position {
+        let (line, col) = byte_to_lsp_pos(src, byte_offset);
+        Position::new(line, col)
+    }
+
+    fn word_pos(src: &str, needle: &str, occurrence: usize) -> Position {
+        let offset = src
+            .match_indices(needle)
+            .nth(occurrence)
+            .map(|(offset, _)| offset + 1)
+            .expect("hover target");
+        pos_at(src, offset)
+    }
+
+    #[test]
+    fn hover_type_enum_group_shows_type_declaration() {
+        let src = "type [Border]{ width: int; };\n";
+        let symbols = resolve_src(src);
+        let pos = word_pos(src, "Border", 0);
+        let value = hover_type_enum_group(&symbols, src, pos, "Border").expect("type hover");
+        assert!(value.contains("type [Border]"), "{value}");
+        assert!(value.contains("width: int"), "{value}");
+    }
+
+    #[test]
+    fn hover_type_enum_group_shows_enum_declaration() {
+        let src = "enum Color { Red, Green, Blue };\n";
+        let symbols = resolve_src(src);
+        let pos = word_pos(src, "Color", 0);
+        let value = hover_type_enum_group(&symbols, src, pos, "Color").expect("enum hover");
+        assert!(value.contains("enum Color"), "{value}");
+        assert!(value.contains("Red, Green, Blue"), "{value}");
+    }
+
+    #[test]
+    fn hover_type_enum_group_shows_enum_variant() {
+        let src = "enum Color { Red, Green, Blue };\nvar c: Color = Color::Red;\n";
+        let symbols = resolve_src(src);
+        let pos = word_pos(src, "Red", 1);
+        let value = hover_type_enum_group(&symbols, src, pos, "Red").expect("variant hover");
+        assert!(value.contains("Color::Red"), "{value}");
+    }
+
+    #[test]
+    fn hover_type_enum_group_shows_function_group_declaration() {
+        let src = "functionGroup Handlers { function onStart() -> int { return 1; } };\n";
+        let symbols = resolve_src(src);
+        let pos = word_pos(src, "Handlers", 0);
+        let value =
+            hover_type_enum_group(&symbols, src, pos, "Handlers").expect("group hover");
+        assert!(value.contains("functionGroup Handlers"), "{value}");
+        assert!(value.contains("onStart"), "{value}");
+    }
+
+    #[test]
+    fn hover_type_enum_group_shows_function_group_member() {
+        let src = concat!(
+            "functionGroup Handlers { function onStart() -> int { return 1; } };\n",
+            "var x: int = Handlers::onStart();\n",
+        );
+        let symbols = resolve_src(src);
+        let pos = word_pos(src, "onStart", 1);
+        let value =
+            hover_type_enum_group(&symbols, src, pos, "onStart").expect("member hover");
+        assert!(value.contains("function onStart() -> int"), "{value}");
+    }
+
+    #[test]
+    fn hover_type_enum_group_returns_none_for_unrelated_word() {
+        let src = "var x: int = 1;\n";
+        let symbols = resolve_src(src);
+        let pos = word_pos(src, "x", 0);
+        assert!(hover_type_enum_group(&symbols, src, pos, "x").is_none());
+    }
+
+    #[test]
+    fn definition_resolves_function_group_member() {
+        let src = concat!(
+            "functionGroup Handlers { function onStart() -> int { return 1; } };\n",
+            "var x: int = Handlers::onStart();\n",
+        );
+        let dir = std::env::temp_dir();
+        let uri = Url::from_file_path(dir.join("group_member.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        let pos = word_pos(src, "onStart", 1);
+        let location = definition_at(&uri, &state, pos).expect("definition");
+        assert_eq!(location.range.start.line, 0);
+    }
+
+    #[test]
+    fn definition_resolves_function_group_name() {
+        let src = "functionGroup Handlers { function onStart() -> int { return 1; } };\n";
+        let dir = std::env::temp_dir();
+        let uri = Url::from_file_path(dir.join("group_name.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        let pos = word_pos(src, "Handlers", 0);
+        let location = definition_at(&uri, &state, pos).expect("definition");
+        assert_eq!(location.range.start.line, 0);
+    }
+
+    #[test]
+    fn definition_resolves_enum_variant_by_jumping_to_the_enum_declaration() {
+        let src = "enum Color { Red, Green, Blue };\nvar c: Color = Color::Red;\n";
+        let dir = std::env::temp_dir();
+        let uri = Url::from_file_path(dir.join("enum_variant.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        let pos = word_pos(src, "Red", 1);
+        let location = definition_at(&uri, &state, pos).expect("definition");
+        // No per-variant span exists in the AST — this lands on the enum
+        // declaration itself (line 0), not a variant-specific location.
+        assert_eq!(location.range.start.line, 0);
+    }
+
+    #[test]
+    fn references_finds_function_group_member_same_file() {
+        let src = concat!(
+            "functionGroup Handlers {\n",
+            "    function onStart() -> int { return 1; }\n",
+            "};\n",
+            "var a: int = Handlers::onStart();\n",
+            "var b: int = Handlers::onStart();\n",
+        );
+        let dir = std::env::temp_dir();
+        let uri = Url::from_file_path(dir.join("group_refs.spar")).unwrap();
+        let state = SparLanguageServer::analyze(src, &dir);
+        let pos = word_pos(src, "onStart", 1);
+        let location = definition_at(&uri, &state, pos).expect("definition");
+
+        let refs = compute_references("onStart", location, src.to_string(), &HashMap::new(), false);
+        assert_eq!(refs.len(), 2, "both call sites: {refs:?}");
+    }
+
+    #[test]
+    fn definition_resolves_selective_import_to_its_true_source_file_and_line() {
+        let dir = std::env::temp_dir().join(format!("spar_ls_selective_def_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.spar");
+        std::fs::write(
+            &base_path,
+            "export var unrelated: int = 0;\nfunction make() -> int { return 1; };\n",
+        )
+        .unwrap();
+        let main_src = "import { make } from \"base.spar\";\nvar value: int = make();\n";
+        let main_path = dir.join("main.spar");
+        std::fs::write(&main_path, main_src).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+
+        let state = SparLanguageServer::analyze(main_src, &dir);
+        let pos = word_pos(main_src, "make", 1);
+        let location = definition_at(&main_uri, &state, pos).expect("definition");
+
+        // Must land in base.spar (where `make` is really declared), on its
+        // real declaration line (1) — not on the local `import { make }`
+        // statement in main.spar (line 0).
+        assert_eq!(location.uri, Url::from_file_path(&base_path).unwrap());
+        assert_eq!(location.range.start.line, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn definition_resolves_as_part_of_import_to_its_true_source_file_and_line() {
+        let dir = std::env::temp_dir().join(format!("spar_ls_aspartof_def_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.spar");
+        std::fs::write(
+            &base_path,
+            "export var unrelated: int = 0;\nfunction make() -> int { return 1; };\n",
+        )
+        .unwrap();
+        let main_src = "import asPartOf \"base.spar\";\nvar value: int = make();\n";
+        let main_path = dir.join("main.spar");
+        std::fs::write(&main_path, main_src).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+
+        let state = SparLanguageServer::analyze(main_src, &dir);
+        let pos = word_pos(main_src, "make", 0);
+        let location = definition_at(&main_uri, &state, pos).expect("definition");
+
+        assert_eq!(location.uri, Url::from_file_path(&base_path).unwrap());
+        assert_eq!(location.range.start.line, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn references_does_not_search_a_file_for_a_name_its_selective_import_never_requested() {
+        let dir = std::env::temp_dir().join(format!("spar_ls_selective_refs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.spar");
+        std::fs::write(
+            &base_path,
+            "function make() -> int { return 1; };\nfunction helper() -> int { return 2; };\n",
+        )
+        .unwrap();
+
+        // `other.spar` imports `make` specifically — should be searched.
+        let other_src = "import { make } from \"base.spar\";\nvar a: int = make();\n";
+        let other_path = dir.join("other.spar");
+        std::fs::write(&other_path, other_src).unwrap();
+
+        // `unrelated.spar` imports `helper` (not `make`) from the same
+        // base.spar, and separately declares its own unrelated local
+        // `make` — its Selective import brought `helper` into scope, not
+        // `make`, so its local `make` must NOT be reported as a reference
+        // to base.spar's `make`.
+        let unrelated_src = concat!(
+            "import { helper } from \"base.spar\";\n",
+            "function make() -> int { return 99; };\n",
+            "var b: int = make();\n",
+        );
+        let unrelated_path = dir.join("unrelated.spar");
+        std::fs::write(&unrelated_path, unrelated_src).unwrap();
+
+        let state = SparLanguageServer::analyze(other_src, &dir);
+        let other_uri = Url::from_file_path(&other_path).unwrap();
+        let pos = word_pos(other_src, "make", 1);
+        let location = definition_at(&other_uri, &state, pos).expect("definition");
+        assert_eq!(location.uri, Url::from_file_path(&base_path).unwrap());
+
+        let mut importers = HashMap::new();
+        importers.insert(
+            base_path.canonicalize().unwrap(),
+            HashSet::from([
+                other_path.canonicalize().unwrap(),
+                unrelated_path.canonicalize().unwrap(),
+            ]),
+        );
+
+        let defining_source = std::fs::read_to_string(&base_path).unwrap();
+        let refs = compute_references("make", location, defining_source, &importers, false);
+        assert_eq!(refs.len(), 1, "only other.spar's real use, not unrelated.spar's own local make: {refs:?}");
+        assert_eq!(refs[0].uri, other_uri);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn span(line: u32, col: u32, start: usize, end: usize) -> Span {
