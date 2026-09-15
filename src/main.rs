@@ -598,7 +598,11 @@ impl LanguageServer for SparLanguageServer {
         let uri = params.text_document.uri;
         let src = params.text_document.text;
         let base = base_dir_from_uri(&uri);
-        let mut state = Self::analyze(&src, &base);
+        let mut state = uri
+            .to_file_path()
+            .ok()
+            .map(|path| Self::analyze_path(&src, &path))
+            .unwrap_or_else(|| Self::analyze(&src, &base));
         // Update reverse import map.
         if let Some(program) = &state.ast {
             if let Ok(file_path) = uri.to_file_path() {
@@ -658,7 +662,11 @@ impl LanguageServer for SparLanguageServer {
                 }
             };
 
-            let mut state = Self::analyze(&src, &base);
+            let mut state = uri
+                .to_file_path()
+                .ok()
+                .map(|path| Self::analyze_path(&src, &path))
+                .unwrap_or_else(|| Self::analyze(&src, &base));
             if state.symbols.is_some() {
                 state.last_good_symbols = state.symbols.clone();
                 state.last_good_import_symbols = state.import_symbols.clone();
@@ -724,7 +732,11 @@ impl LanguageServer for SparLanguageServer {
             }
         };
 
-        let mut state = Self::analyze(&src, &base);
+        let mut state = uri
+            .to_file_path()
+            .ok()
+            .map(|path| Self::analyze_path(&src, &path))
+            .unwrap_or_else(|| Self::analyze(&src, &base));
         if state.symbols.is_some() {
             state.last_good_symbols = state.symbols.clone();
             state.last_good_import_symbols = state.import_symbols.clone();
@@ -1177,12 +1189,18 @@ impl LanguageServer for SparLanguageServer {
             return Ok(None);
         }
 
+        let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Ok(path) = uri.to_file_path() {
+            if let Some(items) = package_metadata_completion_items(&path, &state.source, offset) {
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+        }
+
         let symbols = match state.effective_symbols() {
             Some(s) => s,
             None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
         };
 
-        let offset = lsp_pos_to_byte_offset(&state.source, pos);
         if let Some(items) = member_completion_items(&state.source, offset, symbols) {
             return Ok(Some(CompletionResponse::Array(items)));
         }
@@ -3121,6 +3139,72 @@ mod tests {
         assert_eq!(
             find_tok(&tokens, "index", src).unwrap().token_type,
             TT_VARIABLE
+        );
+    }
+
+    #[test]
+    fn lsp_discovers_package_lock_for_project_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(temp.path().join("spar.package.spar"), "[Package]{};").unwrap();
+        spar::package::Lockfile::default()
+            .write_atomically(&temp.path().join("spar.package.lock.spar"))
+            .unwrap();
+        let options = SparLanguageServer::compile_options(&src);
+        assert!(options.locator.is_some());
+    }
+
+    #[test]
+    fn lsp_analysis_preloads_manifest_schema_from_document_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spar.package.spar");
+        let state = SparLanguageServer::analyze_path(
+            concat!(
+                "[Package] -> SparPackage {\n",
+                "    version: \"1.0.0\";\n",
+                "    kind: \"application\";\n",
+                "};\n",
+            ),
+            &path,
+        );
+        let errors = state
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(errors.contains("missing required field 'name'"), "{errors}");
+        assert!(
+            !errors.contains("undefined type: `SparPackage`"),
+            "{errors}"
+        );
+    }
+
+    #[test]
+    fn manifest_completion_offers_fields_and_kind_values() {
+        let path = std::path::Path::new("spar.package.spar");
+        let source = "[Package] -> SparPackage {\n    \n};\n";
+        let fields =
+            package_metadata_completion_items(path, source, source.find("    ").unwrap() + 4)
+                .expect("package field completion");
+        for label in ["name", "version", "kind", "entry"] {
+            assert!(
+                fields.iter().any(|item| item.label == label),
+                "missing {label}"
+            );
+        }
+
+        let source = "[Package] -> SparPackage {\n    kind: \"\";\n};\n";
+        let offset = source.find("\"\"").unwrap() + 1;
+        let values = package_metadata_completion_items(path, source, offset)
+            .expect("package kind completion");
+        assert_eq!(
+            values
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["application", "library", "config"]
         );
     }
 }

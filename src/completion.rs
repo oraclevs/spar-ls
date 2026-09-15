@@ -17,6 +17,82 @@ fn keyword_items() -> Vec<CompletionItem> {
     .collect()
 }
 
+fn package_metadata_completion_items(
+    path: &std::path::Path,
+    source: &str,
+    offset: usize,
+) -> Option<Vec<CompletionItem>> {
+    let file_name = path.file_name()?.to_str()?;
+    let prefix = source.get(..offset)?;
+    let section = ["Package", "Dependencies", "Overrides", "Lock"]
+        .into_iter()
+        .filter_map(|name| prefix.rfind(&format!("[{name}]")).map(|at| (at, name)))
+        .max_by_key(|(at, _)| *at)?
+        .1;
+    let section_prefix = &prefix[prefix.rfind(&format!("[{section}]")).unwrap_or(0)..];
+    if section_prefix.matches('{').count() <= section_prefix.matches('}').count() {
+        return None;
+    }
+
+    let current_line = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
+    if file_name == spar::package::PACKAGE_MANIFEST_FILE
+        && section == "Package"
+        && current_line.contains("kind:")
+    {
+        return Some(value_items(&["application", "library", "config"]));
+    }
+    if file_name == spar::package::PACKAGE_LOCK_FILE && current_line.contains("sourceKind:") {
+        return Some(value_items(&["github", "path"]));
+    }
+
+    let fields: &[(&str, &str)] = match (file_name, section) {
+        (spar::package::PACKAGE_MANIFEST_FILE, "Package") => &[
+            ("name", "name: \"${1:package-name}\";"),
+            ("version", "version: \"${1:0.1.0}\";"),
+            ("kind", "kind: \"${1:application}\";"),
+            ("entry", "entry: \"${1:src/main.spar}\";"),
+        ],
+        (spar::package::PACKAGE_MANIFEST_FILE, "Dependencies") => &[
+            ("github dependency", "${1:alias}: str = \"github:${2:owner/repository@1.0.0}\";"),
+            ("local dependency", "${1:alias}: str = \"path:${2:../package}\";"),
+        ],
+        (spar::package::PACKAGE_MANIFEST_FILE, "Overrides") => &[("local override", "${1:alias}: str = \"path:${2:../package}\";")],
+        (spar::package::PACKAGE_LOCK_FILE, "Lock") => &[
+            ("formatVersion", "formatVersion: 1;"),
+            ("root", "root: [SparLockedDependency] = [$1];"),
+            ("packages", "packages: [SparLockedPackage] = [$1];"),
+        ],
+        _ => return None,
+    };
+    Some(
+        fields
+            .iter()
+            .filter(|(label, _)| {
+                label.contains(' ') || !section_prefix.contains(&format!("{label}:"))
+            })
+            .map(|(label, insert_text)| CompletionItem {
+                label: (*label).to_string(),
+                kind: Some(CompletionItemKind::FIELD),
+                insert_text: Some((*insert_text).to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            })
+            .collect(),
+    )
+}
+
+fn value_items(values: &[&str]) -> Vec<CompletionItem> {
+    values
+        .iter()
+        .map(|value| CompletionItem {
+            label: (*value).to_string(),
+            kind: Some(CompletionItemKind::VALUE),
+            insert_text: Some((*value).to_string()),
+            ..Default::default()
+        })
+        .collect()
+}
+
 fn top_level_start(item: &TopLevelItem) -> usize {
     match item {
         TopLevelItem::Import(d) => d.span.start,

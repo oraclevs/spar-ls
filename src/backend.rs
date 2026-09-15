@@ -8,12 +8,46 @@ struct SparLanguageServer {
 }
 
 impl SparLanguageServer {
-    fn analyze(source: &str, base_dir: &std::path::Path) -> DocumentState {
-        let compilation = Compiler::new(CompileOptions {
+    fn attach_package_locator(options: &mut CompileOptions, base_dir: &std::path::Path) {
+        let project_dir = base_dir
+            .ancestors()
+            .find(|directory| directory.join(spar::package::PACKAGE_MANIFEST_FILE).is_file());
+        if let Some(project_dir) = project_dir {
+            let lock_path = project_dir.join(spar::package::PACKAGE_LOCK_FILE);
+            if let Ok(lockfile) = spar::package::Lockfile::read(&lock_path) {
+                let store =
+                    spar::package::PackageStore::new(spar::package::StorePaths::from_env());
+                options.locator = Some(spar::package::ModuleLocator::for_root(lockfile, store));
+            }
+        }
+    }
+
+    fn compile_options(base_dir: &std::path::Path) -> CompileOptions {
+        let mut options = CompileOptions {
             base_dir: base_dir.to_path_buf(),
             ..CompileOptions::default()
-        })
-        .compile(source);
+        };
+        Self::attach_package_locator(&mut options, base_dir);
+        options
+    }
+
+    fn compile_options_for_path(path: &std::path::Path) -> CompileOptions {
+        let mut options = CompileOptions::for_path(path);
+        Self::attach_package_locator(
+            &mut options,
+            path.parent().unwrap_or(std::path::Path::new(".")),
+        );
+        options
+    }
+
+    fn analyze(source: &str, base_dir: &std::path::Path) -> DocumentState {
+        let compilation = Compiler::new(Self::compile_options(base_dir)).compile(source);
+        Self::document_state(source, base_dir, compilation)
+    }
+
+    fn analyze_path(source: &str, path: &std::path::Path) -> DocumentState {
+        let base_dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let compilation = Compiler::new(Self::compile_options_for_path(path)).compile(source);
         Self::document_state(source, base_dir, compilation)
     }
 
@@ -24,16 +58,13 @@ impl SparLanguageServer {
     ) -> DocumentState {
         let mut import_symbols = HashMap::new();
         for (alias, loaded) in &compilation.imports {
-            let full_path = base_dir.join(&loaded.path);
+            let full_path = &loaded.resolved_path;
             let Ok(import_source) = std::fs::read_to_string(full_path) else {
                 continue;
             };
-            let imported = Compiler::new(CompileOptions {
-                base_dir: base_dir.to_path_buf(),
-                evaluate: false,
-                ..CompileOptions::default()
-            })
-            .compile(&import_source);
+            let mut options = Self::compile_options_for_path(full_path);
+            options.evaluate = false;
+            let imported = Compiler::new(options).compile(&import_source);
             if let Some(symbols) = imported.symbols {
                 import_symbols.insert(alias.clone(), symbols);
             }
@@ -59,14 +90,15 @@ impl SparLanguageServer {
                     ) {
                         continue;
                     }
-                    let full_path = base_dir.join(&decl.path);
+                    let full_path = Self::compile_options(base_dir)
+                        .locator
+                        .as_ref()
+                        .and_then(|locator| locator.resolve_import(base_dir, &decl.path))
+                        .unwrap_or_else(|| base_dir.join(&decl.path));
                     if let Ok(target_source) = std::fs::read_to_string(&full_path) {
-                        let target = Compiler::new(CompileOptions {
-                            base_dir: base_dir.to_path_buf(),
-                            evaluate: false,
-                            ..CompileOptions::default()
-                        })
-                        .compile(&target_source);
+                        let mut options = Self::compile_options_for_path(&full_path);
+                        options.evaluate = false;
+                        let target = Compiler::new(options).compile(&target_source);
                         if let Some(symbols) = target.symbols {
                             spliced_import_symbols.insert(decl.path.clone(), symbols);
                         }
@@ -243,8 +275,7 @@ impl SparLanguageServer {
             let Ok(src2) = std::fs::read_to_string(&importer_path) else {
                 continue;
             };
-            let base2 = importer_path.parent().unwrap_or(std::path::Path::new("."));
-            let state2 = Self::analyze(&src2, base2);
+            let state2 = Self::analyze_path(&src2, &importer_path);
             let Ok(uri2) = Url::from_file_path(&importer_path) else {
                 continue;
             };
@@ -292,7 +323,7 @@ impl SparLanguageServer {
                 continue;
             };
             let base = path.parent().unwrap_or(root);
-            let state = Self::analyze(&src, base);
+            let state = Self::analyze_path(&src, &path);
             if let Some(program) = &state.ast {
                 if let Ok(canon) = path.canonicalize() {
                     let imports = extract_imported_paths(program, base);

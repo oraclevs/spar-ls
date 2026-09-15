@@ -637,6 +637,7 @@ version = "0.3.0"
 dependencies = [
  "serde_json",
  "spar",
+ "tempfile",
  "tokio",
  "tower-lsp",
 ]
