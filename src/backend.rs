@@ -197,7 +197,13 @@ impl SparLanguageServer {
         }
 
         let eval_result = if all_errors.is_empty() {
-            match Evaluator::evaluate_with_imports_and_base(&program, &sym, &imports, base_dir) {
+            match Evaluator::evaluate_with_imports_and_base(
+                &program,
+                &sym,
+                &imports,
+                base_dir,
+                spar::HostRegistry::default(),
+            ) {
                 Ok(r) => Some(r),
                 Err(e) => {
                     all_errors.extend(e);
@@ -301,4 +307,3 @@ impl SparLanguageServer {
         }
     }
 }
-

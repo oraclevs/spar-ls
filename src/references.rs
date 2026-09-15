@@ -162,6 +162,11 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
     for stmt in stmts {
         match stmt {
             FuncStmt::LocalVar(v) => collect_expr_refs(&v.value, target, out),
+            FuncStmt::Assignment { value, .. } | FuncStmt::Expression(value, _) => {
+                collect_expr_refs(value, target, out)
+            }
+            FuncStmt::Break(_) | FuncStmt::Continue(_) => {}
+            FuncStmt::Return(ReturnValue::Void, _) => {}
             FuncStmt::Return(ReturnValue::Expr(e), _) => collect_expr_refs(e, target, out),
             FuncStmt::Return(ReturnValue::SectionBlock(fields), _) => {
                 for f in fields {
@@ -173,9 +178,9 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
                 collect_stmts_refs(&i.then_stmts, target, out);
                 collect_stmts_refs(&i.else_stmts, target, out);
             }
-            FuncStmt::For { iterable, body, .. } => {
-                collect_expr_refs(iterable, target, out);
-                collect_stmts_refs(body, target, out);
+            FuncStmt::For(statement) => {
+                collect_expr_refs(&statement.iterable, target, out);
+                collect_stmts_refs(&statement.body, target, out);
             }
         }
     }
@@ -201,6 +206,9 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
                 for f in &gd.functions {
                     collect_stmts_refs(&f.body.stmts, target, out);
                 }
+            }
+            TL::Statement(statement) => {
+                collect_stmts_refs(std::slice::from_ref(statement), target, out)
             }
             TL::Task(td) => {
                 for param in &td.params {

@@ -39,10 +39,14 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
     fn stmts(ss: &[FuncStmt], off: usize) -> Option<&Expr> {
         ss.iter().find_map(|s| match s {
             FuncStmt::LocalVar(v) => search(&v.value,off),
+            FuncStmt::Assignment { value, .. } => search(value, off),
+            FuncStmt::Expression(e, _) => search(e, off),
+            FuncStmt::Break(_) | FuncStmt::Continue(_) => None,
+            FuncStmt::Return(ReturnValue::Void, _) => None,
             FuncStmt::Return(ReturnValue::Expr(e),_) => search(e,off),
             FuncStmt::Return(ReturnValue::SectionBlock(fs),_) => fs.iter().find_map(|f|search(&f.value,off)),
             FuncStmt::If(i) => search(&i.condition,off).or_else(||stmts(&i.then_stmts,off)).or_else(||stmts(&i.else_stmts,off)),
-            FuncStmt::For { iterable, body, .. } => search(iterable,off).or_else(||stmts(body,off)),
+            FuncStmt::For(statement) => search(&statement.iterable,off).or_else(||stmts(&statement.body,off)),
         })
     }
     program.items.iter().find_map(|item| match item {
@@ -51,6 +55,7 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
         TopLevelItem::Section(s) => s.items.iter().find_map(|i| match i { SectionItem::Field(f)=>match &f.value {Some(FieldValue::Expr(e))=>search(e,offset), _=>None}, SectionItem::Spread(s)=>search(&s.expr,offset)}),
         TopLevelItem::Function(f) => stmts(&f.body.stmts,offset),
         TopLevelItem::FunctionGroup(g) => g.functions.iter().find_map(|f|stmts(&f.body.stmts,offset)),
+        TopLevelItem::Statement(statement) => stmts(std::slice::from_ref(statement), offset),
         _ => None,
     })
 }
@@ -178,6 +183,7 @@ pub fn find_index_elem_type_at_offset(
                     }
                 }
                 FuncStmt::Return(rv, _) => match rv {
+                    ReturnValue::Void => {}
                     ReturnValue::Expr(e) => {
                         if let Some(t) = expr_index_elem(e, symbols, offset) {
                             return Some(t);
@@ -202,14 +208,20 @@ pub fn find_index_elem_type_at_offset(
                         return Some(t);
                     }
                 }
-                FuncStmt::For { iterable, body, .. } => {
-                    if let Some(t) = expr_index_elem(iterable, symbols, offset) {
+                FuncStmt::For(statement) => {
+                    if let Some(t) = expr_index_elem(&statement.iterable, symbols, offset) {
                         return Some(t);
                     }
-                    if let Some(t) = stmts_index_elem(body, symbols, offset) {
+                    if let Some(t) = stmts_index_elem(&statement.body, symbols, offset) {
                         return Some(t);
                     }
                 }
+                FuncStmt::Assignment { value, .. } | FuncStmt::Expression(value, _) => {
+                    if let Some(t) = expr_index_elem(value, symbols, offset) {
+                        return Some(t);
+                    }
+                }
+                FuncStmt::Break(_) | FuncStmt::Continue(_) => {}
             }
         }
         None
@@ -408,6 +420,7 @@ fn formatted_task_param(param: &spar::ast::TaskParam) -> String {
     let program = Program {
         is_schema_file: false,
         load_env: None,
+        shebang: None,
         items: vec![TopLevelItem::Task(Box::new(task.clone()))],
     };
     let formatted = format_program(&program, &FormatConfig::default());
@@ -438,6 +451,7 @@ fn format_hover_task(task: &spar::ast::TaskDecl) -> String {
         let program = Program {
             is_schema_file: false,
             load_env: None,
+            shebang: None,
             items: vec![TopLevelItem::Task(Box::new(description_task))],
         };
         let formatted = format_program(&program, &FormatConfig::default());

@@ -13,8 +13,8 @@ use spar::lexer::Lexer;
 use spar::loader::{collect_imports, expand_imports, validate_schema_imports, ImportLoader};
 use spar::parser::Parser;
 use spar::resolver::{
-    EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, Resolver, SectionEntry,
-    SymbolTable, TypeEntry,
+    EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, Resolver, SectionEntry, SymbolTable,
+    TypeEntry,
 };
 use spar::typechecker::TypeChecker;
 use spar::{Compilation, CompileOptions, Compiler, Span, SparError};
@@ -34,6 +34,7 @@ fn format_spar_type(ty: &SparType) -> String {
         SparType::Bool => "bool".to_string(),
         SparType::List(inner) => format!("[{}]", format_spar_type(inner)),
         SparType::Section => "section".to_string(),
+        SparType::Void => "void".to_string(),
         SparType::Named(name) => name.clone(),
     }
 }
@@ -1832,8 +1833,7 @@ mod tests {
         let src = "functionGroup Handlers { function onStart() -> int { return 1; } };\n";
         let symbols = resolve_src(src);
         let pos = word_pos(src, "Handlers", 0);
-        let value =
-            hover_type_enum_group(&symbols, src, pos, "Handlers").expect("group hover");
+        let value = hover_type_enum_group(&symbols, src, pos, "Handlers").expect("group hover");
         assert!(value.contains("functionGroup Handlers"), "{value}");
         assert!(value.contains("onStart"), "{value}");
     }
@@ -1846,8 +1846,7 @@ mod tests {
         );
         let symbols = resolve_src(src);
         let pos = word_pos(src, "onStart", 1);
-        let value =
-            hover_type_enum_group(&symbols, src, pos, "onStart").expect("member hover");
+        let value = hover_type_enum_group(&symbols, src, pos, "onStart").expect("member hover");
         assert!(value.contains("function onStart() -> int"), "{value}");
     }
 
@@ -1918,7 +1917,8 @@ mod tests {
 
     #[test]
     fn definition_resolves_selective_import_to_its_true_source_file_and_line() {
-        let dir = std::env::temp_dir().join(format!("spar_ls_selective_def_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("spar_ls_selective_def_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let base_path = dir.join("base.spar");
         std::fs::write(
@@ -1971,7 +1971,8 @@ mod tests {
 
     #[test]
     fn references_does_not_search_a_file_for_a_name_its_selective_import_never_requested() {
-        let dir = std::env::temp_dir().join(format!("spar_ls_selective_refs_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("spar_ls_selective_refs_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let base_path = dir.join("base.spar");
         std::fs::write(
@@ -2015,7 +2016,11 @@ mod tests {
 
         let defining_source = std::fs::read_to_string(&base_path).unwrap();
         let refs = compute_references("make", location, defining_source, &importers, false);
-        assert_eq!(refs.len(), 1, "only other.spar's real use, not unrelated.spar's own local make: {refs:?}");
+        assert_eq!(
+            refs.len(),
+            1,
+            "only other.spar's real use, not unrelated.spar's own local make: {refs:?}"
+        );
         assert_eq!(refs[0].uri, other_uri);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3084,6 +3089,38 @@ mod tests {
         assert_eq!(
             resolve_field_type_display(&symbols, &path, "border"),
             "Border"
+        );
+    }
+
+    #[test]
+    fn phase0_keywords_are_completed() {
+        let labels: Vec<String> = keyword_items().into_iter().map(|item| item.label).collect();
+        for keyword in ["mut", "break", "continue"] {
+            assert!(
+                labels.iter().any(|label| label == keyword),
+                "missing {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase0_scripting_words_receive_semantic_tokens() {
+        let src = concat!(
+            "function main() -> void {\n",
+            "    var mut count: int = 0;\n",
+            "    for (index, value) in [1] { count = index + value; break; }\n",
+            "    return;\n",
+            "};\n",
+        );
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(find_tok(&tokens, "void", src).unwrap().token_type, TT_TYPE);
+        assert_eq!(
+            find_tok(&tokens, "mut", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(
+            find_tok(&tokens, "index", src).unwrap().token_type,
+            TT_VARIABLE
         );
     }
 }

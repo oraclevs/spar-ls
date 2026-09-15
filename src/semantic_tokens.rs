@@ -338,7 +338,17 @@ fn collect_stmts_tokens(
                 }
                 collect_expr_tokens(&lv.value, source, kinds, out);
             }
+            FS::Assignment { name, value, span } => {
+                if let Some(token) = find_ident_token(source, span.start, name, TT_VARIABLE, MOD_NONE)
+                {
+                    out.push(token);
+                }
+                collect_expr_tokens(value, source, kinds, out);
+            }
+            FS::Expression(expression, _) => collect_expr_tokens(expression, source, kinds, out),
+            FS::Break(_) | FS::Continue(_) => {}
             FS::Return(rv, _) => match rv {
+                ReturnValue::Void => {}
                 ReturnValue::Expr(e) => collect_expr_tokens(e, source, kinds, out),
                 ReturnValue::SectionBlock(fields) => {
                     for rf in fields {
@@ -351,19 +361,32 @@ fn collect_stmts_tokens(
                 collect_stmts_tokens(&if_stmt.then_stmts, source, kinds, out);
                 collect_stmts_tokens(&if_stmt.else_stmts, source, kinds, out);
             }
-            FS::For {
-                var_name,
-                iterable,
-                body,
-                span,
-            } => {
-                if let Some(tok) =
-                    find_ident_token(source, span.start, var_name, TT_VARIABLE, MOD_DECLARATION)
-                {
-                    out.push(tok);
+            FS::For(statement) => {
+                match &statement.binding {
+                    spar::ast::ForBinding::Value { name, span } => {
+                        if let Some(token) = find_ident_token(
+                            source,
+                            span.start,
+                            name,
+                            TT_VARIABLE,
+                            MOD_DECLARATION,
+                        ) {
+                            out.push(token);
+                        }
+                    }
+                    spar::ast::ForBinding::Indexed {
+                        index_name,
+                        index_span,
+                        value_name,
+                        value_span,
+                    } => {
+                        out.push(raw_from_span(index_span, TT_VARIABLE, MOD_DECLARATION));
+                        out.push(raw_from_span(value_span, TT_VARIABLE, MOD_DECLARATION));
+                        let _ = (index_name, value_name);
+                    }
                 }
-                collect_expr_tokens(iterable, source, kinds, out);
-                collect_stmts_tokens(body, source, kinds, out);
+                collect_expr_tokens(&statement.iterable, source, kinds, out);
+                collect_stmts_tokens(&statement.body, source, kinds, out);
             }
         }
     }
@@ -686,6 +709,9 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                     collect_stmts_tokens(&f.body.stmts, source, &kinds, out);
                 }
             }
+            TL::Statement(statement) => {
+                collect_stmts_tokens(std::slice::from_ref(statement), source, &kinds, out);
+            }
         }
     }
     collect_language_words(source, out);
@@ -693,10 +719,10 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
 
 fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
     const KEYWORDS: &[&str] = &[
-        "var", "export", "import", "dynamic", "as", "private", "if", "else", "for",
-        "in", "return", "function", "task", "type", "Schema", "SchemaFrom", "asPartOf", "from",
+        "var", "mut", "export", "import", "dynamic", "as", "private", "if", "else", "for",
+        "in", "break", "continue", "return", "function", "task", "type", "Schema", "SchemaFrom", "asPartOf", "from",
     ];
-    const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "section"];
+    const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "section", "void"];
     let bytes = source.as_bytes();
     let mut i = 0;
     while i < bytes.len() {

@@ -5,7 +5,7 @@ fn keyword_items() -> Vec<CompletionItem> {
         // declaration keywords
         "var", "export", "private", "import", "dynamic", "as", "section", "function", "task",
         // control keywords
-        "if", "else", "for", "in", "return", // literals
+        "if", "else", "for", "in", "break", "continue", "return", "mut", // literals
         "true", "false",
     ]
     .iter()
@@ -30,6 +30,16 @@ fn top_level_start(item: &TopLevelItem) -> usize {
         TopLevelItem::Enum(d) => d.span.start,
         TopLevelItem::FunctionGroup(d) => d.span.start,
         TopLevelItem::Task(d) => d.span.start,
+        TopLevelItem::Statement(statement) => match statement {
+            FuncStmt::LocalVar(d) => d.span.start,
+            FuncStmt::Assignment { span, .. }
+            | FuncStmt::Expression(_, span)
+            | FuncStmt::Return(_, span)
+            | FuncStmt::Break(span)
+            | FuncStmt::Continue(span) => span.start,
+            FuncStmt::If(d) => d.span.start,
+            FuncStmt::For(d) => d.span.start,
+        },
     }
 }
 

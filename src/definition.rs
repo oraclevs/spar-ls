@@ -56,11 +56,23 @@ fn local_decl_span(program: &Program, offset: usize, word: &str) -> Option<Span>
                     if v.span.start <= offset && v.name == word { *found = Some(v.span.clone()); }
                 }
                 FuncStmt::If(i) => { walk(&i.then_stmts, offset, word, found); walk(&i.else_stmts, offset, word, found); }
-                FuncStmt::For { var_name, body, span, .. } => {
-                    if span.start <= offset && var_name == word { *found = Some(span.clone()); }
-                    walk(body, offset, word, found);
+                FuncStmt::For(statement) => {
+                    match &statement.binding {
+                        spar::ast::ForBinding::Value { name, span } => {
+                            if span.start <= offset && name == word { *found = Some(span.clone()); }
+                        }
+                        spar::ast::ForBinding::Indexed { index_name, index_span, value_name, value_span } => {
+                            if index_span.start <= offset && index_name == word { *found = Some(index_span.clone()); }
+                            if value_span.start <= offset && value_name == word { *found = Some(value_span.clone()); }
+                        }
+                    }
+                    walk(&statement.body, offset, word, found);
                 }
-                FuncStmt::Return(_, _) => {}
+                FuncStmt::Return(_, _)
+                | FuncStmt::Assignment { .. }
+                | FuncStmt::Expression(_, _)
+                | FuncStmt::Break(_)
+                | FuncStmt::Continue(_) => {}
             }
         }
     }
