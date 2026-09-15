@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "spar"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "spar-ls"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "spar",
