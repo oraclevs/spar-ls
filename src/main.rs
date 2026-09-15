@@ -35,6 +35,7 @@ fn format_spar_type(ty: &SparType) -> String {
         SparType::List(inner) => format!("[{}]", format_spar_type(inner)),
         SparType::Section => "section".to_string(),
         SparType::Void => "void".to_string(),
+        SparType::Shell => "shell".to_string(),
         SparType::Named(name) => name.clone(),
     }
 }
@@ -2382,6 +2383,7 @@ mod tests {
         assert_eq!(format_spar_type(&SparType::Str), "str");
         assert_eq!(format_spar_type(&SparType::Bool), "bool");
         assert_eq!(format_spar_type(&SparType::Section), "section");
+        assert_eq!(format_spar_type(&SparType::Shell), "shell");
         assert_eq!(
             format_spar_type(&SparType::List(Box::new(SparType::Int))),
             "[int]"
@@ -2919,6 +2921,36 @@ mod tests {
             TT_KEYWORD
         );
         assert_eq!(find_tok(&tokens, "int", src).unwrap().token_type, TT_TYPE);
+    }
+
+    #[test]
+    fn semantic_tokens_classify_shell_syntax_and_type() {
+        let src = concat!(
+            "function plan() -> shell { return command echo hi; };\n",
+            "function run() -> int { var r: ExecResult = exec shell { true; }; return r.exitCode; };\n",
+        );
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(find_tok(&tokens, "shell", src).unwrap().token_type, TT_TYPE);
+        assert_eq!(
+            find_tok(&tokens, "command", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(
+            find_tok(&tokens, "exec", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        let block_shell = tokens
+            .iter()
+            .find(|token| {
+                token.line == 1 && {
+                    let line = src.lines().nth(1).unwrap();
+                    let start = token.start_char as usize;
+                    let end = start + token.length as usize;
+                    line.get(start..end) == Some("shell")
+                }
+            })
+            .expect("shell block keyword not found");
+        assert_eq!(block_shell.token_type, TT_KEYWORD);
     }
 
     #[test]

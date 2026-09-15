@@ -313,6 +313,17 @@ fn collect_expr_tokens(
             collect_expr_tokens(base, source, kinds, out);
             out.push(raw_from_span(field_span, TT_PROPERTY, MOD_NONE));
         }
+        Expr::Shell(shell) | Expr::ExecShell(shell) => {
+            let keyword = source
+                .get(shell.span.start..)
+                .filter(|tail| tail.starts_with("command"))
+                .map_or("shell", |_| "command");
+            if let Some(token) =
+                find_ident_token(source, shell.span.start, keyword, TT_KEYWORD, MOD_NONE)
+            {
+                out.push(token);
+            }
+        }
         Expr::Literal(_) => {}
     }
 }
@@ -720,9 +731,9 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
 fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
     const KEYWORDS: &[&str] = &[
         "var", "mut", "export", "import", "dynamic", "as", "private", "if", "else", "for",
-        "in", "break", "continue", "return", "function", "task", "type", "Schema", "SchemaFrom", "asPartOf", "from",
+        "in", "break", "continue", "return", "function", "task", "type", "Schema", "SchemaFrom", "asPartOf", "from", "command", "exec",
     ];
-    const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "section", "void"];
+    const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "section", "void", "shell"];
     let bytes = source.as_bytes();
     let mut i = 0;
     while i < bytes.len() {

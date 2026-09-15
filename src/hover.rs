@@ -11,6 +11,7 @@ fn expr_span(expr: &spar::ast::Expr) -> &Span {
         Expr::List(_, s) | Expr::Grouped(_, s) | Expr::Object(_, s) => s,
         Expr::Call { span, .. } | Expr::Unary { span, .. } | Expr::Comprehension { span, .. }
         | Expr::Index { span, .. } | Expr::FieldAccess { span, .. } => span,
+        Expr::Shell(shell) | Expr::ExecShell(shell) => &shell.span,
     }
 }
 
@@ -32,7 +33,7 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
             Expr::FieldAccess { base, .. } => search(base, off),
             Expr::String(s) => s.parts.iter().find_map(|p| if let StringPart::Expr(x)=p { search(x,off) } else { None }),
             Expr::Object(items, _) => items.iter().find_map(|i| match i { SectionItem::Field(f) => match &f.value { Some(FieldValue::Expr(x)) => search(x,off), _=>None }, SectionItem::Spread(s)=>search(&s.expr,off) }),
-            Expr::Literal(_) | Expr::NamespaceRef(_) => None,
+            Expr::Literal(_) | Expr::NamespaceRef(_) | Expr::Shell(_) | Expr::ExecShell(_) => None,
         };
         child.or(Some(e))
     }
@@ -165,7 +166,7 @@ pub fn find_index_elem_type_at_offset(
                 })
             }
             Expr::FieldAccess { base, .. } => expr_index_elem(base, symbols, offset),
-            Expr::Literal(_) | Expr::NamespaceRef(_) => None,
+            Expr::Literal(_) | Expr::NamespaceRef(_) | Expr::Shell(_) | Expr::ExecShell(_) => None,
         }
     }
 
