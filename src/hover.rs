@@ -48,6 +48,7 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
             FuncStmt::Return(ReturnValue::SectionBlock(fs),_) => fs.iter().find_map(|f|search(&f.value,off)),
             FuncStmt::If(i) => search(&i.condition,off).or_else(||stmts(&i.then_stmts,off)).or_else(||stmts(&i.else_stmts,off)),
             FuncStmt::For(statement) => search(&statement.iterable,off).or_else(||stmts(&statement.body,off)),
+            FuncStmt::Try(_) => None,
         })
     }
     program.items.iter().find_map(|item| match item {
@@ -223,6 +224,7 @@ pub fn find_index_elem_type_at_offset(
                     }
                 }
                 FuncStmt::Break(_) | FuncStmt::Continue(_) => {}
+                FuncStmt::Try(_) => {}
             }
         }
         None

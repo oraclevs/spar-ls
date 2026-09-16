@@ -182,6 +182,7 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
                 collect_expr_refs(&statement.iterable, target, out);
                 collect_stmts_refs(&statement.body, target, out);
             }
+            FuncStmt::Try(_) => {}
         }
     }
 }

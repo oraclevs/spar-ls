@@ -399,6 +399,7 @@ fn collect_stmts_tokens(
                 collect_expr_tokens(&statement.iterable, source, kinds, out);
                 collect_stmts_tokens(&statement.body, source, kinds, out);
             }
+            FS::Try(_) => {}
         }
     }
 }

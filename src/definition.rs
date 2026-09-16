@@ -72,7 +72,8 @@ fn local_decl_span(program: &Program, offset: usize, word: &str) -> Option<Span>
                 | FuncStmt::Assignment { .. }
                 | FuncStmt::Expression(_, _)
                 | FuncStmt::Break(_)
-                | FuncStmt::Continue(_) => {}
+                | FuncStmt::Continue(_)
+                | FuncStmt::Try(_) => {}
             }
         }
     }

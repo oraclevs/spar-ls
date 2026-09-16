@@ -36,6 +36,7 @@ fn format_spar_type(ty: &SparType) -> String {
         SparType::Section => "section".to_string(),
         SparType::Void => "void".to_string(),
         SparType::Shell => "shell".to_string(),
+        SparType::Error => "error".to_string(),
         SparType::Named(name) => name.clone(),
         SparType::TypeParameter(name) => name.clone(),
         SparType::Applied { name, arguments } => format!(

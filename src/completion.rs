@@ -115,6 +115,7 @@ fn top_level_start(item: &TopLevelItem) -> usize {
             | FuncStmt::Continue(span) => span.start,
             FuncStmt::If(d) => d.span.start,
             FuncStmt::For(d) => d.span.start,
+            FuncStmt::Try(d) => d.span.start,
         },
     }
 }
