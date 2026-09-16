@@ -32,7 +32,7 @@ fn format_spar_type(ty: &SparType) -> String {
         SparType::Int => "int".to_string(),
         SparType::Float => "float".to_string(),
         SparType::Bool => "bool".to_string(),
-        SparType::List(inner) => format!("[{}]", format_spar_type(inner)),
+        SparType::List(inner) => format!("List<{}>", format_spar_type(inner)),
         SparType::Section => "section".to_string(),
         SparType::Void => "void".to_string(),
         SparType::Shell => "shell".to_string(),
@@ -2416,13 +2416,13 @@ mod tests {
         assert_eq!(format_spar_type(&SparType::Shell), "shell");
         assert_eq!(
             format_spar_type(&SparType::List(Box::new(SparType::Int))),
-            "[int]"
+            "List<int>"
         );
         assert_eq!(
             format_spar_type(&SparType::List(Box::new(SparType::List(Box::new(
                 SparType::Str
             ))))),
-            "[[str]]"
+            "List<List<str>>"
         );
     }
 
@@ -2447,7 +2447,8 @@ mod tests {
         let items = keyword_items();
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         for kw in &[
-            "if", "else", "for", "in", "return", "function", "var", "export", "private",
+            "if", "else", "for", "in", "return", "function", "var", "export", "private", "struct",
+            "type", "try", "catch",
         ] {
             assert!(labels.contains(kw), "missing keyword: {kw}");
         }
@@ -2940,14 +2941,25 @@ mod tests {
 
     #[test]
     fn semantic_tokens_keywords_and_builtin_types_are_distinct() {
-        let src = "export var port: int = 8080;";
+        let src = concat!(
+            "export struct App { port: int = 8080; };\n",
+            "function main() -> void { try {} catch err {} };",
+        );
         let tokens = decode_semantic_tokens(src);
         assert_eq!(
             find_tok(&tokens, "export", src).unwrap().token_type,
             TT_KEYWORD
         );
         assert_eq!(
-            find_tok(&tokens, "var", src).unwrap().token_type,
+            find_tok(&tokens, "struct", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(
+            find_tok(&tokens, "try", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(
+            find_tok(&tokens, "catch", src).unwrap().token_type,
             TT_KEYWORD
         );
         assert_eq!(find_tok(&tokens, "int", src).unwrap().token_type, TT_TYPE);
