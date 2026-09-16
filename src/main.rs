@@ -37,6 +37,16 @@ fn format_spar_type(ty: &SparType) -> String {
         SparType::Void => "void".to_string(),
         SparType::Shell => "shell".to_string(),
         SparType::Named(name) => name.clone(),
+        SparType::TypeParameter(name) => name.clone(),
+        SparType::Applied { name, arguments } => format!(
+            "{}<{}>",
+            name,
+            arguments
+                .iter()
+                .map(format_spar_type)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -59,12 +69,21 @@ fn resolve_shape_for_path(
 ) -> Option<Vec<spar::ast::TypeField>> {
     let top = symbols.sections.get(&vec![path.first()?.clone()])?;
     let type_name = top.type_binding.as_ref()?;
+    let type_name = match type_name {
+        SparType::Named(name) => name,
+        SparType::Applied { name, .. } => name,
+        _ => return None,
+    };
     let mut fields = symbols.types.get(type_name)?.fields.clone();
     for seg in &path[1..] {
         let tf = fields.iter().find(|f| &f.name == seg)?;
         fields = match &tf.shape {
             spar::ast::TypeFieldShape::Section(nested) => nested.clone(),
             spar::ast::TypeFieldShape::Named(other) => symbols.types.get(other)?.fields.clone(),
+            spar::ast::TypeFieldShape::TypeParameter(_) => return None,
+            spar::ast::TypeFieldShape::Applied { name, .. } => {
+                symbols.types.get(name)?.fields.clone()
+            }
             spar::ast::TypeFieldShape::Primitive(_) => return None,
         };
     }
@@ -78,6 +97,16 @@ fn format_type_field_shape(shape: &spar::ast::TypeFieldShape) -> String {
         // A Named shape's own type name is more useful than a bare
         // "section" — e.g. "PostgresType" tells the reader where to look.
         spar::ast::TypeFieldShape::Named(name) => name.clone(),
+        spar::ast::TypeFieldShape::TypeParameter(name) => name.clone(),
+        spar::ast::TypeFieldShape::Applied { name, arguments } => format!(
+            "{}<{}>",
+            name,
+            arguments
+                .iter()
+                .map(format_spar_type)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

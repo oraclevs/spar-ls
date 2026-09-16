@@ -805,6 +805,28 @@ fn collect_type_fields_tokens(
                     out.push(tok);
                 }
             }
+            TypeFieldShape::TypeParameter(name) => {
+                if let Some(tok) = find_ident_token(
+                    source,
+                    f.span.start,
+                    name,
+                    kinds.named_type_token(name),
+                    MOD_NONE,
+                ) {
+                    out.push(tok);
+                }
+            }
+            TypeFieldShape::Applied { name, .. } => {
+                if let Some(tok) = find_ident_token(
+                    source,
+                    f.span.start,
+                    name,
+                    kinds.named_type_token(name),
+                    MOD_NONE,
+                ) {
+                    out.push(tok);
+                }
+            }
             TypeFieldShape::Section(nested) => {
                 collect_type_fields_tokens(nested, source, kinds, out)
             }
