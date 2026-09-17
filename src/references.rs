@@ -99,6 +99,7 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
             collect_expr_refs(&b.rhs, target, out);
         }
         Expr::Unary { operand, .. } => collect_expr_refs(operand, target, out),
+        Expr::Await { value, .. } => collect_expr_refs(value, target, out),
         Expr::List(items, _) => {
             for item in items {
                 collect_expr_refs(item, target, out);

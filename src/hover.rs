@@ -9,7 +9,7 @@ fn expr_span(expr: &spar::ast::Expr) -> &Span {
         Expr::FnCall(f) => &f.span,
         Expr::BinaryOp(b) => &b.span,
         Expr::List(_, s) | Expr::Grouped(_, s) | Expr::Object(_, s) => s,
-        Expr::Call { span, .. } | Expr::Unary { span, .. } | Expr::Comprehension { span, .. }
+        Expr::Call { span, .. } | Expr::Unary { span, .. } | Expr::Await { span, .. } | Expr::Comprehension { span, .. }
         | Expr::Index { span, .. } | Expr::FieldAccess { span, .. } => span,
         Expr::Shell(shell) | Expr::ExecShell(shell) => &shell.span,
     }
@@ -25,6 +25,7 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
         let child = match e {
             Expr::BinaryOp(b) => search(&b.lhs, off).or_else(|| search(&b.rhs, off)),
             Expr::Unary { operand, .. } | Expr::Grouped(operand, _) => search(operand, off),
+            Expr::Await { value, .. } => search(value, off),
             Expr::List(xs, _) => xs.iter().find_map(|x| search(x, off)),
             Expr::FnCall(f) => f.args.iter().find_map(|x| search(x, off)),
             Expr::Call { args, .. } => args.iter().find_map(|x| search(&x.value, off)),
@@ -133,6 +134,7 @@ pub fn find_index_elem_type_at_offset(
             Expr::BinaryOp(b) => expr_index_elem(&b.lhs, symbols, offset)
                 .or_else(|| expr_index_elem(&b.rhs, symbols, offset)),
             Expr::Unary { operand, .. } => expr_index_elem(operand, symbols, offset),
+            Expr::Await { value, .. } => expr_index_elem(value, symbols, offset),
             Expr::List(items, _) => items
                 .iter()
                 .find_map(|e| expr_index_elem(e, symbols, offset)),

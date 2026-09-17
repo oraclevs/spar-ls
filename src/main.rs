@@ -2966,6 +2966,39 @@ mod tests {
     }
 
     #[test]
+    fn semantic_tokens_and_formatter_support_async_await() {
+        let src = "async function value() -> int { return 1; }; async function main() -> int { return await value(); };";
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(
+            find_tok(&tokens, "async", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(
+            find_tok(&tokens, "await", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+
+        let parsed = spar::parser::Parser::new(spar::lexer::Lexer::new(src).tokenize().unwrap())
+            .parse()
+            .unwrap();
+        let formatted =
+            spar::formatter::format_program(&parsed, &spar::formatter::FormatConfig::default());
+        assert!(formatted.contains("async function main() -> int"));
+        assert!(formatted.contains("return await value();"));
+    }
+
+    #[test]
+    fn diagnostics_reuse_core_await_context_rule() {
+        let source = "async function value() -> int { return 1; }; function main() -> int { return await value(); };";
+        let tokens = spar::lexer::Lexer::new(source).tokenize().unwrap();
+        let program = spar::parser::Parser::new(tokens).parse().unwrap();
+        let state = analyze_single_file(source, program, Vec::new());
+        assert!(state.diagnostics().iter().any(|diagnostic| diagnostic
+            .message
+            .contains("only valid inside an async function")));
+    }
+
+    #[test]
     fn semantic_tokens_classify_shell_syntax_and_type() {
         let src = concat!(
             "function plan() -> shell { return command echo hi; };\n",
