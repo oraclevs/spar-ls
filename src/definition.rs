@@ -4,17 +4,8 @@ fn span_location(uri: Url, source: &str, span: &Span) -> Location {
     Location::new(uri, Range::new(Position::new(line, col), Position::new(line, col + length)))
 }
 
-fn imported_uri(program: &Program, current: &Url, alias: &str) -> Option<Url> {
-    use spar::ast::ImportKind;
-    let base = current.to_file_path().ok()?.parent()?.to_path_buf();
-    program.items.iter().find_map(|item| {
-        let TopLevelItem::Import(decl) = item else { return None };
-        let ImportKind::Aliased(explicit) = &decl.kind else { return None };
-        let derived = std::path::Path::new(&decl.path).file_stem()?.to_str()?;
-        if explicit.as_deref().unwrap_or(derived) == alias {
-            Url::from_file_path(base.join(&decl.path)).ok()
-        } else { None }
-    })
+fn imported_uri(state: &DocumentState, alias: &str) -> Option<Url> {
+    Url::from_file_path(state.import_paths.get(alias)?).ok()
 }
 
 fn symbol_span(symbols: &SymbolTable, path: &[String], word: &str) -> Option<Span> {
@@ -99,7 +90,7 @@ fn task_decl_span(program: &Program, word: &str) -> Option<Span> {
 }
 
 /// If `word` is a top-level name brought in by a `Selective`/
-/// `TypeSelective`/`AsPartOf` import, resolves it against that import
+/// `TypeSelective` import, resolves it against that import
 /// target's own freshly-parsed `SymbolTable` (`state.spliced_import_symbols`)
 /// instead of the local (possibly retagged, see `spar::loader::
 /// retag_top_level_span`) span baked into the compiled/spliced AST — so
@@ -114,16 +105,14 @@ fn task_decl_span(program: &Program, word: &str) -> Option<Span> {
 /// it correctly; what's NOT attempted is fixing up spans nested inside a
 /// spliced item (e.g. an individual field of a spliced `[Section]`) — those
 /// still carry whatever span the retag/splice step left them with.
-fn spliced_definition(state: &DocumentState, current: &Url, word: &str) -> Option<Location> {
+fn spliced_definition(state: &DocumentState, _current: &Url, word: &str) -> Option<Location> {
     use spar::ast::ImportKind;
-    let base = current.to_file_path().ok()?.parent()?.to_path_buf();
     for decl in &state.spliced_import_decls {
         let original_name = match &decl.kind {
             ImportKind::Selective(items) | ImportKind::TypeSelective(items) => items
                 .iter()
                 .find(|item| item.alias.as_deref().unwrap_or(item.name.as_str()) == word)
                 .map(|item| item.name.clone()),
-            ImportKind::AsPartOf => Some(word.to_string()),
             ImportKind::Aliased(_) | ImportKind::Schema => None,
         };
         let Some(original_name) = original_name else {
@@ -135,10 +124,13 @@ fn spliced_definition(state: &DocumentState, current: &Url, word: &str) -> Optio
         let Some(span) = symbol_span(target_symbols, &[], &original_name) else {
             continue;
         };
-        let Ok(target_uri) = Url::from_file_path(base.join(&decl.path)) else {
+        let Some(target_path) = state.spliced_import_paths.get(&decl.path) else {
             continue;
         };
-        let Ok(target_source) = std::fs::read_to_string(base.join(&decl.path)) else {
+        let Ok(target_uri) = Url::from_file_path(target_path) else {
+            continue;
+        };
+        let Ok(target_source) = std::fs::read_to_string(target_path) else {
             continue;
         };
         return Some(span_location(target_uri, &target_source, &span));
@@ -160,7 +152,7 @@ fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Loca
     let prefix = path_prefix_before_word(&state.source, pos).unwrap_or_default();
     if let Some(alias) = prefix.first() {
         if let Some(imported) = state.effective_import_symbols().get(alias) {
-            let target_uri = imported_uri(program, uri, alias)?;
+            let target_uri = imported_uri(state, alias)?;
             let target_source = std::fs::read_to_string(target_uri.to_file_path().ok()?).ok()?;
             let span = symbol_span(imported, &prefix[1..], &word)?;
             return Some(span_location(target_uri, &target_source, &span));

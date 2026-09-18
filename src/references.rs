@@ -3,17 +3,15 @@
 // Walks the AST looking for uses of the symbol under the cursor. Same-file
 // references match the bare identifier; cross-file references are found by
 // walking the *transitive* reverse import graph in `importers` (a file that
-// imports a file that re-exports the target via `asPartOf` can still see
-// it, so one hop isn't enough), and for each candidate file, resolving
+// imports a file that re-exports the target can still see it, so one hop
+// isn't enough), and for each candidate file, resolving
 // whatever alias (if any) that file uses for the file the symbol is
 // defined in.
 //
 // Precision limits, deliberate (same latitude given to `definition_at`'s
 // own section-field fallback): a `.field` access matches by field name
 // alone, not by base-expression type, so an unrelated object with a field
-// of the same name is not ruled out. An `AsPartOf` import splices every
-// export of the target file in bare, so those files are always searched as
-// bare-word matches too. A `Selective`/`TypeSelective` import only searches
+// of the same name is not ruled out. A `Selective`/`TypeSelective` import only searches
 // a file bare when its import statement actually requested that specific
 // name (see `SpliceRelationship::Named`) — an aliased request
 // (`import { foo as bar }`) is still matched against the *original* name
@@ -278,7 +276,7 @@ fn local_function_group_owning<'a>(program: &'a Program, member: &str) -> Option
 
 /// Every file transitively reachable by walking `importers` backwards from
 /// `defining_file` (i.e. every file that imports it, directly or through a
-/// chain of `asPartOf`/aliased/selective imports) — including
+/// chain of aliased/selective imports) — including
 /// `defining_file` itself.
 fn reachable_files(
     importers: &HashMap<PathBuf, HashSet<PathBuf>>,
@@ -311,30 +309,24 @@ enum SpliceRelationship {
     /// anything else is an unrelated same-named local symbol, not a
     /// reference to the thing being searched for.
     Named(Vec<String>),
-    /// `AsPartOf` — every export is implicitly pulled in, so any bare word
-    /// occurring in this file is fair game to search.
-    Everything,
 }
 
 /// Whichever alias (if any) `state`'s file uses to import `defining_file`,
 /// plus how (if at all) it splices the target's symbols in bare
-/// (`Selective`/`TypeSelective`/`AsPartOf`).
+/// (`Selective`/`TypeSelective`).
 ///
 /// `Aliased`/`Schema` imports are read off `state.ast` — `expand_imports`
-/// leaves those import statements in place. `Selective`/`TypeSelective`/
-/// `AsPartOf` imports are spliced away entirely (replaced by their target's
-/// items) by the time `state.ast` exists, so those are read off
+/// leaves those import statements in place. `Selective`/`TypeSelective`
+/// imports are spliced away entirely (replaced by their target's items) by
+/// the time `state.ast` exists, so those are read off
 /// `state.spliced_import_decls` instead — a fresh, pre-splice parse kept
 /// around for exactly this purpose (see `DocumentState`).
 fn import_relationship(
     state: &DocumentState,
-    file_uri: &Url,
+    _file_uri: &Url,
     defining_file: &std::path::Path,
 ) -> (Option<String>, SpliceRelationship) {
     use spar::ast::ImportKind;
-    let Some(base) = file_uri.to_file_path().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) else {
-        return (None, SpliceRelationship::None);
-    };
     let Ok(defining_canon) = defining_file.canonicalize() else {
         return (None, SpliceRelationship::None);
     };
@@ -342,20 +334,23 @@ fn import_relationship(
         for item in &program.items {
             let TopLevelItem::Import(decl) = item else { continue };
             let ImportKind::Aliased(explicit) = &decl.kind else { continue };
-            let Ok(candidate) = base.join(&decl.path).canonicalize() else { continue };
-            if candidate != defining_canon {
-                continue;
-            }
             let derived = std::path::Path::new(&decl.path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            return (Some(explicit.clone().unwrap_or(derived)), SpliceRelationship::None);
+            let alias = explicit.clone().unwrap_or(derived);
+            let Some(resolved) = state.import_paths.get(&alias) else { continue };
+            let Ok(candidate) = resolved.canonicalize() else { continue };
+            if candidate != defining_canon {
+                continue;
+            }
+            return (Some(alias), SpliceRelationship::None);
         }
     }
     for decl in &state.spliced_import_decls {
-        let Ok(candidate) = base.join(&decl.path).canonicalize() else { continue };
+        let Some(resolved) = state.spliced_import_paths.get(&decl.path) else { continue };
+        let Ok(candidate) = resolved.canonicalize() else { continue };
         if candidate != defining_canon {
             continue;
         }
@@ -364,7 +359,6 @@ fn import_relationship(
                 None,
                 SpliceRelationship::Named(items.iter().map(|i| i.name.clone()).collect()),
             ),
-            ImportKind::AsPartOf => (None, SpliceRelationship::Everything),
             ImportKind::Aliased(_) | ImportKind::Schema => (None, SpliceRelationship::None),
         };
     }
@@ -414,7 +408,6 @@ fn compute_references(
                 collect_program_refs(program, RefTarget::Aliased(alias, word), &mut spans);
             }
             let is_spliced = match &splice {
-                SpliceRelationship::Everything => true,
                 SpliceRelationship::Named(names) => names.iter().any(|n| n == word),
                 SpliceRelationship::None => false,
             };

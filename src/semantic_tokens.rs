@@ -733,8 +733,8 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
 
 fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
     const KEYWORDS: &[&str] = &[
-        "var", "mut", "export", "import", "dynamic", "as", "private", "if", "else", "for",
-        "in", "break", "continue", "return", "function", "async", "await", "task", "type", "struct", "try", "catch", "Schema", "SchemaFrom", "asPartOf", "from", "command", "exec",
+        "var", "mut", "export", "import", "pkg", "dynamic", "as", "private", "if", "else", "for",
+        "in", "break", "continue", "return", "function", "async", "await", "task", "type", "struct", "try", "catch", "Schema", "SchemaFrom", "from", "command", "exec",
     ];
     const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "List", "Promise", "error", "section", "void", "shell"];
     let bytes = source.as_bytes();

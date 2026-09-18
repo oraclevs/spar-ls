@@ -5,7 +5,11 @@ struct DocumentState {
     ast: Option<Program>,
     symbols: Option<SymbolTable>,
     import_symbols: HashMap<String, SymbolTable>,
-    /// The file's own `Selective`/`TypeSelective`/`AsPartOf` import
+    /// Resolved source path for namespace/aliased imports, keyed by the
+    /// effective alias used in source. This is compiler-resolved so package
+    /// imports and extensionless local imports work in navigation.
+    import_paths: HashMap<String, PathBuf>,
+    /// The file's own `Selective`/`TypeSelective` import
     /// declarations, from a fresh (pre-splice) parse of `source` — the
     /// compiled `ast` no longer has these as distinct items, since
     /// `expand_imports` splices their targets' items directly into it.
@@ -17,6 +21,11 @@ struct DocumentState {
     /// by that import's raw path string — the same shape `import_symbols`
     /// uses for `Aliased` imports, computed the same way.
     spliced_import_symbols: HashMap<String, SymbolTable>,
+    /// Resolved source path for each selective import, keyed by the raw
+    /// import path string. Package imports and extensionless local imports
+    /// cannot be reconstructed reliably with `base_dir.join(...)`, so
+    /// definition/references use this compiler-resolved path instead.
+    spliced_import_paths: HashMap<String, PathBuf>,
     #[allow(dead_code)]
     result: Option<EvalResult>,
     errors: Vec<SparError>,

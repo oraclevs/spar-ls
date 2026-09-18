@@ -57,13 +57,16 @@ impl SparLanguageServer {
         compilation: Compilation,
     ) -> DocumentState {
         let mut import_symbols = HashMap::new();
+        let mut import_paths = HashMap::new();
         for (alias, loaded) in &compilation.imports {
+            import_paths.insert(alias.clone(), loaded.resolved_path.clone());
             let full_path = &loaded.resolved_path;
             let Ok(import_source) = std::fs::read_to_string(full_path) else {
                 continue;
             };
-            let mut options = Self::compile_options_for_path(full_path);
+            let mut options = CompileOptions::for_path(full_path);
             options.evaluate = false;
+            options.locator = loaded.locator.clone();
             let imported = Compiler::new(options).compile(&import_source);
             if let Some(symbols) = imported.symbols {
                 import_symbols.insert(alias.clone(), symbols);
@@ -71,13 +74,19 @@ impl SparLanguageServer {
         }
 
         // A fresh, pre-splice parse of `source` to recover the
-        // Selective/TypeSelective/AsPartOf import declarations
+        // Selective/TypeSelective import declarations
         // `expand_imports` already consumed out of `compilation.program` —
         // needed so go-to-definition/references can redirect a spliced-in
         // symbol to its real origin file/line instead of the local
         // (possibly retagged) span baked into the compiled AST.
         let mut spliced_import_decls = Vec::new();
         let mut spliced_import_symbols = HashMap::new();
+        let mut spliced_import_paths = HashMap::new();
+        let resolution_options = Self::compile_options(base_dir);
+        let mut resolution_loader = ImportLoader::new(base_dir);
+        if let Some(locator) = resolution_options.locator {
+            resolution_loader = resolution_loader.with_locator(locator);
+        }
         if let Ok(tokens) = Lexer::new(source).tokenize() {
             if let Ok(raw_program) = Parser::new(tokens).parse() {
                 for item in raw_program.items {
@@ -90,17 +99,17 @@ impl SparLanguageServer {
                     ) {
                         continue;
                     }
-                    let full_path = Self::compile_options(base_dir)
-                        .locator
-                        .as_ref()
-                        .and_then(|locator| locator.resolve_import(base_dir, &decl.path))
-                        .unwrap_or_else(|| base_dir.join(&decl.path));
-                    if let Ok(target_source) = std::fs::read_to_string(&full_path) {
-                        let mut options = Self::compile_options_for_path(&full_path);
-                        options.evaluate = false;
-                        let target = Compiler::new(options).compile(&target_source);
-                        if let Some(symbols) = target.symbols {
-                            spliced_import_symbols.insert(decl.path.clone(), symbols);
+                    if let Ok(resolved) = resolution_loader.resolve_import(&decl) {
+                        let full_path = resolved.path;
+                        spliced_import_paths.insert(decl.path.clone(), full_path.clone());
+                        if let Ok(target_source) = std::fs::read_to_string(&full_path) {
+                            let mut options = CompileOptions::for_path(&full_path);
+                            options.evaluate = false;
+                            options.locator = resolved.locator;
+                            let target = Compiler::new(options).compile(&target_source);
+                            if let Some(symbols) = target.symbols {
+                                spliced_import_symbols.insert(decl.path.clone(), symbols);
+                            }
                         }
                     }
                     spliced_import_decls.push(decl);
@@ -113,148 +122,12 @@ impl SparLanguageServer {
             ast: compilation.program,
             symbols: compilation.symbols,
             import_symbols,
+            import_paths,
             spliced_import_decls,
             spliced_import_symbols,
+            spliced_import_paths,
             result: compilation.result,
             errors: compilation.errors,
-            last_good_symbols: None,
-            last_good_import_symbols: HashMap::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn analyze_legacy(source: &str, base_dir: &std::path::Path) -> DocumentState {
-        let mut all_errors: Vec<SparError> = Vec::new();
-
-        let tokens = match Lexer::new(source).tokenize() {
-            Ok(t) => t,
-            Err(e) => {
-                all_errors.push(e);
-                return DocumentState {
-                    source: source.to_string(),
-                    ast: None,
-                    symbols: None,
-                    import_symbols: HashMap::new(),
-                    spliced_import_decls: Vec::new(),
-                    spliced_import_symbols: HashMap::new(),
-                    result: None,
-                    errors: all_errors,
-                    last_good_symbols: None,
-                    last_good_import_symbols: HashMap::new(),
-                };
-            }
-        };
-
-        let mut program = match Parser::new(tokens).parse() {
-            Ok(p) => p,
-            Err(e) => {
-                all_errors.push(e);
-                return DocumentState {
-                    source: source.to_string(),
-                    ast: None,
-                    symbols: None,
-                    import_symbols: HashMap::new(),
-                    spliced_import_decls: Vec::new(),
-                    spliced_import_symbols: HashMap::new(),
-                    result: None,
-                    errors: all_errors,
-                    last_good_symbols: None,
-                    last_good_import_symbols: HashMap::new(),
-                };
-            }
-        };
-
-        // Splice selective / import type / asPartOf imports into local scope
-        // before anything else touches `program` — same ordering as the CLI.
-        let mut expand_loader = ImportLoader::new(base_dir);
-        if let Err(e) = expand_imports(&mut program, &mut expand_loader) {
-            all_errors.extend(e);
-            return analyze_single_file(source, program, all_errors);
-        }
-
-        let mut loader = ImportLoader::new(base_dir);
-        let imports = match collect_imports(&program, &mut loader) {
-            Ok(i) => i,
-            Err(e) => {
-                all_errors.extend(e);
-                return analyze_single_file(source, program, all_errors);
-            }
-        };
-
-        // Resolve each imported file's full symbols for hover and completion.
-        // Done here (before main resolver) so it's populated even if main resolve fails.
-        let mut import_symbols: HashMap<String, SymbolTable> = HashMap::new();
-        for (alias, loaded) in &imports {
-            let full_path = base_dir.join(&loaded.path);
-            if let Ok(imp_src) = std::fs::read_to_string(&full_path) {
-                if let Ok(tokens) = Lexer::new(&imp_src).tokenize() {
-                    if let Ok(prog) = Parser::new(tokens).parse() {
-                        if let Ok(isym) = Resolver::new().resolve(&prog, &[]) {
-                            import_symbols.insert(alias.clone(), isym);
-                        }
-                    }
-                }
-            }
-        }
-
-        let sym = match Resolver::resolve_with_imports(&program, &imports) {
-            Ok(s) => s,
-            Err(e) => {
-                all_errors.extend(e);
-                return DocumentState {
-                    source: source.to_string(),
-                    ast: Some(program),
-                    symbols: None,
-                    import_symbols,
-                    spliced_import_decls: Vec::new(),
-                    spliced_import_symbols: HashMap::new(),
-                    result: None,
-                    errors: all_errors,
-                    last_good_symbols: None,
-                    last_good_import_symbols: HashMap::new(),
-                };
-            }
-        };
-
-        let schema_bindings = match validate_schema_imports(&program, base_dir) {
-            Ok(b) => b,
-            Err(e) => {
-                all_errors.extend(e);
-                HashMap::new()
-            }
-        };
-
-        if let Err(e) = TypeChecker::check_with_schema(&program, &sym, schema_bindings) {
-            all_errors.extend(e);
-        }
-
-        let eval_result = if all_errors.is_empty() {
-            match Evaluator::evaluate_with_imports_and_base(
-                &program,
-                &sym,
-                &imports,
-                base_dir,
-                spar::HostRegistry::default(),
-            ) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    all_errors.extend(e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        DocumentState {
-            source: source.to_string(),
-            ast: Some(program),
-            symbols: Some(sym),
-            import_symbols,
-            spliced_import_decls: Vec::new(),
-            spliced_import_symbols: HashMap::new(),
-            result: eval_result,
-            errors: all_errors,
             last_good_symbols: None,
             last_good_import_symbols: HashMap::new(),
         }
@@ -326,7 +199,7 @@ impl SparLanguageServer {
             let state = Self::analyze_path(&src, &path);
             if let Some(program) = &state.ast {
                 if let Ok(canon) = path.canonicalize() {
-                    let imports = extract_imported_paths(program, base);
+                    let imports = extract_imported_paths(&state);
                     self.update_importers(&canon, &imports).await;
                 }
             }

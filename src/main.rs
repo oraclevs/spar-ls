@@ -10,7 +10,7 @@ use spar::ast::{FuncStmt, Program, SparType, TopLevelItem};
 use spar::evaluator::{EvalResult, Evaluator};
 use spar::formatter::{format_program, format_source, FormatConfig};
 use spar::lexer::Lexer;
-use spar::loader::{collect_imports, expand_imports, validate_schema_imports, ImportLoader};
+use spar::loader::ImportLoader;
 use spar::parser::Parser;
 use spar::resolver::{
     EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, Resolver, SectionEntry, SymbolTable,
@@ -476,8 +476,10 @@ fn analyze_single_file(
                 ast: Some(program),
                 symbols: None,
                 import_symbols: HashMap::new(),
+                import_paths: HashMap::new(),
                 spliced_import_decls: Vec::new(),
                 spliced_import_symbols: HashMap::new(),
+                spliced_import_paths: HashMap::new(),
                 result: None,
                 errors,
                 last_good_symbols: None,
@@ -493,8 +495,10 @@ fn analyze_single_file(
         ast: Some(program),
         symbols: Some(sym),
         import_symbols: HashMap::new(),
+        import_paths: HashMap::new(),
         spliced_import_decls: Vec::new(),
         spliced_import_symbols: HashMap::new(),
+        spliced_import_paths: HashMap::new(),
         result: None,
         errors,
         last_good_symbols: None,
@@ -502,28 +506,16 @@ fn analyze_single_file(
     }
 }
 
-/// Returns the canonical absolute paths of all non-schema imports declared in `program`,
-/// resolved relative to `base_dir`.
-fn extract_imported_paths(
-    program: &spar::ast::Program,
-    base_dir: &std::path::Path,
-) -> Vec<PathBuf> {
-    use spar::ast::{ImportKind, TopLevelItem};
-    program
-        .items
-        .iter()
-        .filter_map(|item| {
-            if let TopLevelItem::Import(d) = item {
-                if !matches!(d.kind, ImportKind::Schema) {
-                    let p = base_dir.join(&d.path);
-                    p.canonicalize().ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
+/// Returns the canonical absolute paths of every resolved source import in
+/// this document. Paths come from compiler resolution rather than being
+/// rebuilt from raw import strings, so package imports, extensionless local
+/// imports, and selective imports all participate in the reverse import graph.
+fn extract_imported_paths(state: &DocumentState) -> Vec<PathBuf> {
+    state
+        .import_paths
+        .values()
+        .chain(state.spliced_import_paths.values())
+        .filter_map(|path| path.canonicalize().ok())
         .collect()
 }
 
@@ -638,7 +630,7 @@ impl LanguageServer for SparLanguageServer {
         if let Some(program) = &state.ast {
             if let Ok(file_path) = uri.to_file_path() {
                 if let Ok(canon) = file_path.canonicalize() {
-                    let imports = extract_imported_paths(program, &base);
+                    let imports = extract_imported_paths(&state);
                     self.update_importers(&canon, &imports).await;
                 }
             }
@@ -710,7 +702,7 @@ impl LanguageServer for SparLanguageServer {
             // Only when AST is valid — avoids thrashing importers with every broken keystroke.
             if let Some(program) = &state.ast {
                 if let Some(canon) = uri.to_file_path().ok().and_then(|p| p.canonicalize().ok()) {
-                    let imports = extract_imported_paths(program, &base);
+                    let imports = extract_imported_paths(&state);
                     self.update_importers(&canon, &imports).await;
                     if state.symbols.is_some() {
                         self.propagate_to_importers(&canon).await;
@@ -779,7 +771,7 @@ impl LanguageServer for SparLanguageServer {
         // Update importers map and re-diagnose direct importers of this file.
         if let Some(program) = &state.ast {
             if let Some(canon) = uri.to_file_path().ok().and_then(|p| p.canonicalize().ok()) {
-                let imports = extract_imported_paths(program, &base);
+                let imports = extract_imported_paths(&state);
                 self.update_importers(&canon, &imports).await;
 
                 // Re-diagnose all direct importers of this file.
@@ -1975,7 +1967,7 @@ mod tests {
             "export var unrelated: int = 0;\nfunction make() -> int { return 1; };\n",
         )
         .unwrap();
-        let main_src = "import { make } from \"base.spar\";\nvar value: int = make();\n";
+        let main_src = "import { make } from \"./base\";\nvar value: int = make();\n";
         let main_path = dir.join("main.spar");
         std::fs::write(&main_path, main_src).unwrap();
         let main_uri = Url::from_file_path(&main_path).unwrap();
@@ -1987,31 +1979,6 @@ mod tests {
         // Must land in base.spar (where `make` is really declared), on its
         // real declaration line (1) — not on the local `import { make }`
         // statement in main.spar (line 0).
-        assert_eq!(location.uri, Url::from_file_path(&base_path).unwrap());
-        assert_eq!(location.range.start.line, 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn definition_resolves_as_part_of_import_to_its_true_source_file_and_line() {
-        let dir = std::env::temp_dir().join(format!("spar_ls_aspartof_def_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let base_path = dir.join("base.spar");
-        std::fs::write(
-            &base_path,
-            "export var unrelated: int = 0;\nfunction make() -> int { return 1; };\n",
-        )
-        .unwrap();
-        let main_src = "import asPartOf \"base.spar\";\nvar value: int = make();\n";
-        let main_path = dir.join("main.spar");
-        std::fs::write(&main_path, main_src).unwrap();
-        let main_uri = Url::from_file_path(&main_path).unwrap();
-
-        let state = SparLanguageServer::analyze(main_src, &dir);
-        let pos = word_pos(main_src, "make", 0);
-        let location = definition_at(&main_uri, &state, pos).expect("definition");
-
         assert_eq!(location.uri, Url::from_file_path(&base_path).unwrap());
         assert_eq!(location.range.start.line, 1);
 
@@ -3045,7 +3012,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let imported_path = dir.join("base.spar");
         std::fs::write(&imported_path, "function make() -> int { return 1; };\n").unwrap();
-        let src = "import \"base.spar\";\nvar value: int = base::make();\n";
+        let src = "import \"./base\";\nvar value: int = base::make();\n";
         let uri = Url::from_file_path(dir.join("main.spar")).unwrap();
         let state = SparLanguageServer::analyze(src, &dir);
         let location = definition_at(&uri, &state, Position::new(1, 24)).expect("definition");
@@ -3348,4 +3315,169 @@ mod tests {
             ["application", "library", "config"]
         );
     }
+
+    #[test]
+    fn semantic_tokens_classify_pkg_as_a_keyword() {
+        let src = "import pkg { println } from \"std\";\n";
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(find_tok(&tokens, "pkg", src).unwrap().token_type, TT_KEYWORD);
+    }
+
+    #[test]
+    fn lsp_resolves_extensionless_selective_import_to_real_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("helper.spar");
+        std::fs::write(&helper, "function answer() -> int { return 42; };\n").unwrap();
+        let source = "import { answer } from \"./helper\";\nfunction main() -> int { return answer(); };\n";
+        let main = temp.path().join("main.spar");
+        let uri = Url::from_file_path(&main).unwrap();
+        let state = SparLanguageServer::analyze_path(source, &main);
+        assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
+        assert_eq!(state.spliced_import_paths.get("./helper"), Some(&helper));
+        let location = definition_at(&uri, &state, word_pos(source, "answer", 1)).expect("definition");
+        assert_eq!(location.uri, Url::from_file_path(&helper).unwrap());
+    }
+
+    #[test]
+    fn lsp_resolves_bundled_std_package_submodule_and_definition() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.spar");
+        let source = concat!(
+            "import pkg { readText } from \"std/fs\";\n",
+            "function main() -> int { var value: str = readText(path: \"missing\"); return len(value: value); };\n",
+        );
+        let uri = Url::from_file_path(&main).unwrap();
+        let state = SparLanguageServer::analyze_path(source, &main);
+        assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
+        let expected = state
+            .spliced_import_paths
+            .get("std/fs")
+            .cloned()
+            .expect("resolved std/fs path");
+        assert!(expected.ends_with(std::path::Path::new("stdlib/src/fs.spar")), "{}", expected.display());
+        let location = definition_at(&uri, &state, word_pos(source, "readText", 1)).expect("std definition");
+        assert_eq!(location.uri, Url::from_file_path(&expected).unwrap());
+    }
+
+    #[test]
+    fn lsp_resolves_third_party_and_transitive_package_imports_from_lock_scope() {
+        use std::collections::BTreeMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let src = root.join("src");
+        let toolkit = root.join("toolkit");
+        let toolkit_src = toolkit.join("src");
+        let colors = root.join("colors");
+        let colors_src = colors.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&toolkit_src).unwrap();
+        std::fs::create_dir_all(&colors_src).unwrap();
+
+        std::fs::write(
+            root.join(spar::package::PACKAGE_MANIFEST_FILE),
+            concat!(
+                "struct Package: SparPackage { name = \"app\"; version = \"0.1.0\"; kind = \"application\"; entry = \"src/main.spar\"; };\n",
+                "struct Dependencies { toolkit: str = \"path:./toolkit\"; };\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            toolkit_src.join("lib.spar"),
+            concat!(
+                "import pkg { red } from \"colors\";\n",
+                "function color() -> str { return red(); };\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            colors_src.join("lib.spar"),
+            "function red() -> str { return \"#f00\"; };\n",
+        )
+        .unwrap();
+
+        let toolkit_id = "path-toolkit".to_string();
+        let colors_id = "path-colors".to_string();
+        let mut lock = spar::package::Lockfile::default();
+        lock.root.insert("toolkit".into(), toolkit_id.clone());
+        lock.packages.insert(
+            toolkit_id.clone(),
+            spar::package::LockedPackage {
+                name: "toolkit".into(),
+                version: "1.0.0".into(),
+                source: spar::package::LockedSource::Path {
+                    path: toolkit.to_string_lossy().into_owned(),
+                },
+                integrity: None,
+                entry: "src/lib.spar".into(),
+                dependencies: BTreeMap::from([("colors".into(), colors_id.clone())]),
+            },
+        );
+        lock.packages.insert(
+            colors_id,
+            spar::package::LockedPackage {
+                name: "colors".into(),
+                version: "1.0.0".into(),
+                source: spar::package::LockedSource::Path {
+                    path: colors.to_string_lossy().into_owned(),
+                },
+                integrity: None,
+                entry: "src/lib.spar".into(),
+                dependencies: BTreeMap::new(),
+            },
+        );
+        lock.write_atomically(&root.join(spar::package::PACKAGE_LOCK_FILE))
+            .unwrap();
+
+        let main = src.join("main.spar");
+        let source = concat!(
+            "import pkg { color } from \"toolkit\";\n",
+            "function main() -> int { var value: str = color(); return len(value: value); };\n",
+        );
+        let uri = Url::from_file_path(&main).unwrap();
+        let state = SparLanguageServer::analyze_path(source, &main);
+        assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
+        assert_eq!(
+            state.spliced_import_paths.get("toolkit"),
+            Some(&toolkit_src.join("lib.spar"))
+        );
+        let location = definition_at(&uri, &state, word_pos(source, "color", 1))
+            .expect("package definition");
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(toolkit_src.join("lib.spar")).unwrap()
+        );
+    }
+
+    #[test]
+    fn lsp_prelude_native_capabilities_do_not_surface_as_user_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.spar");
+        let source = concat!(
+            "struct App { name: str = \"demo\"; };\n",
+            "function main() -> int { println(message: App.name); return len(value: App.name); };\n",
+        );
+        let state = SparLanguageServer::analyze_path(source, &main);
+        assert!(
+            state.diagnostics().is_empty(),
+            "prelude native capabilities must resolve inside LSP analysis: {:?}",
+            state.diagnostics()
+        );
+    }
+
+    #[test]
+    fn lsp_namespace_std_import_populates_import_symbols_for_hover_and_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.spar");
+        let source = "import pkg \"std/fs\" as fs;\nfunction main() -> int { var text: str = fs::readText(path: \"x\"); return 0; };\n";
+        let state = SparLanguageServer::analyze_path(source, &main);
+        assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
+        let symbols = state.effective_import_symbols().get("fs").expect("std/fs symbols");
+        assert!(symbols.functions.contains_key("readText"));
+        let items = import_completion_items(symbols);
+        assert!(items.iter().any(|item| item.label == "readText"));
+        let hover = format_import_hover("fs", symbols);
+        assert!(hover.contains("readText"), "{hover}");
+    }
+
 }
