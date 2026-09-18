@@ -325,6 +325,7 @@ fn collect_expr_tokens(
                 out.push(token);
             }
         }
+        Expr::CommandSubstitution(_) => {}
         Expr::Literal(_) => {}
     }
 }

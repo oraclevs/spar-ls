@@ -140,7 +140,10 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
                 out.push(field_span.clone());
             }
         }
-        Expr::Literal(_) | Expr::Shell(_) | Expr::ExecShell(_) => {}
+        Expr::Literal(_)
+        | Expr::Shell(_)
+        | Expr::ExecShell(_)
+        | Expr::CommandSubstitution(_) => {}
     }
 }
 

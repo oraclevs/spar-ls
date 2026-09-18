@@ -3250,6 +3250,40 @@ mod tests {
     }
 
     #[test]
+    fn analyzes_native_shell_with_nested_loops_if_and_command_substitution() {
+        let src = r#"function main() -> shell {
+    var files: [str] = ["one", "two"];
+    return shell {
+        var mut count: int = 0;
+        for outer in files {
+            for file in files {
+                if file == "one" {
+                    var label: str = $(printf "%s" "${file}");
+                    echo "${outer}:${label}";
+                    count += 1;
+                } else {
+                    echo "${file}";
+                }
+            }
+        }
+        echo "${count}";
+    };
+};
+"#;
+
+        let state = SparLanguageServer::analyze(src, std::path::Path::new("."));
+        assert!(
+            state.diagnostics().is_empty(),
+            "unexpected diagnostics: {:?}",
+            state
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn lsp_discovers_package_lock_for_project_sources() {
         let temp = tempfile::tempdir().unwrap();
         let src = temp.path().join("src");
