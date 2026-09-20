@@ -1390,3 +1390,67 @@ fn removed_shell_field_reports_the_migration_hint() {
         state.diagnostics()
     );
 }
+
+fn local_name_list(marked_source: &str) -> Vec<String> {
+    let (source, offset) = marked(marked_source);
+    local_names_at(&source, offset).into_iter().map(|n| n.name).collect()
+}
+
+#[test]
+fn locals_are_found_while_typing_inside_a_string_interpolation() {
+    let names = local_name_list(concat!(
+        "function f(p: str) -> str {\n",
+        "    var local: str = p;\n",
+        "    var s: str = \"hi ${|\n",
+        "    return s;\n",
+        "};\n",
+    ));
+    for expected in ["p", "local"] {
+        assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+    }
+}
+
+#[test]
+fn locals_are_found_inside_an_unfinished_native_run_body() {
+    let names = local_name_list(concat!(
+        "task T {\n",
+        "    run {\n",
+        "        var enx: str = \"a\";\n",
+        "        echo \"${|\n",
+        "    };\n",
+        "};\n",
+    ));
+    assert!(names.contains(&"enx".to_string()), "{names:?}");
+}
+
+#[test]
+fn completion_is_offered_inside_string_interpolation_but_not_plain_strings() {
+    let (source, offset) = marked("var a: str = \"hi ${|\";\n");
+    assert!(!matches!(editor_context(&source, None, offset), EditorContext::Suppressed));
+    let (source, offset) = marked("var a: str = \"hi |\";\n");
+    assert!(matches!(editor_context(&source, None, offset), EditorContext::Suppressed));
+    let (source, offset) = marked("var a: str = \"${b} and |\";\n");
+    assert!(matches!(editor_context(&source, None, offset), EditorContext::Suppressed));
+}
+
+#[test]
+fn a_file_with_a_broken_line_still_offers_its_symbols() {
+    let source = "var top: str = \"x\";\n\nfunction helper(n: str) -> str {\n    return n;\n};\n\nvar broken: int = ;\n";
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
+    assert!(state.symbols.is_none(), "the file itself must not compile");
+    let symbols = state.effective_symbols().expect("repaired symbols");
+    assert!(symbols.globals.contains_key("top"));
+    assert!(symbols.functions.contains_key("helper"));
+}
+
+#[test]
+fn a_native_shell_lex_error_is_reported_on_its_real_line() {
+    let source = "var a: int = 1;\n\ntask T {\n    run {\n        echo one;\n        #!/usr/bin/env bash\n    };\n};\n";
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
+    let diagnostic = state
+        .diagnostics()
+        .into_iter()
+        .find(|d| d.message.contains("unexpected character"))
+        .expect("lex diagnostic");
+    assert_eq!(diagnostic.range.start.line, 5, "{diagnostic:?}");
+}

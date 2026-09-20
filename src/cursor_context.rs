@@ -34,7 +34,40 @@ enum CursorLexicalState {
 }
 
 fn lexical_state_at(source: &str, offset: usize) -> CursorLexicalState {
+    lexical_scan(source, offset).0
+}
+
+/// Whether `offset` sits inside a still-open `${ ... }` of the string it is
+/// in — code, not literal text, so completion applies there.
+fn inside_string_interpolation(source: &str, offset: usize) -> bool {
+    let (state, string_start) = lexical_scan(source, offset);
+    let (CursorLexicalState::String, Some(start)) = (state, string_start) else {
+        return false;
+    };
+    let body = source.get(start + 1..offset.min(source.len())).unwrap_or("");
+    let bytes = body.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' if depth > 0 => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth > 0
+}
+
+/// Scans `source` up to `offset`; also returns where the string the cursor is
+/// in began (the opening quote), when it is in one.
+fn lexical_scan(source: &str, offset: usize) -> (CursorLexicalState, Option<usize>) {
     let bytes = source.as_bytes();
+    let mut string_start = None;
     let end = offset.min(bytes.len());
     let mut i = 0usize;
     let mut block_depth = 0usize;
@@ -89,11 +122,12 @@ fn lexical_state_at(source: &str, offset: usize) -> CursorLexicalState {
         }
         if b == b'"' {
             in_string = true;
+            string_start = Some(i);
         }
         i += 1;
     }
 
-    if in_line {
+    let state = if in_line {
         CursorLexicalState::LineComment
     } else if block_depth > 0 {
         CursorLexicalState::BlockComment
@@ -101,7 +135,8 @@ fn lexical_state_at(source: &str, offset: usize) -> CursorLexicalState {
         CursorLexicalState::String
     } else {
         CursorLexicalState::Code
-    }
+    };
+    (state, string_start)
 }
 
 fn statement_bounds(source: &str, offset: usize) -> (usize, usize) {
@@ -351,7 +386,7 @@ fn editor_context(source: &str, _ast: Option<&Program>, offset: usize) -> Editor
     if let Some(context) = import_context(source, offset) {
         return context;
     }
-    if lexical == CursorLexicalState::String {
+    if lexical == CursorLexicalState::String && !inside_string_interpolation(source, offset) {
         return EditorContext::Suppressed;
     }
     if let Some(context) = call_context(source, offset) {

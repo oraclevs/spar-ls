@@ -509,6 +509,7 @@ fn analyze_single_file(
                 result: None,
                 errors,
                 last_good_symbols: None,
+                repaired_symbols: None,
                 last_good_import_symbols: HashMap::new(),
             };
         }
@@ -528,6 +529,7 @@ fn analyze_single_file(
         result: None,
         errors,
         last_good_symbols: None,
+                repaired_symbols: None,
         last_good_import_symbols: HashMap::new(),
     }
 }
@@ -1436,6 +1438,7 @@ impl LanguageServer for SparLanguageServer {
         let snippets = self.client_features.lock().await.completion_snippets;
         let mut items: Vec<CompletionItem> =
             scope_completion_items(&local_names_at(&state.source, offset));
+        items.extend(run_interpolation_params(&state.source, offset));
         items.extend(
             function_completion_items(&symbols.functions, snippets)
                 .into_iter()
@@ -2054,15 +2057,18 @@ mod tests {
         let valid = "task Deploy(environment: str, *extra: str) { run { echo ok; }; };\n";
         let symbols = resolve_src(valid);
         let src = "task Deploy(environment: str, *extra: str) { run { echo ${";
-        let items = task_completion_items(src, Some(&symbols), src.len())
-            .expect("incomplete interpolation completion");
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.label.as_str())
-                .collect::<Vec<_>>(),
-            ["environment", "extra"]
+        // A native body's `${` takes any Spar expression, so the task's
+        // parameters are offered by the general expression completion (see
+        // `run_interpolation_params`) rather than exclusively here.
+        assert!(
+            task_completion_items(src, Some(&symbols), src.len()).is_none(),
+            "native interpolation falls through to expression completion"
         );
+        let params = run_interpolation_params(src, src.len())
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert_eq!(params, ["environment", "extra"]);
     }
 
     #[test]

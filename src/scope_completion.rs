@@ -143,6 +143,24 @@ fn parse_chain_tokens(tokens: &[&spar::token::Token], mut index: usize) -> Optio
     Some(Chain { root: root.clone(), steps })
 }
 
+/// Lexes the text before the cursor. That text is usually unfinished — a
+/// half-typed string or `"${`, or a `run { ... }` body still open — and a plain
+/// lex would fail on it. Retry without the line being typed, and with
+/// closing braces added, keeping only tokens from the real prefix.
+fn lex_prefix_tolerantly(source: &str, end: usize) -> Option<Vec<spar::token::SpannedToken>> {
+    let line_start = source[..end].rfind('\n').map_or(0, |index| index + 1);
+    for cut in [end, line_start] {
+        for suffix in ["", "\n}", "\n}\n}"] {
+            let text = format!("{}{suffix}", &source[..cut]);
+            if let Ok(mut tokens) = Lexer::new(&text).tokenize() {
+                tokens.retain(|spanned| spanned.span.start < cut || spanned.token == spar::token::Token::Eof);
+                return Some(tokens);
+            }
+        }
+    }
+    None
+}
+
 /// Names visible at `offset`: parameters of the enclosing function, `var`
 /// declarations, `for` bindings and `catch` names in still-open blocks.
 /// Works on the text before the cursor, so it survives syntax errors elsewhere.
@@ -152,7 +170,7 @@ fn local_names_at(source: &str, offset: usize) -> Vec<ScopeName> {
     while !source.is_char_boundary(end) {
         end -= 1;
     }
-    let Ok(lexed) = Lexer::new(&source[..end]).tokenize() else {
+    let Some(lexed) = lex_prefix_tolerantly(source, end) else {
         return Vec::new();
     };
     let tokens: Vec<&Token> = lexed.iter().map(|spanned| &spanned.token).collect();

@@ -31,6 +31,10 @@ struct DocumentState {
     errors: Vec<SparError>,
     last_good_symbols: Option<SymbolTable>,
     last_good_import_symbols: HashMap<String, SymbolTable>,
+    /// Symbols of this file with its unparsable statements blanked out;
+    /// only computed when the file itself does not compile. Keeps completion,
+    /// hover and signatures working in a file with a broken line.
+    repaired_symbols: Option<SymbolTable>,
 }
 
 impl DocumentState {
@@ -39,7 +43,10 @@ impl DocumentState {
     }
 
     fn effective_symbols(&self) -> Option<&SymbolTable> {
-        self.symbols.as_ref().or(self.last_good_symbols.as_ref())
+        self.symbols
+            .as_ref()
+            .or(self.last_good_symbols.as_ref())
+            .or(self.repaired_symbols.as_ref())
     }
 
     fn effective_import_symbols(&self) -> &HashMap<String, SymbolTable> {
