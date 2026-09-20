@@ -1386,7 +1386,9 @@ impl LanguageServer for SparLanguageServer {
         }
 
         // Case 2: after bare `:` — type annotation position → offer type keywords
-        if is_in_type_position(&state.source, pos) {
+        // `f(a: |)` has a colon too, but it is a named argument, not a type annotation.
+        let in_call_value = matches!(&context, EditorContext::CallArguments { value_of: Some(_), .. });
+        if !in_call_value && is_in_type_position(&state.source, pos) {
             return Ok(Some(CompletionResponse::Array(type_keyword_items())));
         }
 

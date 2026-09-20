@@ -115,7 +115,7 @@ fn signature_help_at(
     source: &str,
     offset: usize,
 ) -> Option<SignatureHelp> {
-    let EditorContext::CallArguments { callee, supplied, active_parameter } = editor_context(source, state.ast.as_ref(), offset) else {
+    let EditorContext::CallArguments { callee, supplied, active_parameter, value_of } = editor_context(source, state.ast.as_ref(), offset) else {
         return None;
     };
     let signature = resolve_callable_named(state, index, uri, &callee)?;
@@ -128,6 +128,12 @@ fn signature_help_at(
     if !supplied.is_empty() && active_parameter as usize >= supplied.len() {
         if let Some((index, _)) = signature.params.iter().enumerate().find(|(_, param)| !supplied.contains(&param.name)) {
             active = index;
+        }
+    }
+    // A named argument in progress (`b: |`) pins the active parameter by name.
+    if let Some(name) = &value_of {
+        if let Some((position, _)) = signature.params.iter().enumerate().find(|(_, param)| &param.name == name) {
+            active = position;
         }
     }
     let parameters = signature.params.iter().map(|param| {
@@ -153,20 +159,13 @@ fn signature_help_at(
     })
 }
 
-fn named_argument_completion_items(
-    state: &DocumentState,
-    index: &WorkspaceIndex,
-    uri: &Url,
-    source: &str,
-    offset: usize,
-) -> Option<Vec<CompletionItem>> {
-    let EditorContext::CallArguments { callee, supplied, .. } = editor_context(source, state.ast.as_ref(), offset) else {
-        return None;
-    };
-    let signature = resolve_callable_named(state, index, uri, &callee)?;
-    let mut items = signature.params.iter()
-        .filter(|param| !supplied.contains(&param.name))
-        .map(|param| CompletionItem {
+fn named_parameter_items(signature: &CallableSignature, supplied: &[String]) -> Vec<CompletionItem> {
+    signature
+        .params
+        .iter()
+        .enumerate()
+        .filter(|(_, param)| !supplied.contains(&param.name))
+        .map(|(position, param)| CompletionItem {
             label: format!("{}:", param.name),
             kind: Some(CompletionItemKind::FIELD),
             detail: Some(if param.has_default {
@@ -175,10 +174,50 @@ fn named_argument_completion_items(
                 param.ty.clone()
             }),
             insert_text: Some(format!("{}: ", param.name)),
-            sort_text: Some(format!("{}_{}", if param.has_default { "1_optional" } else { "0_required" }, param.name)),
+            // Required parameters first, then optional, each in declared order.
+            sort_text: Some(format!(
+                "{}_{:03}",
+                if param.has_default { "1" } else { "0" },
+                position
+            )),
             ..Default::default()
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn value_items_for_type(names: &[ScopeName], expected: &str) -> Vec<CompletionItem> {
+    let mut items = scope_completion_items(names);
+    for item in &mut items {
+        let matches = item.detail.as_deref() == Some(expected);
+        item.sort_text = Some(format!("{}_{}", if matches { "0" } else { "1" }, item.label));
+    }
     items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
-    Some(items)
+    items
+}
+
+fn named_argument_completion_items(
+    state: &DocumentState,
+    index: &WorkspaceIndex,
+    uri: &Url,
+    source: &str,
+    offset: usize,
+) -> Option<Vec<CompletionItem>> {
+    let EditorContext::CallArguments { callee, supplied, value_of, .. } =
+        editor_context(source, state.ast.as_ref(), offset)
+    else {
+        return None;
+    };
+    let signature = resolve_callable_named(state, index, uri, &callee)?;
+    if let Some(param_name) = value_of {
+        // Value position: rank in-scope locals of the parameter's type first. With
+        // no locals, return None so general expression completion takes over.
+        let expected = signature
+            .params
+            .iter()
+            .find(|param| param.name == param_name)
+            .map(|param| param.ty.clone())?;
+        let items = value_items_for_type(&local_names_at(source, offset), &expected);
+        return (!items.is_empty()).then_some(items);
+    }
+    Some(named_parameter_items(&signature, &supplied))
 }

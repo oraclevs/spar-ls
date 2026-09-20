@@ -91,7 +91,7 @@ fn editor_context_recovers_selective_imports_and_paths() {
 #[test]
 fn editor_context_recovers_incomplete_call_arguments() {
     let context = context_from_marked("vidShrink(input: file, |");
-    let EditorContext::CallArguments { callee, supplied, active_parameter } = context else {
+    let EditorContext::CallArguments { callee, supplied, active_parameter, .. } = context else {
         panic!("expected call context");
     };
     assert_eq!(callee, "vidShrink");
@@ -963,4 +963,47 @@ fn scope_items_are_ranked_before_file_level_and_keywords() {
         with_tier(CompletionItem { label: "if".into(), ..Default::default() }, 9).sort_text.as_deref(),
         Some("9_if")
     );
+}
+
+#[test]
+fn call_context_reports_value_position_after_param_colon() {
+    let ctx = context_from_marked("f(a: |)");
+    let EditorContext::CallArguments { value_of, .. } = ctx else { panic!("expected call context") };
+    assert_eq!(value_of.as_deref(), Some("a"));
+    let ctx = context_from_marked("f(a: 1, |)");
+    let EditorContext::CallArguments { value_of, supplied, .. } = ctx else { panic!("expected call context") };
+    assert_eq!(value_of, None);
+    assert_eq!(supplied, vec!["a".to_string()]);
+}
+
+#[test]
+fn named_argument_items_follow_declared_parameter_order() {
+    let signature = CallableSignature {
+        name: "writeText".into(),
+        params: vec![
+            CallableParam { name: "path".into(), ty: "str".into(), has_default: false, default_repr: None },
+            CallableParam { name: "content".into(), ty: "str".into(), has_default: false, default_repr: None },
+            CallableParam { name: "mode".into(), ty: "str".into(), has_default: true, default_repr: Some("\"w\"".into()) },
+        ],
+        return_type: "void".into(),
+        is_async: false,
+        origin: None,
+    };
+    let mut items = named_parameter_items(&signature, &[]);
+    items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+    assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["path:", "content:", "mode:"]);
+    let mut items = named_parameter_items(&signature, &["path".to_string()]);
+    items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+    assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["content:", "mode:"]);
+}
+
+#[test]
+fn value_items_prefer_locals_matching_the_parameter_type() {
+    let names = vec![
+        ScopeName { name: "count".into(), kind: ScopeNameKind::Variable, ty: Some("int".into()) },
+        ScopeName { name: "label".into(), kind: ScopeNameKind::Variable, ty: Some("str".into()) },
+    ];
+    let items = value_items_for_type(&names, "str");
+    assert_eq!(items[0].label, "label");
+    assert!(items[0].sort_text.as_deref().unwrap() < items[1].sort_text.as_deref().unwrap());
 }
