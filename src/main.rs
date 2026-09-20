@@ -380,6 +380,7 @@ include!("symbols.rs");
 include!("rename.rs");
 include!("code_actions.rs");
 include!("shell_semantic.rs");
+include!("scope_completion.rs");
 // ── Import hover / completion helpers ────────────────────────────────────────
 
 fn format_import_hover(alias: &str, sym: &SymbolTable) -> String {
@@ -1389,42 +1390,64 @@ impl LanguageServer for SparLanguageServer {
             return Ok(Some(CompletionResponse::Array(type_keyword_items())));
         }
 
-        // Case 3: default — keywords + builtins + user functions + globals + sections + imports
-        let mut items = keyword_items();
-        items.extend(builtin_items());
+        // Case 3: default expression position — tiered so locals rank first.
         let snippets = self.client_features.lock().await.completion_snippets;
-        items.extend(function_completion_items(&symbols.functions, snippets));
-
+        let mut items: Vec<CompletionItem> =
+            scope_completion_items(&local_names_at(&state.source, offset));
+        items.extend(
+            function_completion_items(&symbols.functions, snippets)
+                .into_iter()
+                .map(|item| {
+                    let tier = if BUILTIN_FUNCTION_NAMES.contains(&item.label.as_str()) { 3 } else { 1 };
+                    with_tier(item, tier)
+                }),
+        );
         for (name, entry) in &symbols.globals {
             let detail = match entry {
                 spar::resolver::GlobalEntry::Var { ty, .. } => Some(format_spar_type(ty)),
                 spar::resolver::GlobalEntry::Dynamic { .. } => Some("dynamic".to_string()),
             };
-            items.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::VARIABLE),
-                detail,
-                ..Default::default()
-            });
+            items.push(with_tier(
+                CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail,
+                    ..Default::default()
+                },
+                1,
+            ));
         }
-
         for path in symbols.sections.keys() {
             if let Some(first) = path.first() {
-                items.push(CompletionItem {
-                    label: first.clone(),
-                    kind: Some(CompletionItemKind::MODULE),
-                    ..Default::default()
-                });
+                items.push(with_tier(
+                    CompletionItem {
+                        label: first.clone(),
+                        kind: Some(CompletionItemKind::MODULE),
+                        ..Default::default()
+                    },
+                    1,
+                ));
             }
         }
-
         for alias in symbols.imports.keys() {
-            items.push(CompletionItem {
-                label: alias.clone(),
-                kind: Some(CompletionItemKind::MODULE),
-                ..Default::default()
-            });
+            items.push(with_tier(
+                CompletionItem {
+                    label: alias.clone(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    ..Default::default()
+                },
+                2,
+            ));
         }
+        items.extend(builtin_items().into_iter().map(|item| with_tier(item, 3)));
+        items.extend(type_keyword_items().into_iter().map(|item| with_tier(item, 4)));
+        items.extend(keyword_items().into_iter().map(|item| with_tier(item, 9)));
+
+        // A local may shadow a same-named global/function: keep the best-ranked
+        // (lowest tier) entry per label.
+        items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+        let mut seen = HashSet::new();
+        items.retain(|item| seen.insert(item.label.clone()));
 
         Ok(Some(CompletionResponse::Array(items)))
     }
