@@ -426,7 +426,6 @@ fn formatted_task_param(param: &spar::ast::TaskParam) -> String {
         depends_on: Vec::new(),
         env: Vec::new(),
         cwd: None,
-        shell: None,
         run_blocks: Vec::new(),
         span: param.span.clone(),
         field_spans: Vec::new(),
@@ -458,7 +457,7 @@ fn format_hover_task(task: &spar::ast::TaskDecl) -> String {
         .map(formatted_task_param)
         .collect::<Vec<_>>()
         .join(", ");
-    let mut value = format!("```spar\ntask [{}]({})\n```", task.name, params);
+    let mut value = format!("```spar\ntask {}({})\n```", task.name, params);
     if task.description.is_some() {
         let mut description_task = task.clone();
         description_task.params.clear();

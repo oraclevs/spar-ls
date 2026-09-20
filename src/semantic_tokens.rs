@@ -769,7 +769,6 @@ fn collect_task_tokens(
         ("group", task.group.as_ref()),
         ("confirm", task.confirm.as_ref()),
         ("cwd", task.cwd.as_ref()),
-        ("shell", task.shell.as_ref()),
     ];
     let Some((body_start, body_end)) = task_body_bounds(program, source, index, task) else {
         return;
@@ -783,7 +782,7 @@ fn collect_task_tokens(
             collect_expr_tokens(expression, source, kinds, out);
         }
     }
-    for name in ["dependsOn", "env", "run"] {
+    for name in ["dependsOn", "env"] {
         if let Some(token) = find_task_field_token(source, body_start, body_end, name) {
             out.push(token);
         }
@@ -807,24 +806,44 @@ fn collect_task_tokens(
         collect_expr_tokens(value, source, kinds, out);
     }
     for block in &task.run_blocks {
-        for command in &block.commands {
-            for part in &command.parts {
-                if let ShellTemplatePart::Expr(expression) = part {
-                    let token_start = out.len();
-                    collect_expr_tokens(expression, source, kinds, out);
-                    for token in &mut out[token_start..] {
-                        if token.token_type != TT_VARIABLE {
-                            continue;
-                        }
-                        let line = source.lines().nth(token.line as usize).unwrap_or_default();
-                        let start = token.start_char as usize;
-                        let end = start + token.length as usize;
-                        if line.get(start..end).is_some_and(|name| {
-                            task.params.iter().any(|param| param.name == name)
-                        }) {
-                            token.token_type = TT_PARAMETER;
+        // `run` itself is a task field; the optional shell/OS words after it
+        // are keywords.
+        out.push(raw_from_span(&block.span, TT_TASK_FIELD, MOD_DECLARATION));
+        for word in [&block.shell_span, &block.os_span].into_iter().flatten() {
+            out.push(raw_from_span(word, TT_KEYWORD, MOD_NONE));
+        }
+        let native;
+        let mut interpolations: Vec<&spar::ast::Expr> = Vec::new();
+        match &block.body {
+            spar::ast::RunBody::Bash(commands) => {
+                for command in commands {
+                    for part in &command.parts {
+                        if let ShellTemplatePart::Expr(expression) = part {
+                            interpolations.push(expression);
                         }
                     }
+                }
+            }
+            spar::ast::RunBody::Native(shell) => {
+                native = spar::ast::Expr::Shell(shell.clone());
+                interpolations.push(&native);
+            }
+        }
+        for expression in interpolations {
+            let token_start = out.len();
+            collect_expr_tokens(expression, source, kinds, out);
+            for token in &mut out[token_start..] {
+                if token.token_type != TT_VARIABLE {
+                    continue;
+                }
+                let line = source.lines().nth(token.line as usize).unwrap_or_default();
+                let start = token.start_char as usize;
+                let end = start + token.length as usize;
+                if line
+                    .get(start..end)
+                    .is_some_and(|name| task.params.iter().any(|param| param.name == name))
+                {
+                    token.token_type = TT_PARAMETER;
                 }
             }
         }
