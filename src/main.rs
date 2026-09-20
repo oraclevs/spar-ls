@@ -58,11 +58,15 @@ where
 
     match first.as_str() {
         "--stdio" => {
-            if let Some(extra) = args.next() {
-                Err(format!("unexpected argument after --stdio: {extra}"))
-            } else {
-                Ok(StartupMode::Serve)
+            // Clients differ: vscode-languageclient appends its own `--stdio` for
+            // stdio transport, so a repeated flag is normal. `--clientProcessId=N`
+            // is the other flag standard clients add; both are safe to ignore.
+            for extra in args {
+                if extra != "--stdio" && !extra.starts_with("--clientProcessId=") {
+                    return Err(format!("unexpected argument after --stdio: {extra}"));
+                }
             }
+            Ok(StartupMode::Serve)
         }
         "--version" | "-V" => Ok(StartupMode::Version),
         "--help" | "-h" => Ok(StartupMode::Help),
