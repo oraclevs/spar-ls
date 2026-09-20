@@ -180,72 +180,6 @@ fn task_body_bounds(
     None
 }
 
-fn task_field_is_present(source: &str, body_start: usize, body_end: usize, name: &str) -> bool {
-    let Some(body) = source.get(body_start..body_end) else {
-        return false;
-    };
-    body.match_indices(name).any(|(offset, _)| {
-        let before = &body[..offset];
-        let line_prefix = before.rsplit_once('\n').map_or(before, |(_, line)| line);
-        let prefix = line_prefix.trim_end();
-        let after = &body[offset + name.len()..];
-        (prefix.is_empty() || prefix.ends_with('{') || prefix.ends_with(';'))
-            && after.trim_start().starts_with(':')
-    })
-}
-
-fn task_metadata_completion_items(
-    task: &spar::ast::TaskDecl,
-    source: &str,
-    body_start: usize,
-    body_end: usize,
-) -> Vec<CompletionItem> {
-    [
-        ("description", "Human-readable task description", "description: \"$1\";"),
-        ("default", "Run when no task name is supplied", "default: ${1:true};"),
-        ("quiet", "Command echoing (quiet by default; set false to show commands)", "quiet: ${1:false};"),
-        ("private", "Hide the task from public listings", "private: ${1:true};"),
-        ("group", "Group shown in task listings", "group: \"$1\";"),
-        ("confirm", "Confirmation prompt before running", "confirm: \"$1\";"),
-        ("dependsOn", "Tasks that must run first", "dependsOn: [$1];"),
-        ("env", "Environment variables for commands", "env: {\n\t$0\n};"),
-        ("cwd", "Working directory for commands", "cwd: \"$1\";"),
-        ("shell", "Shell executable and arguments", "shell: [$1];"),
-        ("run", "Shell commands executed by the task", "run {\n\t$0\n};"),
-    ]
-    .into_iter()
-    .filter(|(name, _, _)| {
-        if *name == "run" {
-            // A task can now carry any number of labeled `run <os>` blocks
-            // alongside at most one bare default — only offer the `run`
-            // snippet while that default block is still missing.
-            !task.run_blocks.iter().any(|block| block.os.is_none())
-        } else {
-            !task_field_is_present(source, body_start, body_end, name)
-        }
-    })
-    .map(|(label, detail, insert_text)| CompletionItem {
-        label: label.to_string(),
-        kind: Some(CompletionItemKind::FIELD),
-        detail: Some(detail.to_string()),
-        insert_text: Some(insert_text.to_string()),
-        insert_text_format: Some(InsertTextFormat::SNIPPET),
-        ..Default::default()
-    })
-    .collect()
-}
-
-fn cursor_in_depends_on(source: &str, body_start: usize, offset: usize) -> bool {
-    let Some(before_cursor) = source.get(body_start..offset) else {
-        return false;
-    };
-    let Some(field_start) = before_cursor.rfind("dependsOn") else {
-        return false;
-    };
-    let field = &before_cursor[field_start + "dependsOn".len()..];
-    field.rfind('[').is_some_and(|open| !field[open + 1..].contains(']'))
-}
-
 fn offset_in_expr(expr: &spar::ast::Expr, offset: usize) -> bool {
     !matches!(expr, spar::ast::Expr::Literal(_))
         && expr_span(expr).start <= offset
@@ -256,123 +190,253 @@ fn task_interpolation_at_offset(
     task: &spar::ast::TaskDecl,
     offset: usize,
 ) -> Option<&spar::ast::Expr> {
-    task.run_blocks.iter().find_map(|block| {
-        block.commands.iter().find_map(|command| {
+    task.run_blocks.iter().find_map(|block| match &block.body {
+        spar::ast::RunBody::Bash(commands) => commands.iter().find_map(|command| {
             command.parts.iter().find_map(|part| match part {
                 spar::ast::ShellTemplatePart::Expr(expr) if offset_in_expr(expr, offset) => {
                     Some(expr)
                 }
                 _ => None,
             })
-        })
+        }),
+        spar::ast::RunBody::Native(shell) => native_interpolation_at_offset(shell, offset),
     })
 }
 
-fn cursor_in_task_run(source: &str, body_start: usize, body_end: usize, offset: usize) -> bool {
-    let Ok(tokens) = Lexer::new(source).tokenize() else {
-        return false;
-    };
-    let mut run_start = None;
-    for token in tokens {
-        if token.span.start < body_start || token.span.start > body_end {
-            continue;
-        }
-        match token.token {
-            spar::Token::RunStart => run_start = Some(token.span.start),
-            spar::Token::RunEnd => {
-                if run_start.is_some_and(|start| start < offset && offset <= token.span.end) {
-                    return true;
-                }
-                run_start = None;
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-fn task_value_completion_items(task: &spar::ast::TaskDecl) -> Vec<CompletionItem> {
-    task
-        .params
+/// The `${...}` expression under `offset` inside a native shell body: command
+/// words in flattened `steps`, plus command-only expression statements
+/// (nested shells recurse).
+fn native_interpolation_at_offset(
+    shell: &spar::ast::ShellExpr,
+    offset: usize,
+) -> Option<&spar::ast::Expr> {
+    use spar::ast::{ShellStep, Statement};
+    shell
+        .steps
         .iter()
-        .map(|param| CompletionItem {
-            label: param.name.clone(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some(format_spar_type(&param.ty)),
-            ..Default::default()
+        .find_map(|(_, step)| match step {
+            ShellStep::Command(command) => interpolation_in_command(command, offset),
+            ShellStep::Pipeline(commands) => commands
+                .iter()
+                .find_map(|command| interpolation_in_command(command, offset)),
         })
-        .collect()
+        .or_else(|| {
+            shell.statements.iter().find_map(|statement| match statement {
+                Statement::Expression(spar::ast::Expr::Shell(inner), _) => {
+                    native_interpolation_at_offset(inner, offset)
+                }
+                _ => None,
+            })
+        })
 }
 
-fn task_entry_value_completion_items(entry: &spar::resolver::TaskEntry) -> Vec<CompletionItem> {
-    entry
-        .params
+fn interpolation_in_command(
+    command: &spar::ast::ShellCommandExpr,
+    offset: usize,
+) -> Option<&spar::ast::Expr> {
+    std::iter::once(&command.program)
+        .chain(command.args.iter())
+        .find_map(|word| {
+            word.parts.iter().find_map(|part| match part {
+                spar::ast::ShellWordPart::Expr(expr) if offset_in_expr(expr, offset) => Some(expr),
+                _ => None,
+            })
+        })
+}
+
+fn task_param_items(params: &[(String, String)]) -> Vec<CompletionItem> {
+    params
         .iter()
         .map(|(name, ty)| CompletionItem {
             label: name.clone(),
             kind: Some(CompletionItemKind::VALUE),
-            detail: Some(format_spar_type(ty)),
+            detail: Some(ty.clone()),
             ..Default::default()
         })
         .collect()
 }
 
-fn incomplete_task_interpolation_items(
-    source: &str,
-    symbols: &SymbolTable,
-    offset: usize,
-) -> Option<Vec<CompletionItem>> {
-    if !source.get(..offset)?.trim_end().ends_with("${") {
-        return None;
-    }
-    let (name, entry) = symbols
-        .tasks
-        .iter()
-        .filter(|(_, entry)| entry.span.start <= offset)
-        .max_by_key(|(_, entry)| entry.span.start)?;
-    let task_source = source.get(entry.span.start..offset)?;
-    let run_start = task_source.rfind("run")?;
-    if !task_source[run_start + "run".len()..].contains('{') {
-        return None;
-    }
-    symbols
-        .tasks
-        .get(name)
-        .map(task_entry_value_completion_items)
+/// True when the cursor sits inside an unclosed `${...` interpolation.
+fn in_open_interpolation(source: &str, offset: usize) -> bool {
+    source
+        .get(..offset)
+        .and_then(|before| before.rfind("${").map(|start| !before[start..].contains('}')))
+        .unwrap_or(false)
 }
 
-fn task_completion_items(
-    program: Option<&Program>,
-    source: &str,
-    symbols: &SymbolTable,
-    offset: usize,
-) -> Option<Vec<CompletionItem>> {
-    let Some(program) = program else {
-        return incomplete_task_interpolation_items(source, symbols, offset);
-    };
-    let (task, body_start, body_end) = task_at_offset(program, source, offset)?;
-    if task_interpolation_at_offset(task, offset).is_some() {
-        return Some(task_value_completion_items(task));
+fn task_body_items(scope: &crate::task_context::TaskScope) -> Vec<CompletionItem> {
+    let fields = [
+        ("description", "Human-readable task description", "description: \"$1\";"),
+        ("default", "Run when no task name is supplied", "default: ${1|true,false|};"),
+        ("quiet", "Command echoing (quiet by default; set false to show commands)", "quiet: ${1|true,false|};"),
+        ("private", "Hide the task from public listings", "private: ${1|true,false|};"),
+        ("group", "Group shown in task listings", "group: \"$1\";"),
+        ("confirm", "Confirmation prompt before running", "confirm: \"$1\";"),
+        ("dependsOn", "Tasks that must run first", "dependsOn: [$1];"),
+        ("env", "Environment variables for commands", "env: {\n\t$0\n};"),
+        ("cwd", "Working directory for commands", "cwd: \"$1\";"),
+    ];
+    let mut items: Vec<CompletionItem> = fields
+        .into_iter()
+        .filter(|(name, _, _)| !scope.present_fields.iter().any(|present| present == name))
+        .map(|(label, detail, insert_text)| CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(detail.to_string()),
+            insert_text: Some(insert_text.to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        })
+        .collect();
+
+    // One `run` block per OS slot, whichever shell it uses.
+    let slot_free = |os: Option<&str>| !scope.used_os_slots.iter().any(|used| used.as_deref() == os);
+    let mut run_snippets: Vec<(&str, &str, &str)> = Vec::new();
+    if slot_free(None) {
+        run_snippets.push(("run", "Spar shell commands, any OS", "run {\n\t$0\n};"));
+        run_snippets.push(("run bash", "Bash commands, any OS", "run bash {\n\t$0\n};"));
     }
-    if cursor_in_depends_on(source, body_start, offset) {
-        return Some(
+    for os in ["linux", "macos", "windows"] {
+        if slot_free(Some(os)) {
+            run_snippets.push((
+                match os {
+                    "linux" => "run linux",
+                    "macos" => "run macos",
+                    _ => "run windows",
+                },
+                "Spar shell commands, this OS only",
+                match os {
+                    "linux" => "run linux {\n\t$0\n};",
+                    "macos" => "run macos {\n\t$0\n};",
+                    _ => "run windows {\n\t$0\n};",
+                },
+            ));
+            run_snippets.push((
+                match os {
+                    "linux" => "run bash linux",
+                    "macos" => "run bash macos",
+                    _ => "run bash windows",
+                },
+                "Bash commands, this OS only",
+                match os {
+                    "linux" => "run bash linux {\n\t$0\n};",
+                    "macos" => "run bash macos {\n\t$0\n};",
+                    _ => "run bash windows {\n\t$0\n};",
+                },
+            ));
+        }
+    }
+    items.extend(run_snippets.into_iter().map(|(label, detail, insert_text)| CompletionItem {
+        label: label.to_string(),
+        kind: Some(CompletionItemKind::SNIPPET),
+        detail: Some(detail.to_string()),
+        insert_text: Some(insert_text.to_string()),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        ..Default::default()
+    }));
+    items
+}
+
+fn run_header_items(
+    shell_seen: bool,
+    os_seen: bool,
+    used_os_slots: &[Option<String>],
+) -> Vec<CompletionItem> {
+    if os_seen {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    if !shell_seen {
+        for (word, detail) in [
+            ("spar", "Native Spar shell language (default)"),
+            ("bash", "Raw bash, run with bash -c"),
+        ] {
+            items.push(CompletionItem {
+                label: word.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some(detail.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+    for os in ["linux", "macos", "windows"] {
+        if used_os_slots.iter().any(|used| used.as_deref() == Some(os)) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: os.to_string(),
+            kind: Some(CompletionItemKind::ENUM_MEMBER),
+            detail: Some("Only run on this operating system".to_string()),
+            ..Default::default()
+        });
+    }
+    items
+}
+
+fn task_field_value_items(field: &str) -> Vec<CompletionItem> {
+    match field {
+        "quiet" | "default" | "private" => ["true", "false"]
+            .into_iter()
+            .map(|value| CompletionItem {
+                label: value.to_string(),
+                kind: Some(CompletionItemKind::VALUE),
+                ..Default::default()
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn task_dependency_items(symbols: Option<&SymbolTable>, current: &str) -> Vec<CompletionItem> {
+    symbols
+        .map(|symbols| {
             symbols
                 .tasks
                 .keys()
-                .filter(|name| name.as_str() != task.name)
+                .filter(|name| name.as_str() != current)
                 .map(|name| CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
                     detail: Some("task dependency".to_string()),
                     ..Default::default()
                 })
-                .collect(),
-        );
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Completion inside a `task` declaration. Works from the text before the
+/// cursor alone (see `task_context`), so it keeps working while the file
+/// doesn't parse; `symbols` only supplies the task names for `dependsOn`.
+/// `None` means "not a task-specific position" — callers fall through to the
+/// general completion path.
+fn task_completion_items(
+    source: &str,
+    symbols: Option<&SymbolTable>,
+    offset: usize,
+) -> Option<Vec<CompletionItem>> {
+    use crate::task_context::{task_context, TaskContext};
+    let scope = task_context(source, offset)?;
+    match &scope.context {
+        TaskContext::Params => None,
+        TaskContext::Body => Some(task_body_items(&scope)),
+        TaskContext::FieldValue(field) => Some(task_field_value_items(field)),
+        TaskContext::DependsOn => Some(task_dependency_items(symbols, &scope.name)),
+        TaskContext::RunHeader { shell_seen, os_seen } => {
+            Some(run_header_items(*shell_seen, *os_seen, &scope.used_os_slots))
+        }
+        TaskContext::RunBody(shell) => {
+            if in_open_interpolation(source, offset) {
+                Some(task_param_items(&scope.params))
+            } else if *shell == spar::ast::RunShell::Bash {
+                // Raw bash: nothing of ours to offer, and the generic Spar
+                // completions would only be noise.
+                Some(Vec::new())
+            } else {
+                None
+            }
+        }
     }
-    if cursor_in_task_run(source, body_start, body_end, offset) {
-        return Some(Vec::new());
-    }
-    Some(task_metadata_completion_items(task, source, body_start, body_end))
 }
 
 fn member_completion_items(

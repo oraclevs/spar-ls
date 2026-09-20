@@ -1,6 +1,7 @@
 //! Spar Language Server — speaks LSP over stdio.
 
 mod diagnostics;
+mod task_context;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -1367,17 +1368,20 @@ impl LanguageServer for SparLanguageServer {
             _ => {}
         }
 
+        // Task positions are classified from the text alone, so they work even
+        // when the file doesn't parse or resolve (no symbols yet).
+        if let Some(items) =
+            task_completion_items(&state.source, state.effective_symbols(), offset)
+        {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
+
         let symbols = match state.effective_symbols() {
             Some(s) => s,
             None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
         };
 
         if let Some(items) = member_completion_items(&state.source, offset, symbols) {
-            return Ok(Some(CompletionResponse::Array(items)));
-        }
-        if let Some(items) =
-            task_completion_items(state.ast.as_ref(), &state.source, symbols, offset)
-        {
             return Ok(Some(CompletionResponse::Array(items)));
         }
 
@@ -1850,7 +1854,17 @@ mod tests {
         let tokens = Lexer::new(src).tokenize().expect("lex");
         let program = Parser::new(tokens).parse().expect("parse");
         let symbols = Resolver::new().resolve(&program, &[]).expect("resolve");
-        task_completion_items(Some(&program), src, &symbols, offset)
+        task_completion_items(src, Some(&symbols), offset)
+            .expect("task completion context")
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
+    fn task_completion_labels_no_ast(src: &str, marker: &str) -> Vec<String> {
+        let offset = src.find(marker).expect("completion marker");
+        let symbols = resolve_src("");
+        task_completion_items(src, Some(&symbols), offset)
             .expect("task completion context")
             .into_iter()
             .map(|item| item.label)
@@ -1858,9 +1872,113 @@ mod tests {
     }
 
     #[test]
+    fn empty_task_body_offers_metadata_fields_without_a_valid_ast() {
+        let src = "task Deploy {\n    /* complete here */\n};\n";
+        let labels = task_completion_labels_no_ast(src, "/* complete here */");
+        for expected in ["description", "quiet", "dependsOn", "run"] {
+            assert!(
+                labels.contains(&expected.to_string()),
+                "missing {expected}: {labels:?}"
+            );
+        }
+        assert!(!labels.contains(&"shell".to_string()));
+    }
+
+    /// Completion labels at the `|` cursor marker, with no AST and no symbols.
+    fn task_labels_at_cursor(marked: &str) -> Option<Vec<String>> {
+        let offset = marked.find('|').expect("cursor marker");
+        let src = marked.replacen('|', "", 1);
+        task_completion_items(&src, None, offset)
+            .map(|items| items.into_iter().map(|item| item.label).collect())
+    }
+
+    #[test]
+    fn task_body_does_not_offer_the_removed_shell_field_and_offers_run_variants() {
+        let labels = task_labels_at_cursor("task X {\n    |").unwrap();
+        assert!(!labels.contains(&"shell".to_string()));
+        for expected in ["run", "run bash", "run windows", "run bash macos"] {
+            assert!(labels.contains(&expected.to_string()), "missing {expected}: {labels:?}");
+        }
+    }
+
+    #[test]
+    fn taken_os_slots_are_not_offered_again_regardless_of_shell() {
+        let labels =
+            task_labels_at_cursor("task X {\n    run bash windows { a; };\n    |").unwrap();
+        assert!(!labels.contains(&"run windows".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"run bash windows".to_string()), "{labels:?}");
+        assert!(labels.contains(&"run linux".to_string()));
+        assert!(labels.contains(&"run".to_string()));
+    }
+
+    #[test]
+    fn run_header_offers_shells_then_os_words_then_nothing() {
+        let first = task_labels_at_cursor("task X {\n    run |").unwrap();
+        assert_eq!(first, ["spar", "bash", "linux", "macos", "windows"]);
+        let after_shell = task_labels_at_cursor("task X {\n    run bash |").unwrap();
+        assert_eq!(after_shell, ["linux", "macos", "windows"]);
+        let after_os = task_labels_at_cursor("task X {\n    run bash linux |").unwrap();
+        assert!(after_os.is_empty());
+        let taken =
+            task_labels_at_cursor("task X {\n    run linux { a; };\n    run |").unwrap();
+        assert!(!taken.contains(&"linux".to_string()), "{taken:?}");
+    }
+
+    #[test]
+    fn boolean_fields_offer_true_and_false() {
+        for field in ["quiet", "default", "private"] {
+            let labels =
+                task_labels_at_cursor(&format!("task X {{\n    {field}: |")).unwrap();
+            assert_eq!(labels, ["true", "false"], "{field}");
+        }
+    }
+
+    #[test]
+    fn depends_on_offers_other_tasks_even_before_the_file_parses() {
+        let src_with_cursor = "task Build { run { a; }; };\ntask Deploy {\n    dependsOn: [|";
+        let offset = src_with_cursor.find('|').unwrap();
+        let src = src_with_cursor.replacen('|', "", 1);
+        let symbols = resolve_src("task Build { run { a; }; };\ntask Deploy { run { b; }; };\n");
+        let labels: Vec<String> = task_completion_items(&src, Some(&symbols), offset)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        assert_eq!(labels, ["Build"]);
+    }
+
+    #[test]
+    fn interpolation_in_native_and_bash_bodies_offers_only_task_params() {
+        for header in ["run", "run bash"] {
+            let marked = format!(
+                "var region: str = \"w\";\ntask Deploy(environment: str, *extra: str) {{\n    {header} {{ echo ${{|"
+            );
+            let labels = task_labels_at_cursor(&marked).unwrap();
+            assert_eq!(labels, ["environment", "extra"], "{header}");
+        }
+    }
+
+    #[test]
+    fn bash_bodies_offer_nothing_but_native_bodies_fall_through() {
+        assert_eq!(task_labels_at_cursor("task X {\n    run bash { ec|").unwrap(), Vec::<String>::new());
+        assert!(task_labels_at_cursor("task X {\n    run { ec|").is_none());
+    }
+
+    #[test]
+    fn outside_tasks_task_completion_stays_out_of_the_way() {
+        assert!(task_labels_at_cursor("var x: int = 1;\n|").is_none());
+        assert!(task_labels_at_cursor("task X { run { a; }; };\n|").is_none());
+    }
+
+    #[test]
+    fn task_params_type_position_falls_through_to_the_generic_type_completions() {
+        assert!(task_labels_at_cursor("task X(a: |").is_none());
+    }
+
+    #[test]
     fn completion_suggests_missing_task_metadata_fields() {
         let src = concat!(
-            "task [Deploy] {\n",
+            "task Deploy {\n",
             "    description: \"Deploy the app\";\n",
             "    quiet: true;\n",
             "    /* complete here */\n",
@@ -1878,7 +1996,7 @@ mod tests {
     #[test]
     fn completion_still_offers_run_when_only_labeled_blocks_exist() {
         let src = concat!(
-            "task [Deploy] {\n",
+            "task Deploy {\n",
             "    description: \"Deploy the app\";\n",
             "    /* complete here */\n",
             "    run windows { echo win; };\n",
@@ -1894,15 +2012,15 @@ mod tests {
     #[test]
     fn completion_suggests_other_tasks_inside_depends_on() {
         let src = concat!(
-            "task [Build] { run { cargo build; }; };\n",
-            "task [Test] { run { cargo test; }; };\n",
-            "task [Deploy] { dependsOn: [Build]; run { echo deploy; }; };\n",
+            "task Build { run { cargo build; }; };\n",
+            "task Test { run { cargo test; }; };\n",
+            "task Deploy { dependsOn: [Build]; run { echo deploy; }; };\n",
         );
         let offset = src.find("Build]; run").expect("dependency") + "Build".len();
         let tokens = Lexer::new(src).tokenize().expect("lex");
         let program = Parser::new(tokens).parse().expect("parse");
         let symbols = Resolver::new().resolve(&program, &[]).expect("resolve");
-        let labels = task_completion_items(Some(&program), src, &symbols, offset)
+        let labels = task_completion_items(src, Some(&symbols), offset)
             .expect("dependsOn completion")
             .into_iter()
             .map(|item| item.label)
@@ -1917,13 +2035,13 @@ mod tests {
         let src = concat!(
             "var environment: str = \"global\";\n",
             "var region: str = \"west\";\n",
-            "task [Deploy](environment: str) { run { echo ${environment}; }; };\n",
+            "task Deploy(environment: str) { run bash { echo ${environment}; }; };\n",
         );
         let offset = src.rfind("environment}").expect("interpolation") + 2;
         let tokens = Lexer::new(src).tokenize().expect("lex");
         let program = Parser::new(tokens).parse().expect("parse");
         let symbols = Resolver::new().resolve(&program, &[]).expect("resolve");
-        let items = task_completion_items(Some(&program), src, &symbols, offset)
+        let items = task_completion_items(src, Some(&symbols), offset)
             .expect("interpolation completion");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "environment");
@@ -1932,10 +2050,10 @@ mod tests {
 
     #[test]
     fn completion_recovers_task_params_immediately_after_interpolation_start() {
-        let valid = "task [Deploy](environment: str, *extra: str) { run { echo ok; }; };\n";
+        let valid = "task Deploy(environment: str, *extra: str) { run { echo ok; }; };\n";
         let symbols = resolve_src(valid);
-        let src = "task [Deploy](environment: str, *extra: str) { run { echo ${";
-        let items = task_completion_items(None, src, &symbols, src.len())
+        let src = "task Deploy(environment: str, *extra: str) { run { echo ${";
+        let items = task_completion_items(src, Some(&symbols), src.len())
             .expect("incomplete interpolation completion");
         assert_eq!(
             items
@@ -2094,15 +2212,15 @@ mod tests {
     #[test]
     fn hover_on_task_name_shows_signature_and_description() {
         let src = concat!(
-            "task [Build] { run { cargo build; }; };\n",
-            "task [Deploy](environment: str = \"staging\", *extra: str) {\n",
+            "task Build { run { cargo build; }; };\n",
+            "task Deploy(environment: str = \"staging\", *extra: str) {\n",
             "    description: \"Deploy to an environment\";\n",
             "    dependsOn: [Build];\n",
             "    run { ./deploy.sh ${environment} ${extra}; };\n",
             "};\n",
         );
         let hover = task_hover(src, "Deploy", 0);
-        assert!(hover.contains("task [Deploy](environment: str = \"staging\", *extra: str)"));
+        assert!(hover.contains("task Deploy(environment: str = \"staging\", *extra: str)"));
         assert!(hover.contains("Deploy to an environment"));
         assert!(hover.contains("Depends on: `Build`"));
     }
@@ -2110,7 +2228,7 @@ mod tests {
     #[test]
     fn hover_on_task_param_declaration_shows_default_and_variadic_marker() {
         let src = concat!(
-            "task [Deploy](environment: str = \"staging\", *extra: str) {\n",
+            "task Deploy(environment: str = \"staging\", *extra: str) {\n",
             "    run { ./deploy.sh ${environment} ${extra}; };\n",
             "};\n",
         );
@@ -2123,7 +2241,7 @@ mod tests {
     #[test]
     fn hover_on_task_param_interpolation_matches_declaration_hover() {
         let src = concat!(
-            "task [Deploy](environment: str = \"staging\") {\n",
+            "task Deploy(environment: str = \"staging\") {\n",
             "    run { ./deploy.sh ${environment}; };\n",
             "};\n",
         );
@@ -2136,15 +2254,15 @@ mod tests {
     #[test]
     fn hover_on_task_dependson_shows_referenced_task_signature() {
         let src = concat!(
-            "task [Build] { description: \"Compile\"; run { cargo build; }; };\n",
-            "task [Test] {\n",
+            "task Build { description: \"Compile\"; run { cargo build; }; };\n",
+            "task Test {\n",
             "    dependsOn: [Build];\n",
             "    run { cargo test; };\n",
             "};\n",
         );
         // `Build` inside `dependsOn: [Build];` — the second occurrence of "Build".
         let hover = task_hover(src, "Build", 1);
-        assert!(hover.contains("task [Build]"), "{hover}");
+        assert!(hover.contains("task Build"), "{hover}");
         assert!(hover.contains("Compile"), "{hover}");
     }
 
@@ -2804,7 +2922,7 @@ mod tests {
     #[test]
     fn build_version_exposes_intelligence_core_identity() {
         let version = spar_ls_version();
-        assert!(version.contains("spar-ls 0.5.0"), "{version}");
+        assert!(version.contains("spar-ls 0.5.1"), "{version}");
         assert!(version.contains("intelligence-core-v2"), "{version}");
     }
 
@@ -3008,7 +3126,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_task_name_uses_registered_task_type() {
-        let src = "task [Deploy] { run { echo deploy; }; };";
+        let src = "task Deploy { run { echo deploy; }; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Deploy", src).expect("Deploy not found");
         assert_eq!(tok.token_type, TT_TASK);
@@ -3022,11 +3140,11 @@ mod tests {
     #[test]
     fn semantic_tokens_task_fields_and_interpolations_are_classified() {
         let src = concat!(
-            "task [Deploy](environment: str) {\n",
+            "task Deploy(environment: str) {\n",
             "    description: \"Deploy\";\n",
             "    dependsOn: [];\n",
             "    env: { TARGET: \"prod\"; };\n",
-            "    run { echo ${environment}; };\n",
+            "    run bash { echo ${environment}; };\n",
             "};\n",
         );
         let tokens = decode_semantic_tokens(src);
@@ -3059,6 +3177,28 @@ mod tests {
             TT_TASK_FIELD
         );
         assert!(find_tok(&tokens, "echo", src).is_none());
+    }
+
+    #[test]
+    fn semantic_tokens_native_run_body_classifies_params_and_command_words() {
+        let src = concat!(
+            "task Deploy(environment: str) {\n",
+            "    run { echo ${environment}; };\n",
+            "};\n",
+        );
+        let tokens = decode_semantic_tokens(src);
+        assert!(tokens.iter().any(|token| {
+            token.token_type == TT_PARAMETER
+                && src.lines().nth(token.line as usize).is_some_and(|line| {
+                    let start = token.start_char as usize;
+                    let end = start + token.length as usize;
+                    line.get(start..end) == Some("environment")
+                })
+        }));
+        assert!(
+            find_tok(&tokens, "echo", src).is_some(),
+            "native run bodies get the same command highlighting as shell {{}} blocks"
+        );
     }
 
     #[test]
@@ -3491,10 +3631,10 @@ mod tests {
     #[test]
     fn references_finds_task_dependson_reference() {
         let src = concat!(
-            "task [Build] {\n",
+            "task Build {\n",
             "    run { echo build; };\n",
             "};\n",
-            "task [Test] {\n",
+            "task Test {\n",
             "    dependsOn: [Build];\n",
             "    run { echo test; };\n",
             "};\n",
@@ -3502,7 +3642,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let uri = Url::from_file_path(dir.join("references_task.spar")).unwrap();
         let state = SparLanguageServer::analyze(src, &dir);
-        // Position on `Build` in `task [Build] {`.
+        // Position on `Build` in `task Build {`.
         let location = definition_at(&uri, &state, Position::new(0, 7)).expect("definition");
 
         let refs = compute_references("Build", location, src.to_string(), &HashMap::new(), false);

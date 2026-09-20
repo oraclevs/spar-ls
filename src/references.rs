@@ -277,7 +277,6 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
                     &td.group,
                     &td.confirm,
                     &td.cwd,
-                    &td.shell,
                 ]
                 .into_iter()
                 .flatten()
@@ -295,11 +294,18 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
                     collect_expr_refs(value, target, out);
                 }
                 for block in &td.run_blocks {
-                    for command in &block.commands {
-                        for part in &command.parts {
-                            if let ShellTemplatePart::Expr(e) = part {
-                                collect_expr_refs(e, target, out);
+                    match &block.body {
+                        spar::ast::RunBody::Bash(commands) => {
+                            for command in commands {
+                                for part in &command.parts {
+                                    if let ShellTemplatePart::Expr(e) = part {
+                                        collect_expr_refs(e, target, out);
+                                    }
+                                }
                             }
+                        }
+                        spar::ast::RunBody::Native(shell) => {
+                            collect_expr_refs(&spar::ast::Expr::Shell(shell.clone()), target, out);
                         }
                     }
                 }
