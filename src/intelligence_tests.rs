@@ -1327,3 +1327,19 @@ fn several_broken_statements_still_leave_the_healthy_ones_colored() {
     assert!(tokens.iter().any(|(t, ty, _)| t == "looper" && *ty == TT_FUNCTION), "{tokens:?}");
     assert!(tokens.iter().any(|(t, ty, _)| t == "Human" && *ty == TT_TYPE));
 }
+
+#[test]
+fn references_to_a_type_include_uses_inside_type_annotations() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(HUMAN_SOURCE, std::path::Path::new("/workspace"));
+    let target = semantic_target_at(
+        &uri,
+        &state,
+        position_of(HUMAN_SOURCE, "type Human", 6),
+        &WorkspaceIndex::default(),
+    )
+    .expect("target");
+    let occurrences = semantic_occurrences_in_document(&uri, &state, &target);
+    // declaration + `List<Human>` (global) + `List<Human>` (parameter) + `var person: Human`
+    assert_eq!(occurrences.len(), 4, "{occurrences:?}");
+}
