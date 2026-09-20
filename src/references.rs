@@ -506,7 +506,32 @@ impl SparLanguageServer {
         };
 
         let importers_snapshot = self.importers.lock().await.clone();
-        compute_references(&word, defining_location, defining_source, &importers_snapshot, include_declaration)
+        let mut locations = compute_references(
+            &word,
+            defining_location,
+            defining_source,
+            &importers_snapshot,
+            include_declaration,
+        );
+        // The AST walk above misses uses that live only in type annotations
+        // (`List<Human>`); add this document's semantic occurrences, deduplicated.
+        let docs = self.documents.lock().await;
+        if let Some(state) = docs.get(uri) {
+            let index = self.workspace_index.lock().await;
+            if let Some(target) = semantic_target_at(uri, state, pos, &index) {
+                for occurrence in semantic_occurrences_in_document(uri, state, &target) {
+                    if !include_declaration && occurrence.role == SemanticOccurrenceRole::Declaration {
+                        continue;
+                    }
+                    let location = Location { uri: uri.clone(), range: occurrence.range };
+                    if !locations.iter().any(|existing| same_location_key(existing, &location)) {
+                        locations.push(location);
+                    }
+                }
+            }
+        }
+        locations.sort_by_key(|location| (location.uri.to_string(), location.range.start.line, location.range.start.character));
+        locations
     }
 }
 
