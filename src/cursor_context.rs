@@ -11,6 +11,8 @@ enum EditorContext {
         package: bool,
         path: Option<String>,
         already: HashSet<String>,
+        /// Absolute byte offset of the closing `}` in `source`, when present.
+        close_at: Option<usize>,
     },
     CallArguments {
         callee: String,
@@ -217,6 +219,7 @@ fn import_context(source: &str, offset: usize) -> Option<EditorContext> {
         package,
         path: quoted_import_path(stmt),
         already,
+        close_at: close.map(|relative| start + relative),
     })
 }
 
