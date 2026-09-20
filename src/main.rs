@@ -3298,11 +3298,11 @@ mod tests {
         let tokens = decode_semantic_tokens(src);
         assert_eq!(
             find_tok(&tokens, "export", src).unwrap().token_type,
-            TT_KEYWORD
+            TT_DECLARATION_KEYWORD
         );
         assert_eq!(
             find_tok(&tokens, "struct", src).unwrap().token_type,
-            TT_KEYWORD
+            TT_DECLARATION_KEYWORD
         );
         assert_eq!(
             find_tok(&tokens, "try", src).unwrap().token_type,
@@ -3321,7 +3321,7 @@ mod tests {
         let tokens = decode_semantic_tokens(src);
         assert_eq!(
             find_tok(&tokens, "async", src).unwrap().token_type,
-            TT_KEYWORD
+            TT_DECLARATION_KEYWORD
         );
         assert_eq!(
             find_tok(&tokens, "await", src).unwrap().token_type,
@@ -3591,7 +3591,7 @@ mod tests {
         assert_eq!(find_tok(&tokens, "void", src).unwrap().token_type, TT_TYPE);
         assert_eq!(
             find_tok(&tokens, "mut", src).unwrap().token_type,
-            TT_KEYWORD
+            TT_DECLARATION_KEYWORD
         );
         assert_eq!(
             find_tok(&tokens, "index", src).unwrap().token_type,
@@ -3729,7 +3729,7 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
     fn semantic_tokens_classify_pkg_as_a_keyword() {
         let src = "import pkg { println } from \"std\";\n";
         let tokens = decode_semantic_tokens(src);
-        assert_eq!(find_tok(&tokens, "pkg", src).unwrap().token_type, TT_KEYWORD);
+        assert_eq!(find_tok(&tokens, "pkg", src).unwrap().token_type, TT_DECLARATION_KEYWORD);
     }
 
     #[test]
