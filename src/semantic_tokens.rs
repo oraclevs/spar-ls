@@ -128,9 +128,16 @@ fn sanitize_raw_tokens(source: &str, raw: Vec<RawToken>) -> Vec<RawToken> {
 
 fn build_semantic_raw_tokens(state: &DocumentState) -> Vec<RawToken> {
     let mut raw = Vec::new();
-    match &state.ast {
-        Some(program) => collect_tokens_from_program(program, &state.source, &mut raw),
-        // No AST (syntax error mid-typing): keep keywords/types colored from the lexer.
+    // Build tokens from this file's OWN parse. The compiled AST has imported items
+    // spliced in with their original files' byte positions, which would paint tokens
+    // onto unrelated lines here. It is used only for meaning: which imported names
+    // are functions vs types, and which functions are bundled std.
+    match raw_program_for_source(&state.source) {
+        Some(own) => {
+            let kinds = SemanticKinds::from_program(state.ast.as_ref().unwrap_or(&own));
+            collect_tokens_with_kinds(&own, &kinds, state.ast.as_ref(), &state.source, &mut raw);
+        }
+        // The file does not parse: keep keywords/types colored from the lexer.
         None => collect_language_words(&state.source, &mut raw),
     }
     sanitize_raw_tokens(&state.source, raw)
@@ -760,8 +767,63 @@ fn collect_task_tokens(
 }
 
 fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<RawToken>) {
-    use spar::ast::TopLevelItem as TL;
     let kinds = SemanticKinds::from_program(program);
+    collect_tokens_with_kinds(program, &kinds, None, source, out);
+}
+
+/// Classify the names of a selective import (`import { a, b as c } from ...`).
+/// `resolved` is the compiled program (imports spliced in) used to tell functions
+/// from types; when it is unavailable, PascalCase names are assumed to be types.
+fn collect_import_item_tokens(
+    decl: &spar::ast::ImportDecl,
+    resolved: Option<&Program>,
+    source: &str,
+    out: &mut Vec<RawToken>,
+) {
+    use spar::ast::{ImportKind, TopLevelItem};
+    let (ImportKind::Selective(items) | ImportKind::TypeSelective(items)) = &decl.kind else {
+        return;
+    };
+    for item in items {
+        let found = resolved.and_then(|program| {
+            program.items.iter().find_map(|candidate| match candidate {
+                TopLevelItem::Function(f) if f.name == item.name => Some((
+                    TT_FUNCTION,
+                    if f.trusted_native { MOD_DEFAULT_LIBRARY } else { MOD_NONE },
+                )),
+                TopLevelItem::Type(t) if t.name == item.name => Some((TT_TYPE, MOD_NONE)),
+                TopLevelItem::Enum(e) if e.name == item.name => Some((TT_ENUM, MOD_NONE)),
+                TopLevelItem::FunctionGroup(g) if g.name == item.name => Some((TT_FUNCTION_GROUP, MOD_NONE)),
+                TopLevelItem::Var(v) if v.name == item.name => Some((TT_VARIABLE, MOD_NONE)),
+                _ => None,
+            })
+        });
+        let (token_type, modifiers) = found.unwrap_or_else(|| {
+            if item.name.chars().next().is_some_and(char::is_uppercase) {
+                (TT_TYPE, MOD_NONE)
+            } else {
+                (TT_FUNCTION, MOD_NONE)
+            }
+        });
+        if let Some(token) = raw_token_from_bytes(source, item.name_span.start, item.name_span.end, token_type, modifiers) {
+            out.push(token);
+        }
+        if let Some(alias) = &item.alias {
+            if let Some(token) = find_ident_token(source, item.name_span.end, alias, token_type, modifiers) {
+                out.push(token);
+            }
+        }
+    }
+}
+
+fn collect_tokens_with_kinds(
+    program: &Program,
+    kinds: &SemanticKinds,
+    resolved: Option<&Program>,
+    source: &str,
+    out: &mut Vec<RawToken>,
+) {
+    use spar::ast::TopLevelItem as TL;
     for (index, item) in program.items.iter().enumerate() {
         match item {
             TL::Var(vd) => {
@@ -861,7 +923,7 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 }
                 out.push(raw_from_span(&sf.source_type_span, TT_TYPE, MOD_NONE));
             }
-            TL::Import(_) => {}
+            TL::Import(decl) => collect_import_item_tokens(decl, resolved, source, out),
             TL::Enum(ed) => {
                 out.push(raw_from_span(&ed.name_span, TT_ENUM, MOD_DECLARATION));
             }
