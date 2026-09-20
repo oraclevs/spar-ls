@@ -27,13 +27,31 @@ fn document_symbol(
     let selection_range = selection_span
         .map(|span| span_to_lsp_range(source, span))
         .unwrap_or_else(|| ident_range_in_span(source, span, &name));
+    // Some declarations carry a span that covers only their first token (`struct`,
+    // `function`), which would exclude the name. LSP requires selectionRange to be
+    // inside range (VS Code throws otherwise), so widen range to cover the name
+    // and every child.
+    let mut range = span_to_lsp_range(source, span);
+    let before = |a: Position, b: Position| (a.line, a.character) < (b.line, b.character);
+    let mut cover = |inner: Range| {
+        if before(inner.start, range.start) {
+            range.start = inner.start;
+        }
+        if before(range.end, inner.end) {
+            range.end = inner.end;
+        }
+    };
+    cover(selection_range);
+    for child in &children {
+        cover(child.range);
+    }
     DocumentSymbol {
         name,
         detail,
         kind,
         tags: None,
         deprecated: None,
-        range: span_to_lsp_range(source, span),
+        range,
         selection_range,
         children: (!children.is_empty()).then_some(children),
     }
