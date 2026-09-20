@@ -916,3 +916,51 @@ fn legend_appends_type_parameter_without_reordering() {
     assert_eq!(TOKEN_TYPES[20], SemanticTokenType::TYPE_PARAMETER);
     assert_eq!(TT_TYPE_PARAMETER, 20);
 }
+
+fn marked(source: &str) -> (String, usize) {
+    let offset = source.find('|').expect("cursor marker");
+    (source.replacen('|', "", 1), offset)
+}
+
+#[test]
+fn local_names_include_params_locals_and_loop_bindings_in_scope() {
+    let (source, offset) = marked(concat!(
+        "function g(p: int, q: str) -> int {\n",
+        "    var loc: int = 2;\n",
+        "    for item in [1, 2] {\n",
+        "        var inner: int = item;\n",
+        "        return |;\n",
+        "    };\n",
+        "    return 0;\n",
+        "};\n",
+    ));
+    let names: Vec<String> = local_names_at(&source, offset).into_iter().map(|n| n.name).collect();
+    for expected in ["p", "q", "loc", "item", "inner"] {
+        assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+    }
+}
+
+#[test]
+fn local_names_exclude_names_from_closed_blocks_and_other_functions() {
+    let (source, offset) = marked(concat!(
+        "function a(x: int) -> int { var hidden: int = 1; return x; };\n",
+        "function b(y: int) -> int { return |; };\n",
+    ));
+    let names: Vec<String> = local_names_at(&source, offset).into_iter().map(|n| n.name).collect();
+    assert!(names.contains(&"y".to_string()));
+    assert!(!names.contains(&"x".to_string()), "{names:?}");
+    assert!(!names.contains(&"hidden".to_string()), "{names:?}");
+}
+
+#[test]
+fn scope_items_are_ranked_before_file_level_and_keywords() {
+    let names = vec![ScopeName { name: "loc".into(), kind: ScopeNameKind::Variable, ty: Some("int".into()) }];
+    let items = scope_completion_items(&names);
+    assert_eq!(items[0].label, "loc");
+    assert_eq!(items[0].sort_text.as_deref(), Some("0_loc"));
+    assert_eq!(items[0].detail.as_deref(), Some("int"));
+    assert_eq!(
+        with_tier(CompletionItem { label: "if".into(), ..Default::default() }, 9).sort_text.as_deref(),
+        Some("9_if")
+    );
+}
