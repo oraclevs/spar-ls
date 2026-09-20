@@ -1300,3 +1300,30 @@ fn member_completion_ignores_numbers_and_spreads() {
     let (source, offset) = marked("var xs: List<int> = [...|];");
     assert!(typed_member_items(&source, offset, &human_symbols()).is_none());
 }
+
+#[test]
+fn one_broken_statement_does_not_recolor_the_rest_of_the_file() {
+    // While typing `person.` the file does not parse. Everything outside that one
+    // statement must keep its full semantic tokens (this is what caused the
+    // whole-file color flip while typing).
+    let broken = HUMAN_SOURCE.replace("println(message: person.name);", "println(message: person.);");
+    let state = SparLanguageServer::analyze(&broken, std::path::Path::new("."));
+    assert!(state.ast.is_none(), "fixture must not parse");
+    let tokens = rendered_tokens(&broken);
+    let has = |text: &str, ty: u32| tokens.iter().any(|(t, token_type, _)| t == text && *token_type == ty);
+    assert!(has("looper", TT_FUNCTION), "function declaration lost: {tokens:?}");
+    assert!(has("people", TT_PARAMETER), "parameter lost");
+    assert!(has("Human", TT_TYPE), "type reference lost");
+    assert!(has("name", TT_PROPERTY), "type field lost");
+    assert!(has("var", TT_DECLARATION_KEYWORD));
+}
+
+#[test]
+fn several_broken_statements_still_leave_the_healthy_ones_colored() {
+    let broken = HUMAN_SOURCE
+        .replace("println(message: person.name);", "println(message: person.);")
+        .replace("var person: Human = people[0];", "var person: Human = ;");
+    let tokens = rendered_tokens(&broken);
+    assert!(tokens.iter().any(|(t, ty, _)| t == "looper" && *ty == TT_FUNCTION), "{tokens:?}");
+    assert!(tokens.iter().any(|(t, ty, _)| t == "Human" && *ty == TT_TYPE));
+}

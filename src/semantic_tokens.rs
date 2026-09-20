@@ -126,13 +126,78 @@ fn sanitize_raw_tokens(source: &str, raw: Vec<RawToken>) -> Vec<RawToken> {
     out
 }
 
+/// Blank (with spaces, keeping every byte offset and newline) the statement that
+/// contains byte `at`: from just after the previous `;`, `{` or `}` through the next
+/// `;` (inclusive) or up to the next `}`.
+fn blank_statement_around(text: &str, at: usize) -> String {
+    let bytes = text.as_bytes();
+    let at = at.min(bytes.len());
+    let mut start = at;
+    while start > 0 && !matches!(bytes[start - 1], b';' | b'{' | b'}') {
+        start -= 1;
+    }
+    let mut end = at;
+    while end < bytes.len() && !matches!(bytes[end], b';' | b'}') {
+        end += 1;
+    }
+    if end < bytes.len() && bytes[end] == b';' {
+        end += 1;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0usize;
+    for ch in text.chars() {
+        let width = ch.len_utf8();
+        if index >= start && index < end && ch != '\n' {
+            out.extend(std::iter::repeat(' ').take(width));
+        } else {
+            out.push(ch);
+        }
+        index += width;
+    }
+    out
+}
+
+/// Parse `source`; if it does not parse (a line is mid-edit), blank the statement the
+/// parser complains about and try again, a few times. Offsets never move, so the
+/// resulting AST can be used against the original text: one broken statement leaves
+/// the rest of the file fully highlighted.
+fn parse_with_statement_repair(source: &str) -> Option<Program> {
+    let mut text = source.to_string();
+    for _ in 0..8 {
+        let tokens = match Lexer::new(&text).tokenize() {
+            Ok(tokens) => tokens,
+            Err(SparError::LexError { span, .. }) | Err(SparError::ParseError { span, .. }) => {
+                let repaired = blank_statement_around(&text, span.start);
+                if repaired == text {
+                    return None;
+                }
+                text = repaired;
+                continue;
+            }
+            Err(_) => return None,
+        };
+        match Parser::new(tokens).parse() {
+            Ok(program) => return Some(program),
+            Err(SparError::ParseError { span, .. }) | Err(SparError::LexError { span, .. }) => {
+                let repaired = blank_statement_around(&text, span.start);
+                if repaired == text {
+                    return None;
+                }
+                text = repaired;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 fn build_semantic_raw_tokens(state: &DocumentState) -> Vec<RawToken> {
     let mut raw = Vec::new();
     // Build tokens from this file's OWN parse. The compiled AST has imported items
     // spliced in with their original files' byte positions, which would paint tokens
     // onto unrelated lines here. It is used only for meaning: which imported names
     // are functions vs types, and which functions are bundled std.
-    match raw_program_for_source(&state.source) {
+    match parse_with_statement_repair(&state.source) {
         Some(own) => {
             let kinds = SemanticKinds::from_program(state.ast.as_ref().unwrap_or(&own));
             collect_tokens_with_kinds(&own, &kinds, state.ast.as_ref(), &state.source, &mut raw);

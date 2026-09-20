@@ -199,8 +199,8 @@ fn signature_from_entry(
 }
 
 fn raw_program_for_source(source: &str) -> Option<Program> {
-    let tokens = Lexer::new(source).tokenize().ok()?;
-    Parser::new(tokens).parse().ok()
+    // Tolerates a half-typed statement (see `parse_with_statement_repair`).
+    parse_with_statement_repair(source)
 }
 
 impl WorkspaceIndex {
