@@ -1156,3 +1156,55 @@ fn document_symbol_ranges_always_contain_their_names_and_children() {
     assert!(!symbols.is_empty());
     assert_symbols_valid(&symbols, "");
 }
+
+fn rendered_tokens_in(source: &str, dir: &std::path::Path) -> Vec<(u32, String, u32, u32)> {
+    let state = SparLanguageServer::analyze(source, dir);
+    let lines: Vec<&str> = source.split('\n').collect();
+    build_semantic_raw_tokens(&state)
+        .iter()
+        .map(|token| {
+            let text: String = lines[token.line as usize]
+                .chars()
+                .skip(token.start_char as usize)
+                .take(token.length as usize)
+                .collect();
+            (token.line, text, token.token_type, token.modifiers)
+        })
+        .collect()
+}
+
+#[test]
+fn imported_shell_functions_do_not_leak_tokens_onto_the_import_line() {
+    // Imported items are spliced into the compiled AST with their original file's
+    // byte positions; tokens built from them landed on this file's import lines.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lib.spar"),
+        concat!(
+            "function build(a: str) -> shell {\n",
+            "    return shell {\n",
+            "        echo \"${a}\";\n",
+            "        ffmpeg -y -i in.mp4 out.mp4;\n",
+            "    };\n",
+            "};\n",
+            "function other() -> int { return 1; };\n",
+            "type Widget { n: int; };\n",
+        ),
+    )
+    .unwrap();
+    let source = "import {\n    build,\n    other\n} from \"lib.spar\";\nimport type { Widget } from \"lib.spar\";\nvar n: int = other();\n";
+    let state = SparLanguageServer::analyze(source, dir.path());
+    assert!(state.ast.is_some(), "fixture must compile");
+    let tokens = rendered_tokens_in(source, dir.path());
+
+    for (line, text, token_type, _) in &tokens {
+        if *line <= 4 {
+            assert!(!is_shell_semantic_type(*token_type), "shell token {text:?} leaked onto import line {line}");
+        }
+    }
+    let kind = |line: u32, name: &str| tokens.iter().find(|t| t.0 == line && t.1 == name).map(|t| t.2);
+    assert_eq!(kind(1, "build"), Some(TT_FUNCTION));
+    assert_eq!(kind(2, "other"), Some(TT_FUNCTION));
+    assert_eq!(kind(4, "Widget"), Some(TT_TYPE));
+    assert_eq!(kind(5, "other"), Some(TT_FUNCTION), "the call site still resolves");
+}
