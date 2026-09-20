@@ -1343,3 +1343,50 @@ fn references_to_a_type_include_uses_inside_type_annotations() {
     // declaration + `List<Human>` (global) + `List<Human>` (parameter) + `var person: Human`
     assert_eq!(occurrences.len(), 4, "{occurrences:?}");
 }
+
+#[test]
+fn removed_task_bracket_syntax_reports_the_migration_hint_and_offers_a_quick_fix() {
+    let source = "task [Build] { run { true; }; };\n";
+    let path = std::path::Path::new("/tmp/spar-ls-task-quickfix.spar");
+    let uri = Url::from_file_path(path).unwrap();
+    let state = SparLanguageServer::analyze_path(source, path);
+
+    let diagnostics = state.diagnostics();
+    let removed = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("task [Name] is removed"))
+        .unwrap_or_else(|| panic!("missing migration diagnostic: {diagnostics:?}"));
+
+    let actions = task_bracket_quick_fixes(&state, &uri, std::slice::from_ref(removed));
+    assert_eq!(actions.len(), 1);
+    let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+        panic!("expected a CodeAction");
+    };
+    assert_eq!(action.title, "Remove brackets: task Build");
+    let edits = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri];
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, "Build");
+    assert_eq!(edits[0].range.start.character, 5);
+    assert_eq!(edits[0].range.end.character, 12);
+
+    // Unrelated diagnostics produce no quick-fix.
+    let unrelated = Diagnostic {
+        message: "something else".into(),
+        ..Diagnostic::default()
+    };
+    assert!(task_bracket_quick_fixes(&state, &uri, &[unrelated]).is_empty());
+}
+
+#[test]
+fn removed_shell_field_reports_the_migration_hint() {
+    let source = "task B { shell: [\"sh\"]; run { true; }; };\n";
+    let state = SparLanguageServer::analyze_path(source, std::path::Path::new("/tmp/spar-ls-shell.spar"));
+    assert!(
+        state
+            .diagnostics()
+            .iter()
+            .any(|d| d.message.contains("use run bash { ... } to select a shell")),
+        "{:?}",
+        state.diagnostics()
+    );
+}

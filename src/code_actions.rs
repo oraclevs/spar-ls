@@ -233,3 +233,50 @@ fn code_actions_for_unresolved(
         })
     }).collect()
 }
+
+/// Quick-fix for the removed `task [Name]` syntax: rewrites it to `task Name`.
+fn task_bracket_quick_fixes(
+    state: &DocumentState,
+    uri: &Url,
+    diagnostics: &[Diagnostic],
+) -> Vec<CodeActionOrCommand> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("task [Name] is removed"))
+        .filter_map(|diagnostic| {
+            let line_number = diagnostic.range.start.line;
+            let line = state.source.lines().nth(line_number as usize)?;
+            let task_index = line.find("task")?;
+            let open = line[task_index..].find('[')? + task_index;
+            let close = line[open..].find(']')? + open;
+            let name = line[open + 1..close].trim();
+            if name.is_empty() {
+                return None;
+            }
+            let column = |byte: usize| line[..byte].encode_utf16().count() as u32;
+            let edit = TextEdit {
+                range: Range {
+                    start: Position { line: line_number, character: column(open) },
+                    end: Position { line: line_number, character: column(close + 1) },
+                },
+                new_text: name.to_string(),
+            };
+            let mut changes = HashMap::new();
+            changes.insert(uri.clone(), vec![edit]);
+            Some(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Remove brackets: task {name}"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                command: None,
+                is_preferred: Some(true),
+                disabled: None,
+                data: None,
+            }))
+        })
+        .collect()
+}

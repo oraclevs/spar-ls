@@ -528,6 +528,17 @@ fn task_hover_at_offset(
         }) {
             return Some(format_hover_task_param(param));
         }
+        for block in &task.run_blocks {
+            let header_word = [&block.shell_span, &block.os_span]
+                .into_iter()
+                .flatten()
+                .find(|span| span.start <= offset && offset <= span.end);
+            if header_word.is_some() {
+                if let Some(text) = run_header_hover(word) {
+                    return Some(text);
+                }
+            }
+        }
         // Hovering a `dependsOn: [Build]` entry shows the referenced task's
         // own signature, same as hovering its declaration would.
         if let Some(dep) = task
@@ -555,4 +566,19 @@ fn task_hover_at_offset(
         .iter()
         .find(|param| param.name == word)
         .map(format_hover_task_param)
+}
+
+/// Hover text for the optional shell / OS words in `run [shell] [os] { }`.
+fn run_header_hover(word: &str) -> Option<String> {
+    let text = match word {
+        "spar" => "**spar** \u{2014} run this block with the native Spar shell language (the default). `${expr}`, `$HOME` and `$(cmd)` work as in `shell { }`; runs in-process on every OS.",
+        "bash" => "**bash** \u{2014} run this block with `bash -c`. The body is raw bash; `${expr}` still interpolates Spar values.",
+        "linux" | "macos" | "windows" => {
+            return Some(format!(
+                "**{word}** \u{2014} this block only runs on {word}. A `run` block with no OS is the fallback when no OS-specific block matches. A task has at most one `run` block per OS."
+            ));
+        }
+        _ => return None,
+    };
+    Some(text.to_string())
 }
