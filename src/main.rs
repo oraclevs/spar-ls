@@ -1629,13 +1629,14 @@ impl LanguageServer for SparLanguageServer {
         let docs = self.documents.lock().await;
         let Some(state) = docs.get(&uri) else { return Ok(None); };
         let index = self.workspace_index.lock().await;
-        let actions = code_actions_for_unresolved(
+        let mut actions = code_actions_for_unresolved(
             state,
             &index,
             &uri,
             params.range,
             &params.context.diagnostics,
         );
+        actions.extend(task_bracket_quick_fixes(state, &uri, &params.context.diagnostics));
         Ok((!actions.is_empty()).then_some(actions))
     }
 
@@ -3177,6 +3178,31 @@ mod tests {
             TT_TASK_FIELD
         );
         assert!(find_tok(&tokens, "echo", src).is_none());
+    }
+
+    #[test]
+    fn run_header_shell_and_os_words_are_keyword_tokens() {
+        let src = "task T {\n    run bash windows { true; };\n    run linux { echo hi; };\n};\n";
+        let tokens = decode_semantic_tokens(src);
+        for word in ["bash", "windows", "linux"] {
+            assert_eq!(
+                find_tok(&tokens, word, src).unwrap().token_type,
+                TT_KEYWORD,
+                "{word}"
+            );
+        }
+        assert_eq!(
+            find_tok(&tokens, "run", src).unwrap().token_type,
+            TT_TASK_FIELD
+        );
+    }
+
+    #[test]
+    fn hover_on_run_header_words_explains_them() {
+        let src = "task T {\n    run bash windows { true; };\n    run linux { echo hi; };\n};\n";
+        assert!(task_hover(src, "bash", 0).contains("bash -c"));
+        assert!(task_hover(src, "windows", 0).contains("only runs on windows"));
+        assert!(task_hover(src, "linux", 0).contains("fallback"));
     }
 
     #[test]

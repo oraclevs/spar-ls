@@ -126,6 +126,23 @@ with tempfile.TemporaryDirectory() as root:
     check("import discovery adds from clause",
           bool(write_text) and 'from "std/fs"' in (write_text[0].get("insertText") or ""), write_text[:1])
 
+    result = complete_at("task Deploy {\n    |\n};\n")
+    found = labels(result)
+    check("task body offers metadata fields while the file does not parse",
+          "description" in found and "dependsOn" in found and "run" in found, found[:12])
+    check("task body no longer offers the removed shell field", "shell" not in found, found[:12])
+
+    result = complete_at("task Deploy {\n    run |\n};\n")
+    check("run header offers shells and OS words",
+          sorted(labels(result)) == ["bash", "linux", "macos", "spar", "windows"], labels(result))
+
+    result = complete_at("task Deploy {\n    run bash |\n};\n")
+    check("run header after a shell offers only OS words",
+          sorted(labels(result)) == ["linux", "macos", "windows"], labels(result))
+
+    result = complete_at("task Deploy {\n    quiet: |\n};\n")
+    check("boolean task fields offer true/false", sorted(labels(result)) == ["false", "true"], labels(result))
+
     edit(base + 'var s: str = "error var int";\n// function in comment\n')
     tokens = client.request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
     check("semantic tokens returned", tokens is not None and len(tokens["data"]) > 0)
