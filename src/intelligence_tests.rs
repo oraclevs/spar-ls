@@ -889,3 +889,30 @@ fn builtin_types_and_functions_carry_default_library() {
     assert!(find("writeText", 4).iter().any(|(ty, m)| *ty == TT_FUNCTION && m & MOD_DEFAULT_LIBRARY != 0),
         "std fn call must be defaultLibrary: {:?}", find("writeText", 4));
 }
+
+#[test]
+fn generic_type_arguments_and_type_parameters_are_typed() {
+    let source = concat!(
+        "type Thing { n: int; };\n",
+        "var xs: List<Thing> = [];\n",
+        "function identity<T>(value: T) -> T { return value; };\n",
+    );
+    assert!(SparLanguageServer::analyze(source, std::path::Path::new(".")).ast.is_some(),
+        "fixture must parse");
+    let tokens = rendered_tokens(source);
+    // `Thing` appears as a declaration on line 1 and as a generic argument on line 2.
+    let thing_types = tokens.iter().filter(|(t, ty, _)| t == "Thing" && *ty == TT_TYPE).count();
+    assert_eq!(thing_types, 2, "tokens: {tokens:?}");
+    // `List` is a built-in generic.
+    assert!(tokens.iter().any(|(t, ty, m)| t == "List" && *ty == TT_TYPE && m & MOD_DEFAULT_LIBRARY != 0));
+    // Type parameter: declaration + parameter type + return type.
+    let tp = tokens.iter().filter(|(t, ty, _)| t == "T" && *ty == TT_TYPE_PARAMETER).count();
+    assert!(tp >= 3, "expected T tokens, got {tokens:?}");
+}
+
+#[test]
+fn legend_appends_type_parameter_without_reordering() {
+    assert_eq!(TOKEN_TYPES[19], SemanticTokenType::new("shellInterpolation"));
+    assert_eq!(TOKEN_TYPES[20], SemanticTokenType::TYPE_PARAMETER);
+    assert_eq!(TT_TYPE_PARAMETER, 20);
+}

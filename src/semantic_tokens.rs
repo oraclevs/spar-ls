@@ -21,6 +21,7 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::new("shellRedirect"), // 17
     SemanticTokenType::new("shellEnvironment"), // 18
     SemanticTokenType::new("shellInterpolation"), // 19
+    SemanticTokenType::TYPE_PARAMETER, // 20
 ];
 
 const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -49,6 +50,7 @@ const TT_SHELL_OPERATOR: u32 = 16;
 const TT_SHELL_REDIRECT: u32 = 17;
 const TT_SHELL_ENVIRONMENT: u32 = 18;
 const TT_SHELL_INTERPOLATION: u32 = 19;
+const TT_TYPE_PARAMETER: u32 = 20;
 const MOD_NONE: u32 = 0;
 const MOD_DECLARATION: u32 = 1;
 const MOD_RESOLVED: u32 = 1 << 1;
@@ -580,20 +582,53 @@ fn collect_named_type_token(
     kinds: &SemanticKinds,
     out: &mut Vec<RawToken>,
 ) {
-    match ty {
-        SparType::Named(name) => {
-            if let Some(token) = find_ident_token(
-                source,
-                from_byte,
-                name,
-                kinds.named_type_token(name),
-                MOD_NONE,
-            ) {
-                out.push(token);
+    collect_type_tokens_from(ty, source, from_byte, kinds, out);
+}
+
+/// Emit tokens for every user-facing identifier in `ty`, scanning forward so a
+/// repeated name (`Map<Thing, Thing>`) resolves to successive occurrences.
+/// Returns the byte offset just after the last identifier consumed.
+fn collect_type_tokens_from(
+    ty: &SparType,
+    source: &str,
+    from_byte: usize,
+    kinds: &SemanticKinds,
+    out: &mut Vec<RawToken>,
+) -> usize {
+    const BUILTIN_GENERICS: &[&str] = &["List", "Map", "Promise"];
+    fn emit(
+        source: &str,
+        name: &str,
+        token_type: u32,
+        modifiers: u32,
+        from: usize,
+        out: &mut Vec<RawToken>,
+    ) -> usize {
+        match find_ident_byte(source, from, name) {
+            Some(byte) => {
+                if let Some(token) =
+                    raw_token_from_bytes(source, byte, byte + name.len(), token_type, modifiers)
+                {
+                    out.push(token);
+                }
+                byte + name.len()
             }
+            None => from,
         }
-        SparType::List(inner) => collect_named_type_token(inner, source, from_byte, kinds, out),
-        _ => {}
+    }
+    match ty {
+        SparType::Named(name) => emit(source, name, kinds.named_type_token(name), MOD_NONE, from_byte, out),
+        SparType::TypeParameter(name) => emit(source, name, TT_TYPE_PARAMETER, MOD_NONE, from_byte, out),
+        SparType::List(inner) => collect_type_tokens_from(inner, source, from_byte, kinds, out),
+        SparType::Applied { name, arguments } => {
+            let modifiers = if BUILTIN_GENERICS.contains(&name.as_str()) { MOD_DEFAULT_LIBRARY } else { MOD_NONE };
+            let mut cursor = emit(source, name, kinds.named_type_token(name), modifiers, from_byte, out);
+            for argument in arguments {
+                cursor = collect_type_tokens_from(argument, source, cursor, kinds, out);
+            }
+            cursor
+        }
+        _ => from_byte,
     }
 }
 
@@ -780,6 +815,9 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
             TL::Function(fd) => {
                 let library = if fd.trusted_native { MOD_DEFAULT_LIBRARY } else { MOD_NONE };
                 out.push(raw_from_span(&fd.name_span, TT_FUNCTION, MOD_DECLARATION | library));
+                for type_parameter in &fd.type_parameters {
+                    out.push(raw_from_span(&type_parameter.span, TT_TYPE_PARAMETER, MOD_DECLARATION));
+                }
                 for param in &fd.params {
                     if let Some(tok) = find_ident_token(
                         source,
@@ -800,6 +838,9 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
             }
             TL::Type(td) => {
                 out.push(raw_from_span(&td.name_span, TT_TYPE, MOD_DECLARATION));
+                for type_parameter in &td.type_parameters {
+                    out.push(raw_from_span(&type_parameter.span, TT_TYPE_PARAMETER, MOD_DECLARATION));
+                }
                 collect_type_fields_tokens(&td.fields, source, &kinds, out);
             }
             TL::SchemaSection(sd) => {
@@ -834,6 +875,9 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 }
                 for f in &gd.functions {
                     out.push(raw_from_span(&f.name_span, TT_FUNCTION, MOD_DECLARATION));
+                    for type_parameter in &f.type_parameters {
+                        out.push(raw_from_span(&type_parameter.span, TT_TYPE_PARAMETER, MOD_DECLARATION));
+                    }
                     for param in &f.params {
                         if let Some(tok) = find_ident_token(
                             source,
