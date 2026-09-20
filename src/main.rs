@@ -28,7 +28,7 @@ fn format_document_source(source: &str) -> Option<String> {
     format_source(source).ok()
 }
 
-const FOUNDATION_BUILD_TAG: &str = "intelligence-core-v1";
+const FOUNDATION_BUILD_TAG: &str = "intelligence-core-v2";
 
 fn spar_ls_version() -> String {
     format!(
@@ -564,12 +564,17 @@ fn advertised_server_capabilities() -> ServerCapabilities {
         })),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
-            trigger_characters: Some(vec![":".to_string(), "{".to_string(), ".".to_string()]),
+            trigger_characters: Some(
+                [":", "{", ".", "(", ",", "\"", "/"]
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+            ),
             resolve_provider: Some(true),
             ..Default::default()
         }),
         signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string(), ":".to_string()]),
             retrigger_characters: None,
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
@@ -1297,6 +1302,15 @@ impl LanguageServer for SparLanguageServer {
         }
 
         let context = editor_context(&state.source, state.ast.as_ref(), offset);
+        // Punctuation triggers ("(", ",", quote, "/") only help inside calls and
+        // imports; elsewhere they would pop a full list after every comma.
+        let punctuation_trigger = params.context.as_ref().is_some_and(|ctx| {
+            ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
+                && matches!(ctx.trigger_character.as_deref(), Some("(" | "," | "\"" | "/"))
+        });
+        if punctuation_trigger && matches!(context, EditorContext::Expression) {
+            return Ok(None);
+        }
         match &context {
             EditorContext::Suppressed => return Ok(None),
             EditorContext::ImportPath { prefix, package } => {
@@ -2760,8 +2774,8 @@ mod tests {
     #[test]
     fn build_version_exposes_intelligence_core_identity() {
         let version = spar_ls_version();
-        assert!(version.contains("spar-ls 0.4.0"), "{version}");
-        assert!(version.contains("intelligence-core-v1"), "{version}");
+        assert!(version.contains("spar-ls 0.5.0"), "{version}");
+        assert!(version.contains("intelligence-core-v2"), "{version}");
     }
 
     #[test]

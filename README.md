@@ -18,7 +18,7 @@ Verify the installed build with:
 
 ```bash
 spar-ls --version
-# spar-ls 0.4.0 (intelligence-core-v1)
+# spar-ls 0.5.0 (intelligence-core-v2)
 ```
 
 ## Portable feature matrix
@@ -27,7 +27,7 @@ spar-ls --version
 |---|---|
 | `textDocument/publishDiagnostics` | Compiler lex/parse/resolve/type diagnostics |
 | `textDocument/hover` | Types, functions, fields, imports, callable signatures |
-| `textDocument/completion` | General symbols, members, imports, import paths, named arguments |
+| `textDocument/completion` | Locals and parameters, file-level and imported symbols, members, imports, import paths, named arguments (declared order) and argument values |
 | `completionItem/resolve` | Optional extra symbol detail/documentation when supported by the client |
 | `textDocument/signatureHelp` | Function/task/function-group parameter signatures and active parameter |
 | `textDocument/definition` | Same-file and cross-file definitions |
@@ -51,6 +51,8 @@ import { | } from "./utils.spar";
 import type { | } from "./types.spar";
 import pkg { | } from "std/fs";
 ```
+
+Before `from "..."` is typed, `import pkg { | ` lists the exports of every bundled `std/*` module. Accepting one adds the `from "std/fs"` clause automatically (as an additional edit after the closing `}`, or by completing the whole statement when no `}` exists yet).
 
 Only legal exported symbols are offered. `import type` filters to exported type/enum symbols, and already-selected names are omitted.
 
@@ -145,3 +147,19 @@ The repository also includes regression coverage for minimal/rich client capabil
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Semantic tokens
+
+Standard token types plus these Spar-specific types (append-only legend): `section`, `task`, `taskField`, `functionGroup`, `shellCommand`, `shellBuiltin`, `shellArgument`, `shellFlag`, `shellOperator`, `shellRedirect`, `shellEnvironment`, `shellInterpolation`, and the standard `typeParameter`.
+
+Modifiers: `declaration`, `resolved`, `unresolved`, and `defaultLibrary`. `defaultLibrary` marks everything built in (built-in types, conversion functions, bundled `std` functions, shell builtins); user-declared symbols never carry it, so clients can color built-in and user-defined names differently.
+
+Keywords and types are recovered from the lexer when the file has a syntax error, so highlighting does not disappear while typing.
+
+## Smoke test
+
+`scripts/lsp_smoke.py` drives the server over plain stdio with no editor involved. It opens a valid file, edits it into an incomplete state, and checks completion, named arguments, import discovery and semantic tokens:
+
+```bash
+python3 scripts/lsp_smoke.py ./target/release/spar-ls
+```

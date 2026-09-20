@@ -1061,3 +1061,16 @@ fn export_discovery_skips_names_already_listed_and_non_package_imports() {
         std::path::Path::new("."), false, false, &HashSet::new(), "import { ", 9, None,
     ).is_empty());
 }
+
+#[test]
+fn advertised_capabilities_use_wide_trigger_characters_and_v2_tag() {
+    let caps = advertised_server_capabilities();
+    let triggers = caps.completion_provider.unwrap().trigger_characters.unwrap();
+    for expected in [":", "{", ".", "(", ",", "\"", "/"] {
+        assert!(triggers.contains(&expected.to_string()), "missing trigger {expected:?}");
+    }
+    assert!(!triggers.contains(&" ".to_string()), "space trigger would fire after every space");
+    let signature = caps.signature_help_provider.unwrap();
+    assert!(signature.trigger_characters.unwrap().contains(&":".to_string()));
+    assert_eq!(FOUNDATION_BUILD_TAG, "intelligence-core-v2");
+}
