@@ -150,7 +150,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Semantic tokens
 
-Standard token types plus these Spar-specific types (append-only legend): `section`, `task`, `taskField`, `functionGroup`, `shellCommand`, `shellBuiltin`, `shellArgument`, `shellFlag`, `shellOperator`, `shellRedirect`, `shellEnvironment`, `shellInterpolation`, and the standard `typeParameter`.
+Standard token types plus these Spar-specific types (append-only legend): `section`, `task`, `taskField`, `functionGroup`, `declarationKeyword`, `shellCommand`, `shellBuiltin`, `shellArgument`, `shellFlag`, `shellOperator`, `shellRedirect`, `shellEnvironment`, `shellInterpolation`, and the standard `typeParameter`.
+
+`declarationKeyword` covers declaring words (`var`, `function`, `export`, `import`, `struct`, `type`, `task`); `keyword` covers control flow (`if`, `for`, `return`, `try`).
 
 Modifiers: `declaration`, `resolved`, `unresolved`, and `defaultLibrary`. `defaultLibrary` marks everything built in (built-in types, conversion functions, bundled `std` functions, shell builtins); user-declared symbols never carry it, so clients can color built-in and user-defined names differently.
 

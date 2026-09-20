@@ -826,7 +826,7 @@ fn broken_syntax_still_yields_keyword_tokens() {
     let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
     assert!(state.ast.is_none(), "fixture must fail to parse");
     let tokens = rendered_tokens(source);
-    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_KEYWORD));
+    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_DECLARATION_KEYWORD));
     assert!(tokens.iter().any(|(text, ty, _)| text == "int" && *ty == TT_TYPE));
 }
 
@@ -856,7 +856,7 @@ fn keywords_and_types_inside_strings_and_comments_are_not_tokens() {
         assert_ne!(token.line, 5, "token inside comment: {token:?}");
     }
     let tokens = rendered_tokens(TOKEN_FIXTURE);
-    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_KEYWORD));
+    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_DECLARATION_KEYWORD));
 }
 
 #[test]
@@ -1087,4 +1087,28 @@ fn stdio_flag_may_repeat_because_clients_append_their_own() {
     );
     assert!(startup_mode_from_args(["--stdio", "--bogus"]).is_err());
     assert!(startup_mode_from_args(["--version", "--stdio"]).is_ok());
+}
+
+#[test]
+fn declaration_and_control_keywords_are_different_token_types() {
+    let source = concat!(
+        "export var a: int = 1;\n",
+        "function f() -> int { if a > 0 { return 1; } return 0; };\n",
+        "type Thing { n: int; };\n",
+    );
+    let tokens = rendered_tokens(source);
+    let ty = |word: &str| tokens.iter().find(|(text, _, _)| text == word).map(|(_, ty, _)| *ty);
+    for word in ["export", "var", "function", "type"] {
+        assert_eq!(ty(word), Some(TT_DECLARATION_KEYWORD), "{word} should be a declaration keyword");
+    }
+    for word in ["if", "return"] {
+        assert_eq!(ty(word), Some(TT_KEYWORD), "{word} should be a control keyword");
+    }
+}
+
+#[test]
+fn legend_appends_declaration_keyword() {
+    assert_eq!(TOKEN_TYPES[20], SemanticTokenType::TYPE_PARAMETER);
+    assert_eq!(TOKEN_TYPES[21], SemanticTokenType::new("declarationKeyword"));
+    assert_eq!(TT_DECLARATION_KEYWORD, 21);
 }

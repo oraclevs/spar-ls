@@ -22,6 +22,7 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::new("shellEnvironment"), // 18
     SemanticTokenType::new("shellInterpolation"), // 19
     SemanticTokenType::TYPE_PARAMETER, // 20
+    SemanticTokenType::new("declarationKeyword"), // 21
 ];
 
 const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
@@ -51,6 +52,7 @@ const TT_SHELL_REDIRECT: u32 = 17;
 const TT_SHELL_ENVIRONMENT: u32 = 18;
 const TT_SHELL_INTERPOLATION: u32 = 19;
 const TT_TYPE_PARAMETER: u32 = 20;
+const TT_DECLARATION_KEYWORD: u32 = 21;
 const MOD_NONE: u32 = 0;
 const MOD_DECLARATION: u32 = 1;
 const MOD_RESOLVED: u32 = 1 << 1;
@@ -922,16 +924,18 @@ fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
     for spanned in &tokens {
         let (token_type, modifiers) = match &spanned.token {
             Token::Var | Token::KwMut | Token::Export | Token::Import | Token::As
-            | Token::Dynamic | Token::Private | Token::KwAsync | Token::KwAwait
-            | Token::KwFunction | Token::KwReturn | Token::KwIf | Token::KwElse
-            | Token::KwFor | Token::KwIn | Token::KwBreak | Token::KwContinue
-            | Token::KwTry | Token::KwCatch | Token::KwStruct | Token::KwCommand
-            | Token::KwExec => (TT_KEYWORD, MOD_NONE),
+            | Token::Dynamic | Token::Private | Token::KwAsync | Token::KwFunction
+            | Token::KwStruct => (TT_DECLARATION_KEYWORD, MOD_NONE),
+            Token::KwAwait | Token::KwReturn | Token::KwIf | Token::KwElse | Token::KwFor
+            | Token::KwIn | Token::KwBreak | Token::KwContinue | Token::KwTry
+            | Token::KwCatch | Token::KwCommand | Token::KwExec => (TT_KEYWORD, MOD_NONE),
             Token::TypeStr | Token::TypeInt | Token::TypeFloat | Token::TypeBool
             | Token::TypeSection | Token::TypeVoid | Token::TypeShell => {
                 (TT_TYPE, MOD_DEFAULT_LIBRARY)
             }
-            Token::Ident(word) if SOFT_KEYWORDS.contains(&word.as_str()) => (TT_KEYWORD, MOD_NONE),
+            Token::Ident(word) if SOFT_KEYWORDS.contains(&word.as_str()) => {
+                (TT_DECLARATION_KEYWORD, MOD_NONE)
+            }
             Token::Ident(word) if BUILTIN_TYPE_IDENTS.contains(&word.as_str()) => {
                 (TT_TYPE, MOD_DEFAULT_LIBRARY)
             }
