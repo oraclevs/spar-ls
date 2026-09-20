@@ -24,6 +24,75 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+fn format_document_source(source: &str) -> Option<String> {
+    format_source(source).ok()
+}
+
+const FOUNDATION_BUILD_TAG: &str = "intelligence-core-v1";
+
+fn spar_ls_version() -> String {
+    format!(
+        "spar-ls {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        FOUNDATION_BUILD_TAG
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartupMode {
+    Serve,
+    Version,
+    Help,
+    FormatFile(PathBuf),
+}
+
+fn startup_mode_from_args<I, S>(args: I) -> std::result::Result<StartupMode, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    let Some(first) = args.next() else {
+        return Ok(StartupMode::Serve);
+    };
+
+    match first.as_str() {
+        "--stdio" => {
+            if let Some(extra) = args.next() {
+                Err(format!("unexpected argument after --stdio: {extra}"))
+            } else {
+                Ok(StartupMode::Serve)
+            }
+        }
+        "--version" | "-V" => Ok(StartupMode::Version),
+        "--help" | "-h" => Ok(StartupMode::Help),
+        "--format-file" => {
+            let Some(path) = args.next() else {
+                return Err("--format-file requires a path".to_string());
+            };
+            if let Some(extra) = args.next() {
+                return Err(format!("unexpected argument after format path: {extra}"));
+            }
+            Ok(StartupMode::FormatFile(PathBuf::from(path)))
+        }
+        other => Err(format!("unknown argument: {other}")),
+    }
+}
+
+fn format_file_for_probe(path: &std::path::Path) -> std::result::Result<String, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    format_source(&source)
+        .map_err(|error| format!("failed to format {} safely: {error}", path.display()))
+}
+
+fn print_cli_help() {
+    eprintln!(
+        "{}\n\nUSAGE:\n    spar-ls [--stdio]\n    spar-ls --version\n    spar-ls --format-file <path>\n\n--format-file runs the exact safe formatter used by the LSP and writes the formatted source to stdout.",
+        spar_ls_version()
+    );
+}
+
 // ── Type display helper ───────────────────────────────────────────────────────
 
 fn format_spar_type(ty: &SparType) -> String {
@@ -129,231 +198,172 @@ fn resolve_field_type_display(symbols: &SymbolTable, path: &[String], field_name
 
 // ── Text utilities ────────────────────────────────────────────────────────────
 
+/// True when `pos` names a line that exists in `source` and a column that
+/// does not run past that line's end (in UTF-16 code units, as LSP counts).
+fn position_is_within_document(source: &str, pos: Position) -> bool {
+    source
+        .split('\n')
+        .nth(pos.line as usize)
+        .is_some_and(|line| pos.character as usize <= line.encode_utf16().count())
+}
+
 /// Return the identifier (alphanumeric + `_`) at a zero-indexed LSP Position.
 pub fn word_at_position(source: &str, pos: Position) -> String {
-    let lines: Vec<&str> = source.lines().collect();
-    let line_idx = pos.line as usize;
-    let char_idx = pos.character as usize;
-
-    if line_idx >= lines.len() {
+    if !position_is_within_document(source, pos) {
         return String::new();
     }
-    let chars: Vec<char> = lines[line_idx].chars().collect();
-    if char_idx >= chars.len() {
-        return String::new();
-    }
+    let offset = lsp_pos_to_byte_offset(source, pos).min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let line_end = source[offset..]
+        .find('\n')
+        .map(|relative| offset + relative)
+        .unwrap_or(source.len());
+    let line = &source[line_start..line_end];
+    let relative = offset.saturating_sub(line_start).min(line.len());
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
 
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-
-    if !is_ident(chars[char_idx]) {
-        return String::new();
-    }
-
-    let start = {
-        let mut i = char_idx;
-        while i > 0 && is_ident(chars[i - 1]) {
-            i -= 1;
-        }
-        i
+    let mut char_offsets = line.char_indices().map(|(i, _)| i).collect::<Vec<_>>();
+    char_offsets.push(line.len());
+    let mut index = match char_offsets.binary_search(&relative) {
+        Ok(i) => i.min(char_offsets.len().saturating_sub(2)),
+        Err(i) => i.saturating_sub(1).min(char_offsets.len().saturating_sub(2)),
     };
-    let end = {
-        let mut i = char_idx;
-        while i < chars.len() && is_ident(chars[i]) {
-            i += 1;
+    let chars = line.chars().collect::<Vec<_>>();
+    if chars.is_empty() { return String::new(); }
+    if index >= chars.len() { index = chars.len() - 1; }
+    if !is_ident(chars[index]) {
+        if index > 0 && relative == line.len() && is_ident(chars[index - 1]) {
+            index -= 1;
+        } else {
+            return String::new();
         }
-        i
-    };
-
+    }
+    let mut start = index;
+    while start > 0 && is_ident(chars[start - 1]) { start -= 1; }
+    let mut end = index + 1;
+    while end < chars.len() && is_ident(chars[end]) { end += 1; }
     chars[start..end].iter().collect()
 }
 
 /// Returns the path segments immediately before the word at `pos`, e.g. for
 /// `base::Minor::port` with cursor on `port`, returns `["base", "Minor"]`.
-/// Returns `None` if no `::` prefix exists before the word.
 pub fn path_prefix_before_word(source: &str, pos: Position) -> Option<Vec<String>> {
-    let lines: Vec<&str> = source.lines().collect();
-    let line_idx = pos.line as usize;
-    let char_idx = pos.character as usize;
-    if line_idx >= lines.len() {
-        return None;
-    }
-    let chars: Vec<char> = lines[line_idx].chars().collect();
-    // Skip back over the current word
-    let mut i = char_idx.min(chars.len());
-    while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
-        i -= 1;
-    }
-    // Must be preceded by `::`
-    if i < 2 || chars[i - 1] != ':' || chars[i - 2] != ':' {
-        return None;
-    }
-    // Now parse the path ending at position i-2
-    let prefix: String = chars[..i - 2].iter().collect();
-    let segments: Vec<String> = prefix
+    let offset = lsp_pos_to_byte_offset(source, pos).min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let before = &source[line_start..offset];
+    let chars = before.chars().collect::<Vec<_>>();
+    let mut i = chars.len();
+    while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') { i -= 1; }
+    if i < 2 || chars[i - 1] != ':' || chars[i - 2] != ':' { return None; }
+    let prefix = chars[..i - 2].iter().collect::<String>();
+    let segments = prefix
         .split("::")
-        .map(|part| {
-            part.chars()
-                .rev()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.is_empty() {
-        None
-    } else {
-        Some(segments)
-    }
+        .map(|part| part.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().chars().rev().collect::<String>())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    (!segments.is_empty()).then_some(segments)
 }
 
-/// Returns true when `pos` falls inside a block comment (supports nesting: /* /* */ */).
-/// Handles strings and line comments so their `/*` sequences are not counted.
+/// Returns true when `pos` falls inside a nested block comment.
 pub fn is_cursor_in_block_comment(source: &str, pos: Position) -> bool {
-    let target_line = pos.line as usize;
-    let target_char = pos.character as usize;
+    let target = lsp_pos_to_byte_offset(source, pos).min(source.len());
     let bytes = source.as_bytes();
-    let mut depth: i32 = 0;
+    let mut depth = 0usize;
     let mut i = 0usize;
-    let mut cur_line = 0usize;
-    let mut cur_col = 0usize;
-
-    macro_rules! past_cursor {
-        () => {
-            cur_line > target_line || (cur_line == target_line && cur_col >= target_char)
-        };
-    }
-    macro_rules! advance_char {
-        ($b:expr) => {
-            if $b == b'\n' {
-                cur_line += 1;
-                cur_col = 0;
-            } else {
-                cur_col += 1;
-            }
+    let mut in_string = false;
+    let mut in_line = false;
+    let mut escaped = false;
+    while i < target {
+        let byte = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        if in_line {
+            if byte == b'\n' { in_line = false; }
             i += 1;
-        };
-    }
-
-    while i < bytes.len() && !past_cursor!() {
-        // Skip string literals when not inside a block comment.
-        if depth == 0 && bytes[i] == b'"' {
-            cur_col += 1;
+            continue;
+        }
+        if depth > 0 {
+            if byte == b'/' && next == Some(b'*') { depth += 1; i += 2; continue; }
+            if byte == b'*' && next == Some(b'/') { depth = depth.saturating_sub(1); i += 2; continue; }
             i += 1;
-            while i < bytes.len() && !past_cursor!() && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    advance_char!(bytes[i]);
-                }
-                if i < bytes.len() && !past_cursor!() {
-                    advance_char!(bytes[i]);
-                }
-            }
-            if i < bytes.len() && !past_cursor!() {
-                cur_col += 1;
-                i += 1;
-            }
             continue;
         }
-        // Skip line comments when not inside a block comment.
-        if depth == 0 && i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            while i < bytes.len() && !past_cursor!() && bytes[i] != b'\n' {
-                cur_col += 1;
-                i += 1;
-            }
+        if in_string {
+            if escaped { escaped = false; }
+            else if byte == b'\\' { escaped = true; }
+            else if byte == b'"' { in_string = false; }
+            i += 1;
             continue;
         }
-        // Block comment open.
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            depth += 1;
-            cur_col += 2;
-            i += 2;
-            continue;
-        }
-        // Block comment close.
-        if depth > 0 && i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-            depth -= 1;
-            cur_col += 2;
-            i += 2;
-            continue;
-        }
-        advance_char!(bytes[i]);
+        if byte == b'/' && next == Some(b'/') { in_line = true; i += 2; continue; }
+        if byte == b'/' && next == Some(b'*') { depth = 1; i += 2; continue; }
+        if byte == b'"' { in_string = true; }
+        i += 1;
     }
-
     depth > 0
 }
 
-/// If the text before `pos` ends with `seg1::seg2::` (one or more segments followed by `::`)
-/// return those segments. For example, `"foo::bar::"` → `Some(vec!["foo", "bar"])`.
-/// Returns `None` when text before cursor does not end with `::`.
+/// If the text before `pos` ends with `seg1::seg2::`, return those segments.
 pub fn path_before_cursor(source: &str, pos: Position) -> Option<Vec<String>> {
-    let lines: Vec<&str> = source.lines().collect();
-    let line_idx = pos.line as usize;
-    let char_idx = pos.character as usize;
-
-    if line_idx >= lines.len() {
+    if !position_is_within_document(source, pos) {
         return None;
     }
-    let line = lines[line_idx];
-    let text_before = &line[..char_idx.min(line.len())];
-
-    if !text_before.ends_with("::") {
-        return None;
-    }
-
+    let offset = lsp_pos_to_byte_offset(source, pos).min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let text_before = &source[line_start..offset];
+    if !text_before.ends_with("::") { return None; }
     let without_suffix = &text_before[..text_before.len() - 2];
-    let segments: Vec<String> = without_suffix
+    let segments = without_suffix
         .split("::")
-        .map(|part| {
-            part.chars()
-                .rev()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if segments.is_empty() {
-        None
-    } else {
-        Some(segments)
-    }
+        .map(|part| part.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().chars().rev().collect::<String>())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    (!segments.is_empty()).then_some(segments)
 }
 
-/// Returns `true` if the cursor is immediately after a bare `:` — a type annotation position.
+/// Returns `true` if the cursor is immediately after a bare `:` type annotation.
 pub fn is_in_type_position(source: &str, pos: Position) -> bool {
-    let lines: Vec<&str> = source.lines().collect();
-    let line_idx = pos.line as usize;
-    let char_idx = pos.character as usize;
-
-    if line_idx >= lines.len() {
+    if !position_is_within_document(source, pos) {
         return false;
     }
-    let line = lines[line_idx];
-    let text_before = &line[..char_idx.min(line.len())];
-    let trimmed = text_before.trim_end();
-
+    let offset = lsp_pos_to_byte_offset(source, pos).min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let trimmed = source[line_start..offset].trim_end();
     trimmed.ends_with(':') && !trimmed.ends_with("::")
 }
 
 /// Convert a zero-indexed LSP Position to a byte offset in `source`.
 pub fn lsp_pos_to_byte_offset(source: &str, pos: Position) -> usize {
-    let mut line = 0u32;
     let mut line_start = 0usize;
-    for (i, ch) in source.char_indices() {
-        if line == pos.line {
-            return line_start + pos.character as usize;
+    let mut current_line = 0u32;
+    for (index, ch) in source.char_indices() {
+        if current_line == pos.line {
+            break;
         }
         if ch == '\n' {
-            line += 1;
-            line_start = i + 1;
+            current_line += 1;
+            line_start = index + ch.len_utf8();
         }
     }
-    line_start + pos.character as usize
+    if current_line != pos.line {
+        return source.len();
+    }
+
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|relative| line_start + relative)
+        .unwrap_or(source.len());
+    let mut utf16 = 0u32;
+    for (relative, ch) in source[line_start..line_end].char_indices() {
+        let next = utf16 + ch.len_utf16() as u32;
+        if next > pos.character {
+            return line_start + relative;
+        }
+        utf16 = next;
+        if utf16 == pos.character {
+            return line_start + relative + ch.len_utf8();
+        }
+    }
+    line_end
 }
 
 include!("hover.rs");
@@ -361,6 +371,15 @@ include!("completion.rs");
 include!("definition.rs");
 include!("references.rs");
 include!("semantic_tokens.rs");
+include!("client_capabilities.rs");
+include!("workspace_index.rs");
+include!("cursor_context.rs");
+include!("import_intelligence.rs");
+include!("signature_help.rs");
+include!("symbols.rs");
+include!("rename.rs");
+include!("code_actions.rs");
+include!("shell_semantic.rs");
 // ── Import hover / completion helpers ────────────────────────────────────────
 
 fn format_import_hover(alias: &str, sym: &SymbolTable) -> String {
@@ -520,14 +539,70 @@ fn extract_imported_paths(state: &DocumentState) -> Vec<PathBuf> {
 }
 
 include!("backend.rs");
+fn advertised_server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::FULL),
+                save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                    include_text: Some(false),
+                })),
+                ..Default::default()
+            },
+        )),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![":".to_string(), "{".to_string(), ".".to_string()]),
+            resolve_provider: Some(true),
+            ..Default::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensOptions(
+                SemanticTokensOptions {
+                    legend: SemanticTokensLegend {
+                        token_types: TOKEN_TYPES.to_vec(),
+                        token_modifiers: TOKEN_MODIFIERS.to_vec(),
+                    },
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    range: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        ..Default::default()
+    }
+}
+
 // ── LanguageServer implementation ─────────────────────────────────────────────
 
 #[tower_lsp::async_trait]
 impl LanguageServer for SparLanguageServer {
+    #[allow(deprecated)]
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Normalize optional client features from standard LSP capabilities only.
+        *self.client_features.lock().await = ClientFeatureSupport::from_initialize(&params);
+
         // Store workspace root for later file scan.
         let root = params
             .root_uri
+            .clone()
             .and_then(|u| u.to_file_path().ok())
             .or_else(|| {
                 params
@@ -539,72 +614,54 @@ impl LanguageServer for SparLanguageServer {
         *self.workspace_root.lock().await = root;
 
         Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(false),
-                        })),
-                        ..Default::default()
-                    },
-                )),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
-                references_provider: Some(OneOf::Left(true)),
-                completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![
-                        ":".to_string(),
-                        "{".to_string(),
-                        ".".to_string(),
-                    ]),
-                    resolve_provider: Some(false),
-                    ..Default::default()
-                }),
-                semantic_tokens_provider: Some(
-                    SemanticTokensServerCapabilities::SemanticTokensOptions(
-                        SemanticTokensOptions {
-                            legend: SemanticTokensLegend {
-                                token_types: TOKEN_TYPES.to_vec(),
-                                token_modifiers: TOKEN_MODIFIERS.to_vec(),
-                            },
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
-                            range: Some(false),
-                            ..Default::default()
-                        },
-                    ),
-                ),
-                document_formatting_provider: Some(OneOf::Left(true)),
-                ..Default::default()
-            },
+            capabilities: advertised_server_capabilities(),
             server_info: Some(ServerInfo {
                 name: "spar-ls".to_string(),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                version: Some(format!(
+                    "{} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    FOUNDATION_BUILD_TAG
+                )),
             }),
         })
     }
 
     async fn initialized(&self, _params: InitializedParams) {
         self.client
-            .log_message(MessageType::INFO, "spar-ls initialized")
+            .log_message(
+                MessageType::INFO,
+                format!("{} initialized", spar_ls_version()),
+            )
             .await;
 
-        // Register watcher for external file changes.
-        let registration = Registration {
-            id: "spar-file-watcher".to_string(),
-            method: "workspace/didChangeWatchedFiles".to_string(),
-            register_options: Some(
-                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                    watchers: vec![FileSystemWatcher {
-                        glob_pattern: GlobPattern::String("**/*.spar".to_string()),
-                        kind: None,
-                    }],
-                })
-                .unwrap(),
-            ),
-        };
-        let _ = self.client.register_capability(vec![registration]).await;
+        // Register a watcher only when the client advertises the standard
+        // dynamic-registration capability. Minimal LSP clients must not be
+        // sent an unsupported client/registerCapability request.
+        if self
+            .client_features
+            .lock()
+            .await
+            .watched_files_dynamic_registration
+        {
+            let registration = Registration {
+                id: "spar-file-watcher".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                        watchers: vec![FileSystemWatcher {
+                            glob_pattern: GlobPattern::String("**/*.spar".to_string()),
+                            kind: None,
+                        }],
+                    })
+                    .unwrap(),
+                ),
+            };
+            let _ = self.client.register_capability(vec![registration]).await;
+        }
+
+        // Seed standard-library exports for import completion/auto-import, then
+        // scan the user workspace. This is compiler analysis only: no code runs.
+        self.index_bundled_stdlib().await;
 
         // Scan workspace and push diagnostics for all .spar files.
         let root = self.workspace_root.lock().await.clone();
@@ -627,7 +684,7 @@ impl LanguageServer for SparLanguageServer {
             .map(|path| Self::analyze_path(&src, &path))
             .unwrap_or_else(|| Self::analyze(&src, &base));
         // Update reverse import map.
-        if let Some(program) = &state.ast {
+        if state.ast.is_some() {
             if let Ok(file_path) = uri.to_file_path() {
                 if let Ok(canon) = file_path.canonicalize() {
                     let imports = extract_imported_paths(&state);
@@ -656,6 +713,7 @@ impl LanguageServer for SparLanguageServer {
             state.last_good_import_symbols = state.import_symbols.clone();
         }
         let diags = state.diagnostics();
+        self.index_document(&uri, &state).await;
         self.documents.lock().await.insert(uri.clone(), state);
         self.publish_diagnostics(uri, diags).await;
     }
@@ -700,7 +758,7 @@ impl LanguageServer for SparLanguageServer {
 
             // Update importers map and propagate diagnostics to files that import this one.
             // Only when AST is valid — avoids thrashing importers with every broken keystroke.
-            if let Some(program) = &state.ast {
+            if state.ast.is_some() {
                 if let Some(canon) = uri.to_file_path().ok().and_then(|p| p.canonicalize().ok()) {
                     let imports = extract_imported_paths(&state);
                     self.update_importers(&canon, &imports).await;
@@ -711,6 +769,7 @@ impl LanguageServer for SparLanguageServer {
             }
 
             let diags = state.diagnostics();
+            self.index_document(&uri, &state).await;
             self.documents.lock().await.insert(uri.clone(), state);
             self.publish_diagnostics(uri, diags).await;
         }
@@ -719,6 +778,21 @@ impl LanguageServer for SparLanguageServer {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.lock().await.remove(&uri);
+
+        // The workspace index must stop reflecting unsaved editor contents as
+        // soon as the document closes. Restore the on-disk declaration set if
+        // the file still exists; otherwise remove the module entirely.
+        let disk_state = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(&path).ok().map(|source| (path, source)))
+            .map(|(path, source)| Self::analyze_path(&source, &path));
+        if let Some(state) = disk_state {
+            self.index_document(&uri, &state).await;
+        } else {
+            self.remove_indexed_document(&uri).await;
+        }
+
         self.client.publish_diagnostics(uri, vec![], None).await;
     }
 
@@ -769,7 +843,7 @@ impl LanguageServer for SparLanguageServer {
         }
 
         // Update importers map and re-diagnose direct importers of this file.
-        if let Some(program) = &state.ast {
+        if state.ast.is_some() {
             if let Some(canon) = uri.to_file_path().ok().and_then(|p| p.canonicalize().ok()) {
                 let imports = extract_imported_paths(&state);
                 self.update_importers(&canon, &imports).await;
@@ -781,6 +855,7 @@ impl LanguageServer for SparLanguageServer {
 
         // Publish diagnostics for the saved file itself.
         let diags = state.diagnostics();
+        self.index_document(&uri, &state).await;
         self.documents.lock().await.insert(uri.clone(), state);
         self.publish_diagnostics(uri, diags).await;
     }
@@ -802,6 +877,7 @@ impl LanguageServer for SparLanguageServer {
                     self.importers.lock().await.remove(&path);
                 }
                 self.documents.lock().await.remove(&uri);
+                self.remove_indexed_document(&uri).await;
                 self.client.publish_diagnostics(uri, vec![], None).await;
             }
         }
@@ -1219,6 +1295,41 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
+        let context = editor_context(&state.source, state.ast.as_ref(), offset);
+        match &context {
+            EditorContext::Suppressed => return Ok(None),
+            EditorContext::ImportPath { prefix, package } => {
+                let base = base_dir_from_uri(&uri);
+                let items = import_path_completion_items(&base, prefix, *package);
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+            EditorContext::SelectiveImport { type_only, package, path: Some(path), already } => {
+                let base = base_dir_from_uri(&uri);
+                if let Some(items) = selective_import_completion_items(
+                    &base,
+                    path,
+                    *package,
+                    *type_only,
+                    already,
+                ) {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+            EditorContext::CallArguments { .. } => {
+                let index = self.workspace_index.lock().await;
+                if let Some(items) = named_argument_completion_items(
+                    state,
+                    &index,
+                    &uri,
+                    &state.source,
+                    offset,
+                ) {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+            _ => {}
+        }
+
         let symbols = match state.effective_symbols() {
             Some(s) => s,
             None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
@@ -1281,7 +1392,8 @@ impl LanguageServer for SparLanguageServer {
         // Case 3: default — keywords + builtins + user functions + globals + sections + imports
         let mut items = keyword_items();
         items.extend(builtin_items());
-        items.extend(function_completion_items(&symbols.functions));
+        let snippets = self.client_features.lock().await.completion_snippets;
+        items.extend(function_completion_items(&symbols.functions, snippets));
 
         for (name, entry) in &symbols.globals {
             let detail = match entry {
@@ -1315,6 +1427,138 @@ impl LanguageServer for SparLanguageServer {
         }
 
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
+        let features = self.client_features.lock().await.clone();
+        let index = self.workspace_index.lock().await;
+        Ok(enrich_completion_from_index(
+            item,
+            &index,
+            features.completion_resolve_detail,
+            features.completion_resolve_documentation,
+        ))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        let index = self.workspace_index.lock().await;
+        Ok(signature_help_at(state, &index, &uri, &state.source, offset))
+    }
+
+    async fn document_symbol(&self, params: DocumentSymbolParams) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let docs = self.documents.lock().await;
+        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let hierarchical = self.client_features.lock().await.hierarchical_document_symbols;
+        Ok(Some(document_symbol_response(&uri, state, hierarchical)))
+    }
+
+    async fn symbol(&self, params: WorkspaceSymbolParams) -> Result<Option<Vec<SymbolInformation>>> {
+        let index = self.workspace_index.lock().await;
+        Ok(Some(workspace_symbols(&index, &params.query)))
+    }
+
+    async fn document_highlight(&self, params: DocumentHighlightParams) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let index = self.workspace_index.lock().await;
+        let Some(target) = semantic_target_at(&uri, state, pos, &index) else { return Ok(None); };
+        let highlights = semantic_occurrences_in_document(&uri, state, &target)
+            .into_iter()
+            .map(|occurrence| DocumentHighlight {
+                range: occurrence.range,
+                kind: Some(match occurrence.role {
+                    SemanticOccurrenceRole::Read => DocumentHighlightKind::READ,
+                    SemanticOccurrenceRole::Write | SemanticOccurrenceRole::Declaration => DocumentHighlightKind::WRITE,
+                }),
+            })
+            .collect::<Vec<_>>();
+        Ok((!highlights.is_empty()).then_some(highlights))
+    }
+
+    async fn prepare_rename(&self, params: TextDocumentPositionParams) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let pos = params.position;
+        let docs = self.documents.lock().await;
+        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let index = self.workspace_index.lock().await;
+        let root = self.workspace_root.lock().await.clone();
+        Ok(prepare_rename_at(&uri, state, pos, &index, root.as_deref()))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let new_name = params.new_name;
+        let docs = self.documents.lock().await;
+        let index = self.workspace_index.lock().await;
+        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let Some(target) = semantic_target_at(&uri, state, pos, &index) else { return Ok(None); };
+        let indexed = index.find_by_id(&target.id.0);
+        if !is_valid_rename(indexed, &new_name) { return Ok(None); }
+        let root = self.workspace_root.lock().await.clone();
+        if !declaration_is_editable(&target, root.as_deref()) { return Ok(None); }
+
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        let candidate_uris = if target.local_decl_byte.is_some() {
+            vec![uri.clone()]
+        } else {
+            let mut uris = index.modules.keys().cloned().collect::<Vec<_>>();
+            if !uris.contains(&uri) { uris.push(uri.clone()); }
+            uris
+        };
+        for candidate_uri in candidate_uris {
+            if let Some(open_state) = docs.get(&candidate_uri) {
+                let occurrences = semantic_occurrences_in_document(&candidate_uri, open_state, &target);
+                if !occurrences.is_empty() {
+                    changes.insert(candidate_uri.clone(), occurrences.into_iter().map(|occurrence| TextEdit {
+                        range: occurrence.range,
+                        new_text: new_name.clone(),
+                    }).collect());
+                }
+                continue;
+            }
+            let Ok(path) = candidate_uri.to_file_path() else { continue; };
+            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
+            let disk_state = SparLanguageServer::analyze_path(&source, &path);
+            let occurrences = semantic_occurrences_in_document(&candidate_uri, &disk_state, &target);
+            if !occurrences.is_empty() {
+                changes.insert(candidate_uri.clone(), occurrences.into_iter().map(|occurrence| TextEdit {
+                    range: occurrence.range,
+                    new_text: new_name.clone(),
+                }).collect());
+            }
+        }
+        for edits in changes.values_mut() {
+            edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+        }
+        Ok((!changes.is_empty()).then_some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let docs = self.documents.lock().await;
+        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let index = self.workspace_index.lock().await;
+        let actions = code_actions_for_unresolved(
+            state,
+            &index,
+            &uri,
+            params.range,
+            &params.context.diagnostics,
+        );
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn goto_definition(
@@ -1395,14 +1639,12 @@ impl LanguageServer for SparLanguageServer {
             Some(s) => s,
             None => return Ok(None),
         };
-        let program = match &state.ast {
-            Some(p) => p,
-            None => return Ok(None), // parse failed — fail soft, not as LSP error
-        };
+        if state.ast.is_none() {
+            return Ok(None); // parse failed — fail soft, not as LSP error
+        }
 
-        let formatted = match format_source(&state.source) {
-            Ok(s) => s,
-            Err(_) => format_program(program, &FormatConfig::default()),
+        let Some(formatted) = format_document_source(&state.source) else {
+            return Ok(None);
         };
 
         // Compute end-of-document position covering the full source including any trailing newline.
@@ -1443,6 +1685,37 @@ impl LanguageServer for SparLanguageServer {
 
 #[tokio::main]
 async fn main() {
+    let mode = match startup_mode_from_args(std::env::args().skip(1)) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("spar-ls: {message}");
+            print_cli_help();
+            std::process::exit(2);
+        }
+    };
+
+    match mode {
+        StartupMode::Version => {
+            println!("{}", spar_ls_version());
+            return;
+        }
+        StartupMode::Help => {
+            print_cli_help();
+            return;
+        }
+        StartupMode::FormatFile(path) => {
+            match format_file_for_probe(&path) {
+                Ok(formatted) => print!("{formatted}"),
+                Err(message) => {
+                    eprintln!("spar-ls: {message}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        StartupMode::Serve => {}
+    }
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -1451,12 +1724,17 @@ async fn main() {
         documents: Mutex::new(HashMap::new()),
         importers: Mutex::new(HashMap::new()),
         workspace_root: Mutex::new(None),
+        workspace_index: Mutex::new(WorkspaceIndex::default()),
+        client_features: Mutex::new(ClientFeatureSupport::default()),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod intelligence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2480,6 +2758,44 @@ mod tests {
     // ── formatting helpers ────────────────────────────────────────────────────
 
     #[test]
+    fn build_version_exposes_intelligence_core_identity() {
+        let version = spar_ls_version();
+        assert!(version.contains("spar-ls 0.4.0"), "{version}");
+        assert!(version.contains("intelligence-core-v1"), "{version}");
+    }
+
+    #[test]
+    fn cli_mode_accepts_stdio_for_editor_clients() {
+        assert_eq!(
+            startup_mode_from_args(["--stdio"]).unwrap(),
+            StartupMode::Serve
+        );
+    }
+
+    #[test]
+    fn cli_mode_exposes_formatter_probe() {
+        assert_eq!(
+            startup_mode_from_args(["--format-file", "/tmp/config.spar"]).unwrap(),
+            StartupMode::FormatFile(PathBuf::from("/tmp/config.spar"))
+        );
+    }
+
+    #[test]
+    fn formatter_probe_and_lsp_use_same_safe_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.spar");
+        let source = "struct Config { prompt: section = { enabled: true; path: { enabled: true; maxWidth: 512; }; }; };";
+        std::fs::write(&path, source).unwrap();
+
+        let from_probe = format_file_for_probe(&path).unwrap();
+        let from_lsp = format_document_source(source).unwrap();
+
+        assert_eq!(from_probe, from_lsp);
+        assert!(from_probe.contains("prompt: section = {\n"), "{from_probe}");
+        assert!(from_probe.contains("path: {\n"), "{from_probe}");
+    }
+
+    #[test]
     fn formatting_returns_none_for_unparseable_source() {
         let src = "this is not valid spar {{{";
         // Simulate what formatting() does internally: try parse, expect None on failure.
@@ -2489,6 +2805,58 @@ mod tests {
             .and_then(|t| spar::parser::Parser::new(t).parse().ok())
             .is_some();
         assert!(!parse_ok, "unparseable source must not produce a program");
+    }
+
+
+    #[test]
+    fn lsp_formatter_preserves_nested_boolean_values() {
+        let source = "var config: section = { python: { enabled: true; }; kids: true; };";
+
+        let formatted = format_document_source(source).expect("safe LSP formatting");
+
+        assert!(formatted.contains("python: { enabled: true; };"), "{formatted}");
+        assert!(formatted.contains("kids: true;"), "{formatted}");
+    }
+
+    #[test]
+    fn lsp_formatter_preserves_shell_environment_prefixes() {
+        let source = concat!(
+            "function main() -> shell {\n",
+            "    return shell {\n",
+            "        RUST_LOG=debug cargo check;\n",
+            "    };\n",
+            "};\n",
+        );
+
+        let formatted = format_document_source(source).expect("safe LSP formatting");
+
+        assert!(formatted.contains("RUST_LOG=debug cargo check;"), "{formatted}");
+    }
+
+    #[test]
+    fn lsp_formatter_uses_readable_config_layout() {
+        let source = concat!(
+            "import { greet, build, showFile, rsBinInstall, zipOccLang } from \"functions.spar\";\n",
+            "struct Config {\n",
+            "    aliases: List<Alias> = [{ name: \"gs\"; command: [\"git\", \"status\"]; }];\n",
+            "    prompt: Prompt = { enabled: true; path: { enabled: true; parentLength: 64; maxLastLength: 96; maxWidth: 512; }; git: { enabled: true; showBranch: true; showStaged: true; }; };\n",
+            "};\n",
+        );
+
+        let formatted = format_document_source(source).expect("safe LSP formatting");
+
+        assert!(formatted.contains("import {\n    greet,"), "{formatted}");
+        assert!(
+            formatted.contains("aliases: List<Alias> = [\n        {\n"),
+            "{formatted}"
+        );
+        assert!(formatted.contains("path: {\n"), "{formatted}");
+        assert_eq!(format_document_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn lsp_formatter_returns_none_when_safe_formatter_rejects_source() {
+        assert!(format_document_source("this is not valid spar {{{").is_none());
     }
 
     #[test]
@@ -2526,14 +2894,11 @@ mod tests {
     #[test]
     fn formatting_produces_expected_text_edit() {
         let messy = "var   x:int=1;";
-        let tokens = spar::lexer::Lexer::new(messy).tokenize().unwrap();
-        let program = spar::parser::Parser::new(tokens).parse().unwrap();
-        let formatted =
-            spar::formatter::format_program(&program, &spar::formatter::FormatConfig::default());
-        // format_program always appends a trailing '\n'
+        let formatted = format_document_source(messy).expect("safe LSP formatting");
+
         assert_eq!(
             formatted, "var x: int = 1;\n",
-            "format_program output must end with exactly one newline"
+            "LSP formatting must use the safe Spar source formatter"
         );
     }
 
@@ -3217,9 +3582,35 @@ mod tests {
     }
 
     #[test]
+    fn config_command_field_and_contextual_shell_names_have_no_diagnostics() {
+        let src = r#"
+type AliasConfig {
+    name: str;
+    command: List<str>;
+};
+type Tool {
+    command: str;
+    exec: str;
+    shell: str;
+};
+var command: str = "run";
+var exec: str = command;
+var shell: str = exec;
+var alias: AliasConfig = { name: "ll"; command: ["eza", "--icons"]; };
+var tool: Tool = { command: command; exec: exec; shell: shell; };
+"#;
+        let state = SparLanguageServer::analyze(src, std::path::Path::new("."));
+        assert!(
+            state.diagnostics().is_empty(),
+            "contextual command/exec/shell names must not be LSP errors: {:?}",
+            state.diagnostics()
+        );
+    }
+
+    #[test]
     fn analyzes_native_shell_with_nested_loops_if_and_command_substitution() {
         let src = r#"function main() -> shell {
-    var files: [str] = ["one", "two"];
+    var files: List<str> = ["one", "two"];
     return shell {
         var mut count: int = 0;
         for outer in files {

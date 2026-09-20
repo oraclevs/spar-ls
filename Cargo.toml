@@ -1,8 +1,8 @@
 [package]
 name        = "spar-ls"
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2021"
-description = "Language server (LSP) for the Spar configuration language"
+description = "Portable language server (LSP) for the Spar scripting language"
 license     = "MIT"
 repository  = "https://github.com/oraclevs/spar-ls"
 keywords    = ["lsp", "language-server", "spar", "configuration"]

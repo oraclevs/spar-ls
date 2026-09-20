@@ -5,6 +5,8 @@ struct SparLanguageServer {
     documents: Mutex<HashMap<Url, DocumentState>>,
     importers: Mutex<HashMap<PathBuf, HashSet<PathBuf>>>,
     workspace_root: Mutex<Option<PathBuf>>,
+    workspace_index: Mutex<WorkspaceIndex>,
+    client_features: Mutex<ClientFeatureSupport>,
 }
 
 impl SparLanguageServer {
@@ -137,6 +139,14 @@ impl SparLanguageServer {
         self.client.publish_diagnostics(uri, diags, None).await;
     }
 
+    async fn index_document(&self, uri: &Url, state: &DocumentState) {
+        self.workspace_index.lock().await.replace_document(uri, state);
+    }
+
+    async fn remove_indexed_document(&self, uri: &Url) {
+        self.workspace_index.lock().await.remove_document(uri);
+    }
+
     /// Re-analyse all direct importers of `canon` and push fresh diagnostics.
     /// Called from both did_save and did_change (when parse succeeds).
     async fn propagate_to_importers(&self, canon: &PathBuf) {
@@ -152,6 +162,7 @@ impl SparLanguageServer {
             let Ok(uri2) = Url::from_file_path(&importer_path) else {
                 continue;
             };
+            self.index_document(&uri2, &state2).await;
             let diags2 = state2.diagnostics();
             self.publish_diagnostics(uri2, diags2).await;
         }
@@ -174,6 +185,54 @@ impl SparLanguageServer {
         }
     }
 
+    async fn index_bundled_stdlib(&self) {
+        for module in spar::bundled_stdlib_module_names() {
+            let Some(path) = spar::resolve_bundled_stdlib_import(&module) else { continue; };
+            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
+            let state = Self::analyze_path(&source, &path);
+            let Ok(uri) = Url::from_file_path(&path) else { continue; };
+            self.index_document(&uri, &state).await;
+        }
+    }
+
+    async fn index_visible_package_modules(&self, project_dir: &std::path::Path) {
+        let lock_path = project_dir.join(spar::package::PACKAGE_LOCK_FILE);
+        let Ok(lockfile) = spar::package::Lockfile::read(&lock_path) else { return; };
+        let store = spar::package::PackageStore::new(spar::package::StorePaths::from_env());
+        let locator = spar::package::ModuleLocator::for_root(lockfile, store);
+        let mut files = HashSet::<PathBuf>::new();
+
+        fn walk_spar(dir: &std::path::Path, out: &mut HashSet<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return; };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_spar(&path, out);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("spar") {
+                    out.insert(path);
+                }
+            }
+        }
+
+        for alias in locator.visible_import_aliases() {
+            let Some(entry) = locator.resolve_import(project_dir, &alias) else { continue; };
+            if let Some(module_root) = entry.parent() {
+                walk_spar(module_root, &mut files);
+            } else {
+                files.insert(entry);
+            }
+        }
+
+        let mut files = files.into_iter().collect::<Vec<_>>();
+        files.sort();
+        for path in files {
+            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
+            let state = Self::analyze_path(&source, &path);
+            let Ok(uri) = Url::from_file_path(&path) else { continue; };
+            self.index_document(&uri, &state).await;
+        }
+    }
+
     async fn scan_workspace(&self, root: &std::path::Path) {
         use std::fs;
         fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
@@ -191,13 +250,33 @@ impl SparLanguageServer {
         }
         let mut files = Vec::new();
         walk(root, &mut files);
+
+        // Index dependency modules declared by every Spar package represented
+        // in this workspace. This is offline and lockfile-only, and lets
+        // auto-import discover dependency exports before the user has manually
+        // imported that package in the current file.
+        let mut project_dirs = files
+            .iter()
+            .filter_map(|path| {
+                path.ancestors()
+                    .take_while(|ancestor| ancestor.starts_with(root))
+                    .find(|ancestor| ancestor.join(spar::package::PACKAGE_MANIFEST_FILE).is_file())
+                    .map(std::path::Path::to_path_buf)
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        project_dirs.sort();
+        for project_dir in project_dirs {
+            self.index_visible_package_modules(&project_dir).await;
+        }
+
         for path in files {
             let Ok(src) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let base = path.parent().unwrap_or(root);
             let state = Self::analyze_path(&src, &path);
-            if let Some(program) = &state.ast {
+            if state.ast.is_some() {
                 if let Ok(canon) = path.canonicalize() {
                     let imports = extract_imported_paths(&state);
                     self.update_importers(&canon, &imports).await;
@@ -206,6 +285,7 @@ impl SparLanguageServer {
             let Ok(uri) = Url::from_file_path(&path) else {
                 continue;
             };
+            self.index_document(&uri, &state).await;
             let diags = state.diagnostics();
             self.publish_diagnostics(uri, diags).await;
         }

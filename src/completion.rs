@@ -393,7 +393,7 @@ fn member_completion_items(
     }
 
     if let Some(group) = symbols.function_groups.get(base) {
-        return Some(function_completion_items(&group.functions));
+        return Some(function_completion_items(&group.functions, false));
     }
 
     let section_path = vec![base.to_string()];
@@ -472,7 +472,7 @@ fn builtin_items() -> Vec<CompletionItem> {
     .collect()
 }
 
-fn function_completion_items(functions: &HashMap<String, FunctionEntry>) -> Vec<CompletionItem> {
+fn function_completion_items(functions: &HashMap<String, FunctionEntry>, snippets: bool) -> Vec<CompletionItem> {
     functions
         .iter()
         .map(|(name, entry)| {
@@ -482,6 +482,22 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>) -> Vec<
                 .map(|(pname, pty)| format!("{}: {}", pname, format_spar_type(pty)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let required = entry
+                .params
+                .iter()
+                .filter(|(param, _)| !entry.default_params.contains(param))
+                .collect::<Vec<_>>();
+            let (insert_text, insert_text_format) = if snippets {
+                let args = required
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (param, _))| format!("{}: ${{{}}}", param, index + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (Some(format!("{}({})", name, args)), Some(InsertTextFormat::SNIPPET))
+            } else {
+                (Some(name.clone()), Some(InsertTextFormat::PLAIN_TEXT))
+            };
             CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::FUNCTION),
@@ -490,8 +506,8 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>) -> Vec<
                     param_list,
                     format_spar_type(&entry.ret)
                 )),
-                insert_text: Some(format!("{}($1)", name)),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                insert_text,
+                insert_text_format,
                 ..Default::default()
             }
         })
@@ -517,7 +533,7 @@ fn enum_or_group_path_completions(symbols: &SymbolTable, name: &str) -> Option<V
         );
     }
     if let Some(group) = symbols.function_groups.get(name) {
-        return Some(function_completion_items(&group.functions));
+        return Some(function_completion_items(&group.functions, false));
     }
     None
 }

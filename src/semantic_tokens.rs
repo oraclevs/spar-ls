@@ -13,10 +13,21 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::KEYWORD,   // 9
     SemanticTokenType::ENUM,      // 10
     SemanticTokenType::new("functionGroup"), // 11
+    SemanticTokenType::new("shellCommand"), // 12
+    SemanticTokenType::new("shellBuiltin"), // 13
+    SemanticTokenType::new("shellArgument"), // 14
+    SemanticTokenType::new("shellFlag"), // 15
+    SemanticTokenType::new("shellOperator"), // 16
+    SemanticTokenType::new("shellRedirect"), // 17
+    SemanticTokenType::new("shellEnvironment"), // 18
+    SemanticTokenType::new("shellInterpolation"), // 19
 ];
 
 const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
     SemanticTokenModifier::DECLARATION, // bit 0 = 1
+    SemanticTokenModifier::new("resolved"), // bit 1 = 2
+    SemanticTokenModifier::new("unresolved"), // bit 2 = 4
+    SemanticTokenModifier::new("defaultLibrary"), // bit 3 = 8
 ];
 
 const TT_VARIABLE: u32 = 0;
@@ -30,8 +41,19 @@ const TT_TASK_FIELD: u32 = 8;
 const TT_KEYWORD: u32 = 9;
 const TT_ENUM: u32 = 10;
 const TT_FUNCTION_GROUP: u32 = 11;
+const TT_SHELL_COMMAND: u32 = 12;
+const TT_SHELL_BUILTIN: u32 = 13;
+const TT_SHELL_ARGUMENT: u32 = 14;
+const TT_SHELL_FLAG: u32 = 15;
+const TT_SHELL_OPERATOR: u32 = 16;
+const TT_SHELL_REDIRECT: u32 = 17;
+const TT_SHELL_ENVIRONMENT: u32 = 18;
+const TT_SHELL_INTERPOLATION: u32 = 19;
 const MOD_NONE: u32 = 0;
 const MOD_DECLARATION: u32 = 1;
+const MOD_RESOLVED: u32 = 1 << 1;
+const MOD_UNRESOLVED: u32 = 1 << 2;
+const MOD_DEFAULT_LIBRARY: u32 = 1 << 3;
 
 struct RawToken {
     line: u32,
@@ -87,11 +109,8 @@ impl SemanticKinds {
 }
 
 fn byte_to_lsp_pos(source: &str, byte_offset: usize) -> (u32, u32) {
-    let off = byte_offset.min(source.len());
-    let before = &source[..off];
-    let line = before.bytes().filter(|&b| b == b'\n').count() as u32;
-    let col = (off - before.rfind('\n').map(|p| p + 1).unwrap_or(0)) as u32;
-    (line, col)
+    let position = byte_offset_to_lsp_position(source, byte_offset);
+    (position.line, position.character)
 }
 
 fn raw_from_span(span: &Span, token_type: u32, modifiers: u32) -> RawToken {
@@ -324,8 +343,11 @@ fn collect_expr_tokens(
             {
                 out.push(token);
             }
+            collect_shell_semantic_tokens(shell, source, kinds, out);
         }
-        Expr::CommandSubstitution(_) => {}
+        Expr::CommandSubstitution(shell) => {
+            collect_shell_semantic_tokens(shell, source, kinds, out);
+        }
         Expr::Literal(_) => {}
     }
 }

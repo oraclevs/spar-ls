@@ -1,145 +1,146 @@
 # spar-ls
 
-**Language server for [Spar](https://github.com/oraclevs/spar) — the typed configuration language.**
+**Portable Language Server Protocol implementation for Spar.**
 
-`spar-ls` implements the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) (LSP) for `.spar` files. A language server is a background process that connects to your editor and provides language-aware features — error reporting, hover documentation, completions — without any editor-specific code in the compiler itself.
+`spar-ls` is the editor-neutral intelligence layer for the Spar language. It speaks standard LSP over stdio and links directly against the `spar` compiler/parser/resolver rather than maintaining a second language implementation.
 
----
+The server is deliberately not tied to VS Code. Thin clients can use the same binary from VS Code, Neovim, Zed, Helix, JetBrains IDEs with an LSP client, or any other editor that implements the relevant Language Server Protocol methods.
 
-## Features
-
-All features below are provided via the LSP and work in any compatible editor.
-
-| Feature | Description |
-|---------|-------------|
-| **Diagnostics** | Errors from every compiler stage (lex, parse, resolve, type-check) appear as squiggles in real time |
-| **Hover** | Hover over any variable, section name, field, or import alias to see its type and resolved value |
-| **Completion** | Context-aware suggestions for section fields, variable names, and symbols from imported files. Triggers on `::` |
-| **Semantic tokens** | Token classification for the entire document — editors use this for richer, more accurate coloring than syntax highlighting alone provides |
-| **Formatting** | Format the current document via your editor's "Format Document" command (runs the same engine as `spar fmt`) |
-| **Cross-file diagnostics** | Errors in imported files are propagated to the file that imports them |
-
----
-
-## Installation
-
-You need the Rust toolchain installed (`rustup.rs`).
+## Launch contract
 
 ```bash
-git clone https://github.com/oraclevs/spar-ls.git
-cd spar-ls
-cargo build --release
+spar-ls --stdio
 ```
 
-Copy the binary to a directory on your PATH:
+Running `spar-ls` with no arguments is equivalent. The server reads LSP messages from stdin and writes LSP messages to stdout.
 
-```bash
-sudo cp target/release/spar-ls /usr/local/bin/
-```
-
-Verify:
+Verify the installed build with:
 
 ```bash
 spar-ls --version
-# spar-ls 0.1.0
+# spar-ls 0.4.0 (intelligence-core-v1)
 ```
 
-> `spar-ls` requires `spar` (the core crate) to be at a compatible version — both are pinned to the same release tag.
+## Portable feature matrix
 
----
+| LSP capability | Spar behavior |
+|---|---|
+| `textDocument/publishDiagnostics` | Compiler lex/parse/resolve/type diagnostics |
+| `textDocument/hover` | Types, functions, fields, imports, callable signatures |
+| `textDocument/completion` | General symbols, members, imports, import paths, named arguments |
+| `completionItem/resolve` | Optional extra symbol detail/documentation when supported by the client |
+| `textDocument/signatureHelp` | Function/task/function-group parameter signatures and active parameter |
+| `textDocument/definition` | Same-file and cross-file definitions |
+| `textDocument/references` | Cross-file references through Spar imports |
+| `textDocument/documentHighlight` | Semantic read/write/declaration highlights without text-wide matching |
+| `textDocument/documentSymbol` | Hierarchical symbols with flat fallback for minimal clients |
+| `workspace/symbol` | Cached project symbol search |
+| `textDocument/prepareRename` + `textDocument/rename` | Semantic local/workspace rename using standard `WorkspaceEdit` |
+| `textDocument/codeAction` | Direct auto-import quick-fix edits for unresolved exported symbols |
+| `textDocument/semanticTokens/full` | Spar tokens plus native-shell command/flag/argument/interpolation classes |
+| `textDocument/formatting` | The same safe formatter used by Spar |
 
-## Editor setup
+Optional client capabilities only improve presentation. Core responses remain usable when a client does not support completion resolve, snippets, or hierarchical symbols.
 
-### VS Code
+## Import IntelliSense
 
-Install the [vscode-spar](https://github.com/oraclevs/vscode-spar) extension. It launches `spar-ls` automatically using the binary on your PATH.
+Inside selective imports, completion resolves the actual target module:
 
-If `spar-ls` is installed to a non-standard location, set the path in VS Code settings:
-
-```json
-{
-  "spar.serverPath": "/path/to/spar-ls"
-}
+```spar
+import { | } from "./utils.spar";
+import type { | } from "./types.spar";
+import pkg { | } from "std/fs";
 ```
 
-### Neovim (nvim-lspconfig)
+Only legal exported symbols are offered. `import type` filters to exported type/enum symbols, and already-selected names are omitted.
+
+Import-path completion covers local `.spar` modules, bundled `std/*` modules, and dependency aliases/submodules available from the current package lockfile. It performs no network access.
+
+## Call IntelliSense
+
+Standard signature help is triggered by `(` and `,`. Named-argument completion offers only parameters not already supplied, with required parameters sorted ahead of defaulted parameters.
+
+Clients advertising standard LSP snippet support may receive required-argument call snippets. Clients without snippet support receive ordinary plain-text completion items.
+
+## Native shell semantics
+
+Native `shell { ... }` expressions expose these custom semantic token types through the standard LSP semantic-token protocol:
+
+- `shellCommand`
+- `shellBuiltin`
+- `shellArgument`
+- `shellFlag`
+- `shellOperator`
+- `shellRedirect`
+- `shellEnvironment`
+- `shellInterpolation`
+
+The server also exposes `resolved`, `unresolved`, and `defaultLibrary` semantic modifiers. External command resolution only checks filesystem executability against the server process `PATH`; **it never executes a command** to provide editor metadata, and an unresolved command is not a compiler diagnostic by default.
+
+Foreign shell blocks such as `shell bash { ... }` are intentionally not classified as Spar native-shell syntax. Editor clients can embed their own Bash grammar for those regions.
+
+The language server reports semantic *meaning*, not RGB colors. Each editor/theme decides how semantic token classes are rendered. A Spar editor extension can map resolved commands to green, flags to an accent color, and so on without changing `spar-ls`.
+
+## Client compatibility
+
+The intelligence core uses standard LSP request/response types and `file://` source locations. Core language features do not require VS Code commands, VS Code URI schemes, or custom JSON-RPC methods.
+
+Expected client targets include:
+
+- VS Code
+- Neovim
+- Zed
+- Helix
+- JetBrains IDEs through an LSP integration
+- other standards-compliant LSP clients
+
+Different editors expose standard LSP features through different UI, so identical protocol support does not imply identical menus or keybindings.
+
+### Neovim example
 
 ```lua
-local lspconfig = require('lspconfig')
-local configs   = require('lspconfig.configs')
-
--- Register spar-ls (not yet in upstream lspconfig)
-if not configs.spar_ls then
-  configs.spar_ls = {
-    default_config = {
-      cmd       = { 'spar-ls' },
-      filetypes = { 'spar' },
-      root_dir  = lspconfig.util.root_pattern('.git', '*.spar'),
-      settings  = {},
-    },
-  }
-end
-
--- Associate .spar files with the 'spar' filetype
 vim.filetype.add({ extension = { spar = 'spar' } })
 
-lspconfig.spar_ls.setup {}
+vim.lsp.start({
+  name = 'spar-ls',
+  cmd = { 'spar-ls', '--stdio' },
+  root_dir = vim.fs.root(0, { 'spar.toml', '.git' }) or vim.fn.getcwd(),
+})
 ```
 
-> Neovim integration has not been formally tested by the project — contributions and bug reports are welcome.
-
-### Helix
-
-Add to your `languages.toml`:
+### Helix example
 
 ```toml
-[[language]]
-name             = "spar"
-scope            = "source.spar"
-file-types       = ["spar"]
-roots            = [".git"]
-comment-token    = "//"
-language-servers = ["spar-ls"]
-
 [language-server.spar-ls]
 command = "spar-ls"
+args = ["--stdio"]
+
+[[language]]
+name = "spar"
+scope = "source.spar"
+file-types = ["spar"]
+language-servers = ["spar-ls"]
+comment-token = "//"
 ```
 
-> Helix integration has not been formally tested by the project — contributions and bug reports are welcome.
+## Architecture
 
-### Any other LSP client
+On document updates, `spar-ls` delegates parsing, resolving and type checking to the `spar` crate, then maintains an editor-query workspace index derived from those compiler results. Unsaved open-document content wins over disk content, while last-known-good semantics are retained during transient syntax errors where possible.
 
-`spar-ls` communicates over **stdio** with no flags required:
+Small read-only compiler APIs expose bundled stdlib/module identity to editor tooling; the server does not reach into private compiler internals or execute packages merely to discover metadata.
 
+## Development verification
+
+From the `spar-ls` repository:
+
+```bash
+cargo fmt --check
+cargo check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 ```
-spar-ls
-```
 
-Point your LSP client at that command for `*.spar` files.
-
----
-
-## How it works
-
-On every document change, `spar-ls` runs the full Spar compiler pipeline:
-
-1. **Lex** — tokenize the source
-2. **Parse** — build the AST
-3. **Load imports** — read and compile every imported file
-4. **Resolve** — build the complete symbol table
-5. **Type-check** — validate types across all files in the import graph
-
-Errors from any stage become LSP `Diagnostic` objects and are pushed to the editor immediately. Hover and completion responses are built from the resolved symbol table.
-
----
-
-## Relationship to spar and vscode-spar
-
-- `spar-ls` links directly against the `spar` crate and shares its parser, resolver, typechecker, and formatter. There is no independent language implementation.
-- [vscode-spar](https://github.com/oraclevs/vscode-spar) is the primary consumer, but `spar-ls` works with any LSP-capable editor.
-- For language documentation — syntax, semantics, CLI — see the [spar](https://github.com/oraclevs/spar) repository.
-
----
+The repository also includes regression coverage for minimal/rich client capability negotiation, UTF-16 LSP positions, editor-neutral payloads, import completion, signatures, symbols, semantic identity, auto-imports, and native-shell semantic token classes.
 
 ## License
 
