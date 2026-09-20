@@ -129,6 +129,10 @@ fn sanitize_raw_tokens(source: &str, raw: Vec<RawToken>) -> Vec<RawToken> {
 /// Blank (with spaces, keeping every byte offset and newline) the statement that
 /// contains byte `at`: from just after the previous `;`, `{` or `}` through the next
 /// `;` (inclusive) or up to the next `}`.
+/// How many broken statements `repair_source` will blank before giving up; a
+/// task-runner file can have one bad line per task.
+const REPAIR_ATTEMPTS: usize = 48;
+
 fn blank_statement_around(text: &str, at: usize) -> String {
     let bytes = text.as_bytes();
     let at = at.min(bytes.len());
@@ -162,33 +166,54 @@ fn blank_statement_around(text: &str, at: usize) -> String {
 /// resulting AST can be used against the original text: one broken statement leaves
 /// the rest of the file fully highlighted.
 fn parse_with_statement_repair(source: &str) -> Option<Program> {
+    let text = repair_source(source)?;
+    let tokens = Lexer::new(&text).tokenize().ok()?;
+    Parser::new(tokens).parse().ok()
+}
+
+/// The text of `source` after blanking, in place, each statement the lexer or
+/// parser rejects, until the rest lexes and parses. `None` when it cannot be
+/// made to parse. Offsets never move.
+pub(crate) fn repair_source(source: &str) -> Option<String> {
     let mut text = source.to_string();
-    for _ in 0..8 {
-        let tokens = match Lexer::new(&text).tokenize() {
-            Ok(tokens) => tokens,
-            Err(SparError::LexError { span, .. }) | Err(SparError::ParseError { span, .. }) => {
-                let repaired = blank_statement_around(&text, span.start);
-                if repaired == text {
-                    return None;
-                }
-                text = repaired;
-                continue;
-            }
+    for _ in 0..REPAIR_ATTEMPTS {
+        let failure = match Lexer::new(&text).tokenize() {
+            Ok(tokens) => match Parser::new(tokens).parse() {
+                Ok(_) => return Some(text),
+                Err(SparError::ParseError { span, .. }) => (false, span.start),
+                Err(SparError::LexError { span, .. }) => (true, span.start),
+                Err(_) => return None,
+            },
+            Err(SparError::LexError { span, .. }) => (true, span.start),
+            Err(SparError::ParseError { span, .. }) => (false, span.start),
             Err(_) => return None,
         };
-        match Parser::new(tokens).parse() {
-            Ok(program) => return Some(program),
-            Err(SparError::ParseError { span, .. }) | Err(SparError::LexError { span, .. }) => {
-                let repaired = blank_statement_around(&text, span.start);
-                if repaired == text {
-                    return None;
-                }
-                text = repaired;
-            }
-            Err(_) => return None,
+        // A lexical error can sit inside a string or a `#{...}` escape, where
+        // statement boundaries (`;`, `{`, `}`) are unreliable: blank the whole
+        // physical line. A parse error blanks the statement around it.
+        let repaired = if failure.0 {
+            blank_line_around(&text, failure.1)
+        } else {
+            blank_statement_around(&text, failure.1)
+        };
+        if repaired == text {
+            return None;
         }
+        text = repaired;
     }
     None
+}
+
+/// Replaces the physical line containing byte offset `at` with spaces.
+fn blank_line_around(text: &str, at: usize) -> String {
+    let at = at.min(text.len());
+    let start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |index| at + index);
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.extend(text[start..end].chars().map(|_| ' '));
+    out.push_str(&text[end..]);
+    out
 }
 
 fn build_semantic_raw_tokens(state: &DocumentState) -> Vec<RawToken> {

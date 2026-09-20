@@ -44,13 +44,25 @@ impl SparLanguageServer {
 
     fn analyze(source: &str, base_dir: &std::path::Path) -> DocumentState {
         let compilation = Compiler::new(Self::compile_options(base_dir)).compile(source);
-        Self::document_state(source, base_dir, compilation)
+        let needs_repair = compilation.symbols.is_none();
+        let mut state = Self::document_state(source, base_dir, compilation);
+        if needs_repair {
+            state.repaired_symbols =
+                Self::repaired_symbols(source, Self::compile_options(base_dir));
+        }
+        state
     }
 
     fn analyze_path(source: &str, path: &std::path::Path) -> DocumentState {
         let base_dir = path.parent().unwrap_or(std::path::Path::new("."));
         let compilation = Compiler::new(Self::compile_options_for_path(path)).compile(source);
-        Self::document_state(source, base_dir, compilation)
+        let needs_repair = compilation.symbols.is_none();
+        let mut state = Self::document_state(source, base_dir, compilation);
+        if needs_repair {
+            state.repaired_symbols =
+                Self::repaired_symbols(source, Self::compile_options_for_path(path));
+        }
+        state
     }
 
     fn document_state(
@@ -132,7 +144,19 @@ impl SparLanguageServer {
             errors: compilation.errors,
             last_good_symbols: None,
             last_good_import_symbols: HashMap::new(),
+            repaired_symbols: None,
         }
+    }
+
+    /// Symbols for a file that does not compile, taken from a copy with the
+    /// offending statements blanked.
+    fn repaired_symbols(source: &str, mut options: CompileOptions) -> Option<SymbolTable> {
+        let repaired = repair_source(source)?;
+        if repaired == source {
+            return None;
+        }
+        options.evaluate = false;
+        Compiler::new(options).compile(&repaired).symbols
     }
 
     async fn publish_diagnostics(&self, uri: Url, diags: Vec<Diagnostic>) {
@@ -155,15 +179,42 @@ impl SparLanguageServer {
             map.get(canon).cloned().unwrap_or_default()
         };
         for importer_path in importers_snapshot {
-            let Ok(src2) = std::fs::read_to_string(&importer_path) else {
-                continue;
-            };
-            let state2 = Self::analyze_path(&src2, &importer_path);
             let Ok(uri2) = Url::from_file_path(&importer_path) else {
                 continue;
             };
+            // An importer that is open in the editor must be analysed from
+            // its buffer, not from disk: diagnostics computed from stale
+            // disk text land on the wrong lines (or vanish) in the buffer.
+            let open_source = self
+                .documents
+                .lock()
+                .await
+                .get(&uri2)
+                .map(|document| document.source.clone());
+            let is_open = open_source.is_some();
+            let src2 = match open_source {
+                Some(source) => source,
+                None => match std::fs::read_to_string(&importer_path) {
+                    Ok(source) => source,
+                    Err(_) => continue,
+                },
+            };
+            let mut state2 = Self::analyze_path(&src2, &importer_path);
             self.index_document(&uri2, &state2).await;
             let diags2 = state2.diagnostics();
+            if is_open {
+                let mut docs = self.documents.lock().await;
+                if let Some(previous) = docs.get(&uri2) {
+                    if state2.symbols.is_some() {
+                        state2.last_good_symbols = state2.symbols.clone();
+                        state2.last_good_import_symbols = state2.import_symbols.clone();
+                    } else {
+                        state2.last_good_symbols = previous.last_good_symbols.clone();
+                        state2.last_good_import_symbols = previous.last_good_import_symbols.clone();
+                    }
+                }
+                docs.insert(uri2.clone(), state2);
+            }
             self.publish_diagnostics(uri2, diags2).await;
         }
     }
@@ -285,6 +336,12 @@ impl SparLanguageServer {
             let Ok(uri) = Url::from_file_path(&path) else {
                 continue;
             };
+            // The startup scan reads disk; an open document already has an
+            // index entry and diagnostics from its live buffer, which must
+            // not be replaced by the on-disk version.
+            if self.documents.lock().await.contains_key(&uri) {
+                continue;
+            }
             self.index_document(&uri, &state).await;
             let diags = state.diagnostics();
             self.publish_diagnostics(uri, diags).await;

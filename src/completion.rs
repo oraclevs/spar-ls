@@ -427,7 +427,16 @@ fn task_completion_items(
         }
         TaskContext::RunBody(shell) => {
             if in_open_interpolation(source, offset) {
-                Some(task_param_items(&scope.params))
+                // A native body's `${expr}` takes any Spar expression (its own
+                // locals, globals, functions): fall through to the general
+                // expression completion, where the task's parameters are
+                // added by `run_interpolation_params`. A raw bash body only
+                // binds the task's parameters.
+                if *shell != spar::ast::RunShell::Bash && symbols.is_some() {
+                    None
+                } else {
+                    Some(task_param_items(&scope.params))
+                }
             } else if *shell == spar::ast::RunShell::Bash {
                 // Raw bash: nothing of ours to offer, and the generic Spar
                 // completions would only be noise.
@@ -436,6 +445,24 @@ fn task_completion_items(
                 None
             }
         }
+    }
+}
+
+/// The enclosing task's parameters, when the cursor is inside an open `${...`
+/// in one of its run bodies.
+fn run_interpolation_params(source: &str, offset: usize) -> Vec<CompletionItem> {
+    use crate::task_context::{task_context, TaskContext};
+    match task_context(source, offset) {
+        Some(scope)
+            if matches!(scope.context, TaskContext::RunBody(shell) if shell != spar::ast::RunShell::Bash)
+                && in_open_interpolation(source, offset) =>
+        {
+            task_param_items(&scope.params)
+                .into_iter()
+                .map(|item| with_tier(item, 0))
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
