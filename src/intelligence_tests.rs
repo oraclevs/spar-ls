@@ -742,3 +742,104 @@ fn completion_resolve_respects_negotiated_properties() {
     assert!(rich.detail.is_some());
     assert!(rich.documentation.is_some());
 }
+
+fn rendered_tokens(source: &str) -> Vec<(String, u32, u32)> {
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
+    let lines: Vec<&str> = source.split('\n').collect();
+    build_semantic_raw_tokens(&state)
+        .iter()
+        .map(|token| {
+            let line = lines[token.line as usize];
+            let text: String = line
+                .chars()
+                .skip(token.start_char as usize)
+                .take(token.length as usize)
+                .collect();
+            (text, token.token_type, token.modifiers)
+        })
+        .collect()
+}
+
+const TOKEN_FIXTURE: &str = concat!(
+    "import pkg { writeText, readText } from \"std/fs\";\n",
+    "function f(a: int) -> int { return a; };\n",
+    "var s: str = readText(path: \"x\");\n",
+    "writeText(path: \"a\", content: s);\n",
+    "var msg: str = \"error and var inside string\";\n",
+    "// comment with function and int\n",
+);
+
+#[test]
+fn semantic_tokens_are_in_bounds_sorted_and_non_overlapping() {
+    let state = SparLanguageServer::analyze(TOKEN_FIXTURE, std::path::Path::new("."));
+    let tokens = build_semantic_raw_tokens(&state);
+    assert!(!tokens.is_empty());
+    let lines: Vec<&str> = TOKEN_FIXTURE.split('\n').collect();
+    let mut previous: Option<&RawToken> = None;
+    for token in &tokens {
+        let line = lines.get(token.line as usize).expect("token line in range");
+        assert!(token.length > 0);
+        assert!((token.start_char + token.length) as usize <= line.chars().count());
+        if let Some(prev) = previous {
+            assert!(
+                (token.line, token.start_char) > (prev.line, prev.start_char),
+                "not strictly sorted: {prev:?} then {token:?}"
+            );
+            if prev.line == token.line {
+                assert!(token.start_char >= prev.start_char + prev.length, "overlap: {prev:?} {token:?}");
+            }
+        }
+        previous = Some(token);
+    }
+}
+
+#[test]
+fn semantic_tokens_text_is_identifier_like_for_non_shell_types() {
+    for (text, token_type, _) in rendered_tokens(TOKEN_FIXTURE) {
+        let shell = matches!(
+            token_type,
+            TT_SHELL_COMMAND | TT_SHELL_BUILTIN | TT_SHELL_ARGUMENT | TT_SHELL_FLAG
+                | TT_SHELL_OPERATOR | TT_SHELL_REDIRECT | TT_SHELL_ENVIRONMENT
+                | TT_SHELL_INTERPOLATION
+        );
+        if !shell {
+            assert!(
+                text.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+                "non-identifier token text {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_names_produce_a_single_token_on_the_import_line() {
+    let tokens = rendered_tokens(TOKEN_FIXTURE);
+    let write_text = tokens.iter().filter(|(text, _, _)| text == "writeText").count();
+    // one on the import line, one at the call site on line 4
+    assert_eq!(write_text, 2);
+}
+
+#[test]
+fn broken_syntax_still_yields_keyword_tokens() {
+    // Missing `;` after the first statement: no AST, but keywords must still color.
+    let source = "var a: int = 1\nvar b: str = \"x\";\n";
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
+    assert!(state.ast.is_none(), "fixture must fail to parse");
+    let tokens = rendered_tokens(source);
+    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_KEYWORD));
+    assert!(tokens.iter().any(|(text, ty, _)| text == "int" && *ty == TT_TYPE));
+}
+
+#[test]
+fn encode_semantic_tokens_produces_lsp_relative_offsets() {
+    let raw = vec![
+        RawToken { line: 0, start_char: 4, length: 3, token_type: TT_KEYWORD, modifiers: 0 },
+        RawToken { line: 0, start_char: 8, length: 2, token_type: TT_TYPE, modifiers: 0 },
+        RawToken { line: 2, start_char: 1, length: 5, token_type: TT_FUNCTION, modifiers: 1 },
+    ];
+    let encoded = encode_semantic_tokens(&raw);
+    assert_eq!(
+        encoded.iter().map(|t| (t.delta_line, t.delta_start)).collect::<Vec<_>>(),
+        vec![(0, 4), (0, 4), (2, 1)]
+    );
+}

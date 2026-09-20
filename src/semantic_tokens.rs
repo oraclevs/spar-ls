@@ -55,12 +55,105 @@ const MOD_RESOLVED: u32 = 1 << 1;
 const MOD_UNRESOLVED: u32 = 1 << 2;
 const MOD_DEFAULT_LIBRARY: u32 = 1 << 3;
 
+#[derive(Debug, Clone, PartialEq)]
 struct RawToken {
     line: u32,
     start_char: u32,
     length: u32,
     token_type: u32,
     modifiers: u32,
+}
+
+fn is_shell_semantic_type(token_type: u32) -> bool {
+    matches!(
+        token_type,
+        TT_SHELL_COMMAND
+            | TT_SHELL_BUILTIN
+            | TT_SHELL_ARGUMENT
+            | TT_SHELL_FLAG
+            | TT_SHELL_OPERATOR
+            | TT_SHELL_REDIRECT
+            | TT_SHELL_ENVIRONMENT
+            | TT_SHELL_INTERPOLATION
+    )
+}
+
+/// Drop tokens that cannot be valid for `source`: zero-length, out of range,
+/// not identifier-like (for non-shell types), or overlapping an earlier token.
+/// Spliced std items keep spans from other files and produce such tokens.
+fn sanitize_raw_tokens(source: &str, raw: Vec<RawToken>) -> Vec<RawToken> {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut valid: Vec<RawToken> = raw
+        .into_iter()
+        .filter(|token| {
+            if token.length == 0 {
+                return false;
+            }
+            let Some(line) = lines.get(token.line as usize) else {
+                return false;
+            };
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let text: String = line
+                .chars()
+                .skip(token.start_char as usize)
+                .take(token.length as usize)
+                .collect();
+            if text.chars().count() != token.length as usize {
+                return false;
+            }
+            if is_shell_semantic_type(token.token_type) {
+                return !text.trim().is_empty();
+            }
+            text.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        })
+        .collect();
+    // Stable sort: earlier-pushed (AST) tokens win over language-word tokens at
+    // the same start; longer tokens win over shorter ones starting together.
+    valid.sort_by_key(|token| (token.line, token.start_char, std::cmp::Reverse(token.length)));
+    let mut out: Vec<RawToken> = Vec::with_capacity(valid.len());
+    for token in valid {
+        if let Some(previous) = out.last() {
+            if previous.line == token.line && token.start_char < previous.start_char + previous.length {
+                continue;
+            }
+        }
+        out.push(token);
+    }
+    out
+}
+
+fn build_semantic_raw_tokens(state: &DocumentState) -> Vec<RawToken> {
+    let mut raw = Vec::new();
+    match &state.ast {
+        Some(program) => collect_tokens_from_program(program, &state.source, &mut raw),
+        // No AST (syntax error mid-typing): keep keywords/types colored from the lexer.
+        None => collect_language_words(&state.source, &mut raw),
+    }
+    sanitize_raw_tokens(&state.source, raw)
+}
+
+fn encode_semantic_tokens(raw: &[RawToken]) -> Vec<SemanticToken> {
+    let mut data = Vec::with_capacity(raw.len());
+    let mut previous_line = 0u32;
+    let mut previous_char = 0u32;
+    for token in raw {
+        let delta_line = token.line - previous_line;
+        let delta_start = if delta_line == 0 {
+            token.start_char - previous_char
+        } else {
+            token.start_char
+        };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.length,
+            token_type: token.token_type,
+            token_modifiers_bitset: token.modifiers,
+        });
+        previous_line = token.line;
+        previous_char = token.start_char;
+    }
+    data
 }
 
 struct SemanticKinds {

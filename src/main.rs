@@ -1592,43 +1592,13 @@ impl LanguageServer for SparLanguageServer {
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
         let docs = self.documents.lock().await;
-        let state = match docs.get(&uri) {
-            Some(s) => s,
-            None => return Ok(None),
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
         };
-        let program = match &state.ast {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        let mut raw: Vec<RawToken> = Vec::new();
-        collect_tokens_from_program(program, &state.source, &mut raw);
-        raw.sort_by_key(|t| (t.line, t.start_char));
-
-        let mut data: Vec<SemanticToken> = Vec::with_capacity(raw.len());
-        let mut prev_line = 0u32;
-        let mut prev_char = 0u32;
-        for tok in &raw {
-            let delta_line = tok.line - prev_line;
-            let delta_char = if delta_line == 0 {
-                tok.start_char - prev_char
-            } else {
-                tok.start_char
-            };
-            data.push(SemanticToken {
-                delta_line,
-                delta_start: delta_char,
-                length: tok.length,
-                token_type: tok.token_type,
-                token_modifiers_bitset: tok.modifiers,
-            });
-            prev_line = tok.line;
-            prev_char = tok.start_char;
-        }
-
+        let raw = build_semantic_raw_tokens(state);
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
-            data,
+            data: encode_semantic_tokens(&raw),
         })))
     }
 
