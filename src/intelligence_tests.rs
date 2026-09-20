@@ -843,3 +843,49 @@ fn encode_semantic_tokens_produces_lsp_relative_offsets() {
         vec![(0, 4), (0, 4), (2, 1)]
     );
 }
+
+#[test]
+fn keywords_and_types_inside_strings_and_comments_are_not_tokens() {
+    let state = SparLanguageServer::analyze(TOKEN_FIXTURE, std::path::Path::new("."));
+    for token in build_semantic_raw_tokens(&state) {
+        // line index 4 is `var msg: str = "error and var inside string";`
+        if token.line == 4 {
+            assert!(token.start_char < 16 || token.start_char >= 40, "token inside string: {token:?}");
+        }
+        // line index 5 is the comment line
+        assert_ne!(token.line, 5, "token inside comment: {token:?}");
+    }
+    let tokens = rendered_tokens(TOKEN_FIXTURE);
+    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_KEYWORD));
+}
+
+#[test]
+fn builtin_types_and_functions_carry_default_library() {
+    let source = concat!(
+        "import pkg { writeText } from \"std/fs\";\n",
+        "function f(a: int) -> int { return a; };\n",
+        "var n: int = int(\"1\");\n",
+        "var m: int = f(a: 2);\n",
+        "writeText(path: \"a\", content: \"b\");\n",
+    );
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
+    let lines: Vec<&str> = source.split('\n').collect();
+    let raw = build_semantic_raw_tokens(&state);
+    let find = |name: &str, line: usize| -> Vec<(u32, u32)> {
+        raw.iter()
+            .filter(|t| t.line as usize == line)
+            .filter(|t| {
+                let text: String = lines[line].chars().skip(t.start_char as usize).take(t.length as usize).collect();
+                text == name
+            })
+            .map(|t| (t.token_type, t.modifiers))
+            .collect()
+    };
+    assert!(find("int", 1).iter().any(|(ty, m)| *ty == TT_TYPE && m & MOD_DEFAULT_LIBRARY != 0),
+        "builtin type must be defaultLibrary: {:?}", find("int", 1));
+    assert!(find("int", 2).iter().any(|(ty, m)| *ty == TT_FUNCTION && m & MOD_DEFAULT_LIBRARY != 0),
+        "int(...) call must be defaultLibrary: {:?}", find("int", 2));
+    assert!(find("f", 3).iter().all(|(_, m)| m & MOD_DEFAULT_LIBRARY == 0), "user fn must not be defaultLibrary");
+    assert!(find("writeText", 4).iter().any(|(ty, m)| *ty == TT_FUNCTION && m & MOD_DEFAULT_LIBRARY != 0),
+        "std fn call must be defaultLibrary: {:?}", find("writeText", 4));
+}

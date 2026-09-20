@@ -159,7 +159,11 @@ fn encode_semantic_tokens(raw: &[RawToken]) -> Vec<SemanticToken> {
 struct SemanticKinds {
     enums: HashSet<String>,
     function_groups: HashSet<String>,
+    /// Built-in and bundled-std function names, colored with `defaultLibrary`.
+    library_functions: HashSet<String>,
 }
+
+const BUILTIN_FUNCTION_NAMES: &[&str] = &["env", "int", "float", "str", "bool", "len", "print", "println", "assert"];
 
 impl SemanticKinds {
     fn from_program(program: &Program) -> Self {
@@ -167,6 +171,7 @@ impl SemanticKinds {
         let mut kinds = Self {
             enums: HashSet::new(),
             function_groups: HashSet::new(),
+            library_functions: BUILTIN_FUNCTION_NAMES.iter().map(|name| name.to_string()).collect(),
         };
         for item in &program.items {
             match item {
@@ -176,10 +181,22 @@ impl SemanticKinds {
                 TopLevelItem::FunctionGroup(decl) => {
                     kinds.function_groups.insert(decl.name.clone());
                 }
+                TopLevelItem::Function(decl) if decl.trusted_native => {
+                    kinds.library_functions.insert(decl.name.clone());
+                }
+                TopLevelItem::Function(decl) => {
+                    // A user function shadowing a builtin name is user code.
+                    kinds.library_functions.remove(&decl.name);
+                }
                 _ => {}
             }
         }
         kinds
+    }
+
+    fn call_modifiers(&self, name: &str) -> u32 {
+        let member = name.rsplit("::").next().unwrap_or(name);
+        if self.library_functions.contains(member) { MOD_DEFAULT_LIBRARY } else { MOD_NONE }
     }
 
     fn named_type_token(&self, name: &str) -> u32 {
@@ -303,7 +320,7 @@ fn collect_expr_tokens(
             args,
             ..
         } => {
-            out.push(raw_from_span(name_span, TT_FUNCTION, MOD_NONE));
+            out.push(raw_from_span(name_span, TT_FUNCTION, kinds.call_modifiers(name)));
             if let Some((qualifier, _)) = name.split_once("::") {
                 if let Some(token_type) = kinds.qualifier_token(qualifier) {
                     if let Some(tok) = find_qualifier_token_before(
@@ -322,7 +339,7 @@ fn collect_expr_tokens(
         }
         Expr::FnCall(fc) => {
             let member = fc.name.rsplit("::").next().unwrap_or(&fc.name);
-            if let Some(tok) = find_ident_token(source, fc.span.start, member, TT_FUNCTION, MOD_NONE) {
+            if let Some(tok) = find_ident_token(source, fc.span.start, member, TT_FUNCTION, kinds.call_modifiers(&fc.name)) {
                 out.push(tok);
             }
             if let Some((qualifier, _)) = fc.name.split_once("::") {
@@ -761,7 +778,8 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
                 collect_section_items_tokens(&sd.items, source, &kinds, out);
             }
             TL::Function(fd) => {
-                out.push(raw_from_span(&fd.name_span, TT_FUNCTION, MOD_DECLARATION));
+                let library = if fd.trusted_native { MOD_DEFAULT_LIBRARY } else { MOD_NONE };
+                out.push(raw_from_span(&fd.name_span, TT_FUNCTION, MOD_DECLARATION | library));
                 for param in &fd.params {
                     if let Some(tok) = find_ident_token(
                         source,
@@ -847,47 +865,42 @@ fn collect_tokens_from_program(program: &Program, source: &str, out: &mut Vec<Ra
 }
 
 fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
-    const KEYWORDS: &[&str] = &[
-        "var", "mut", "export", "import", "pkg", "dynamic", "as", "private", "if", "else", "for",
-        "in", "break", "continue", "return", "function", "async", "await", "task", "type", "struct", "try", "catch", "Schema", "SchemaFrom", "from", "command", "exec",
-    ];
-    const BUILTIN_TYPES: &[&str] = &["int", "float", "str", "bool", "List", "Promise", "error", "section", "void", "shell"];
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
+    use spar::token::Token;
+    // Soft keywords the lexer emits as plain identifiers.
+    const SOFT_KEYWORDS: &[&str] = &["pkg", "from", "task", "type", "Schema", "SchemaFrom", "functionGroup"];
+    // Built-in generic/type identifiers (not keywords in the lexer).
+    const BUILTIN_TYPE_IDENTS: &[&str] = &["List", "Map", "Promise"];
+    // Scanning tokens (not raw text) means words inside strings, comments and
+    // native shell words are never classified as keywords or types.
+    let Ok(tokens) = Lexer::new(source).tokenize() else {
+        return;
+    };
+    for spanned in &tokens {
+        let (token_type, modifiers) = match &spanned.token {
+            Token::Var | Token::KwMut | Token::Export | Token::Import | Token::As
+            | Token::Dynamic | Token::Private | Token::KwAsync | Token::KwAwait
+            | Token::KwFunction | Token::KwReturn | Token::KwIf | Token::KwElse
+            | Token::KwFor | Token::KwIn | Token::KwBreak | Token::KwContinue
+            | Token::KwTry | Token::KwCatch | Token::KwStruct | Token::KwCommand
+            | Token::KwExec => (TT_KEYWORD, MOD_NONE),
+            Token::TypeStr | Token::TypeInt | Token::TypeFloat | Token::TypeBool
+            | Token::TypeSection | Token::TypeVoid | Token::TypeShell => {
+                (TT_TYPE, MOD_DEFAULT_LIBRARY)
             }
-            let word = &source[start..i];
-            let token_type = if KEYWORDS.contains(&word) {
-                Some(TT_KEYWORD)
-            } else if BUILTIN_TYPES.contains(&word) {
-                Some(TT_TYPE)
-            } else {
-                None
-            };
-            if let Some(token_type) = token_type {
-                let (line, col) = byte_to_lsp_pos(source, start);
-                if out.iter().any(|token| {
-                    token.line == line
-                        && token.start_char == col
-                        && token.length == word.len() as u32
-                }) {
-                    continue;
-                }
-                out.push(RawToken {
-                    line,
-                    start_char: col,
-                    length: word.len() as u32,
-                    token_type,
-                    modifiers: MOD_NONE,
-                });
+            Token::Ident(word) if SOFT_KEYWORDS.contains(&word.as_str()) => (TT_KEYWORD, MOD_NONE),
+            Token::Ident(word) if BUILTIN_TYPE_IDENTS.contains(&word.as_str()) => {
+                (TT_TYPE, MOD_DEFAULT_LIBRARY)
             }
-        } else {
-            i += 1;
+            _ => continue,
+        };
+        if let Some(token) = raw_token_from_bytes(
+            source,
+            spanned.span.start,
+            spanned.span.end,
+            token_type,
+            modifiers,
+        ) {
+            out.push(token);
         }
     }
 }
