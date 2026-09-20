@@ -1074,3 +1074,17 @@ fn advertised_capabilities_use_wide_trigger_characters_and_v2_tag() {
     assert!(signature.trigger_characters.unwrap().contains(&":".to_string()));
     assert_eq!(FOUNDATION_BUILD_TAG, "intelligence-core-v2");
 }
+
+#[test]
+fn stdio_flag_may_repeat_because_clients_append_their_own() {
+    // vscode-languageclient appends `--stdio` for TransportKind.stdio even when
+    // the launch args already contain it.
+    assert_eq!(startup_mode_from_args(["--stdio", "--stdio"]), Ok(StartupMode::Serve));
+    assert_eq!(startup_mode_from_args(["--stdio"]), Ok(StartupMode::Serve));
+    assert_eq!(
+        startup_mode_from_args(["--stdio", "--clientProcessId=1234"]),
+        Ok(StartupMode::Serve)
+    );
+    assert!(startup_mode_from_args(["--stdio", "--bogus"]).is_err());
+    assert!(startup_mode_from_args(["--version", "--stdio"]).is_ok());
+}

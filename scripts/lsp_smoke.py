@@ -12,7 +12,8 @@ SERVER = sys.argv[1] if len(sys.argv) > 1 else "spar-ls"
 
 class Client:
     def __init__(self, root):
-        self.proc = subprocess.Popen([SERVER, "--stdio"], stdin=subprocess.PIPE,
+        self.proc = subprocess.Popen([SERVER, "--stdio", "--stdio"],  # VS Code passes --stdio and the client appends its own
+                                     stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.root = root
         self.next_id = 1
