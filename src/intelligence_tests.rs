@@ -954,7 +954,7 @@ fn local_names_exclude_names_from_closed_blocks_and_other_functions() {
 
 #[test]
 fn scope_items_are_ranked_before_file_level_and_keywords() {
-    let names = vec![ScopeName { name: "loc".into(), kind: ScopeNameKind::Variable, ty: Some("int".into()) }];
+    let names = vec![ScopeName::new("loc", ScopeNameKind::Variable, Some("int".into()))];
     let items = scope_completion_items(&names);
     assert_eq!(items[0].label, "loc");
     assert_eq!(items[0].sort_text.as_deref(), Some("0_loc"));
@@ -1000,8 +1000,8 @@ fn named_argument_items_follow_declared_parameter_order() {
 #[test]
 fn value_items_prefer_locals_matching_the_parameter_type() {
     let names = vec![
-        ScopeName { name: "count".into(), kind: ScopeNameKind::Variable, ty: Some("int".into()) },
-        ScopeName { name: "label".into(), kind: ScopeNameKind::Variable, ty: Some("str".into()) },
+        ScopeName::new("count", ScopeNameKind::Variable, Some("int".into())),
+        ScopeName::new("label", ScopeNameKind::Variable, Some("str".into())),
     ];
     let items = value_items_for_type(&names, "str");
     assert_eq!(items[0].label, "label");
@@ -1207,4 +1207,96 @@ fn imported_shell_functions_do_not_leak_tokens_onto_the_import_line() {
     assert_eq!(kind(2, "other"), Some(TT_FUNCTION));
     assert_eq!(kind(4, "Widget"), Some(TT_TYPE));
     assert_eq!(kind(5, "other"), Some(TT_FUNCTION), "the call site still resolves");
+}
+
+const HUMAN_SOURCE: &str = concat!(
+    "type Human {\n",
+    "    name: str;\n",
+    "    age: int;\n",
+    "};\n",
+    "var people: List<Human> = [\n",
+    "    { name: \"Mike\"; age: 5; }\n",
+    "];\n",
+    "var person: Human = people[0];\n",
+    "function looper(people: List<Human>) -> int {\n",
+    "    for person in people {\n",
+    "        println(message: person.name);\n",
+    "        return 6;\n",
+    "    }\n",
+    "    return 0;\n",
+    "};\n",
+);
+
+fn position_of(source: &str, needle: &str, offset: usize) -> Position {
+    let index = source.find(needle).expect("needle") + offset;
+    byte_offset_to_lsp_position(source, index)
+}
+
+#[test]
+fn definition_of_a_loop_variable_finds_the_loop_binding_not_the_global() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(HUMAN_SOURCE, std::path::Path::new("/workspace"));
+    let use_site = position_of(HUMAN_SOURCE, "person.name", 1);
+    let location = definition_at(&uri, &state, use_site).expect("definition");
+    // line index 9 is `    for person in people {`; the global `var person` is line 7
+    assert_eq!(location.range.start.line, 9, "jumped to {:?}", location.range);
+}
+
+#[test]
+fn definition_of_a_parameter_finds_the_parameter() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(HUMAN_SOURCE, std::path::Path::new("/workspace"));
+    let use_site = position_of(HUMAN_SOURCE, "in people {", 4);
+    let location = definition_at(&uri, &state, use_site).expect("definition");
+    assert_eq!(location.range.start.line, 8, "the parameter is declared on line 8: {:?}", location.range);
+}
+
+fn human_symbols() -> SymbolTable {
+    let state = SparLanguageServer::analyze(HUMAN_SOURCE, std::path::Path::new("/workspace"));
+    state.effective_symbols().expect("symbols").clone()
+}
+
+fn member_labels(source_with_marker: &str) -> Option<Vec<String>> {
+    let (source, offset) = marked(source_with_marker);
+    typed_member_items(&source, offset, &human_symbols())
+        .map(|items| items.into_iter().map(|item| item.label).collect())
+}
+
+#[test]
+fn member_completion_after_a_loop_variable_inside_call_arguments() {
+    // The screenshot case: `person` is a `for` binding over List<Human>.
+    let source = HUMAN_SOURCE.replace("println(message: person.name);", "println(message: person.|);");
+    assert_eq!(member_labels(&source), Some(vec!["name".to_string(), "age".to_string()]));
+}
+
+#[test]
+fn member_completion_filters_nothing_for_a_partial_member_name() {
+    let source = HUMAN_SOURCE.replace("println(message: person.name);", "println(message: person.na|);");
+    assert_eq!(member_labels(&source), Some(vec!["name".to_string(), "age".to_string()]));
+}
+
+#[test]
+fn member_completion_through_parameters_locals_and_index_chains() {
+    let params = HUMAN_SOURCE.replace("return 6;", "var h: Human = person;\n        var s: str = h.|;\n        return 6;");
+    assert_eq!(member_labels(&params), Some(vec!["name".to_string(), "age".to_string()]));
+
+    let inferred = HUMAN_SOURCE.replace("return 6;", "var g = people[0];\n        var s: str = g.|;\n        return 6;");
+    assert_eq!(member_labels(&inferred), Some(vec!["name".to_string(), "age".to_string()]));
+
+    let indexed = HUMAN_SOURCE.replace("return 0;\n};", "var x: str = people[0].|;\n    return 0;\n};");
+    assert_eq!(member_labels(&indexed), Some(vec!["name".to_string(), "age".to_string()]));
+}
+
+#[test]
+fn member_completion_on_a_list_offers_no_fields() {
+    let source = HUMAN_SOURCE.replace("return 0;\n};", "var x: int = people.|;\n    return 0;\n};");
+    assert_eq!(member_labels(&source), Some(Vec::new()));
+}
+
+#[test]
+fn member_completion_ignores_numbers_and_spreads() {
+    let (source, offset) = marked("var f: float = 1.|;");
+    assert!(typed_member_items(&source, offset, &human_symbols()).is_none());
+    let (source, offset) = marked("var xs: List<int> = [...|];");
+    assert!(typed_member_items(&source, offset, &human_symbols()).is_none());
 }

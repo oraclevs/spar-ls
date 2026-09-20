@@ -385,6 +385,7 @@ include!("rename.rs");
 include!("code_actions.rs");
 include!("shell_semantic.rs");
 include!("scope_completion.rs");
+include!("member_completion.rs");
 // ── Import hover / completion helpers ────────────────────────────────────────
 
 fn format_import_hover(alias: &str, sym: &SymbolTable) -> String {
@@ -1315,6 +1316,18 @@ impl LanguageServer for SparLanguageServer {
         if punctuation_trigger && matches!(context, EditorContext::Expression) {
             return Ok(None);
         }
+        // `receiver.` (also `receiver.par|`) is a member access wherever it appears,
+        // including inside call arguments: offer the receiver type's members only.
+        if !matches!(
+            context,
+            EditorContext::Suppressed | EditorContext::ImportPath { .. } | EditorContext::SelectiveImport { .. }
+        ) {
+            if let Some(symbols) = state.effective_symbols() {
+                if let Some(items) = typed_member_items(&state.source, offset, symbols) {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+        }
         match &context {
             EditorContext::Suppressed => return Ok(None),
             EditorContext::ImportPath { prefix, package } => {
@@ -1467,6 +1480,19 @@ impl LanguageServer for SparLanguageServer {
         items.extend(builtin_items().into_iter().map(|item| with_tier(item, 3)));
         items.extend(type_keyword_items().into_iter().map(|item| with_tier(item, 4)));
         items.extend(keyword_items().into_iter().map(|item| with_tier(item, 9)));
+
+        // In `f(param: |)`, locals whose type matches the parameter come first.
+        {
+            let index = self.workspace_index.lock().await;
+            if let Some(expected) = expected_value_type(state, &index, &uri, &state.source, offset) {
+                for item in &mut items {
+                    let is_local = item.sort_text.as_deref().is_some_and(|text| text.starts_with("0_"));
+                    if is_local && item.detail.as_deref() == Some(expected.as_str()) {
+                        item.sort_text = Some(format!("00_{}", item.label));
+                    }
+                }
+            }
+        }
 
         // A local may shadow a same-named global/function: keep the best-ranked
         // (lowest tier) entry per label.

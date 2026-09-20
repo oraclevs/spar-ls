@@ -39,14 +39,16 @@ fn symbol_span(symbols: &SymbolTable, path: &[String], word: &str) -> Option<Spa
     symbols.sections.get(&complete).map(|e| e.span.clone())
 }
 
-fn local_decl_span(program: &Program, offset: usize, word: &str) -> Option<Span> {
-    fn walk(stmts: &[FuncStmt], offset: usize, word: &str, found: &mut Option<Span>) {
+fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -> Option<Span> {
+    fn walk(stmts: &[FuncStmt], source: &str, offset: usize, word: &str, found: &mut Option<Span>) {
         for stmt in stmts {
             match stmt {
                 FuncStmt::LocalVar(v) => {
-                    if v.span.start <= offset && v.name == word { *found = Some(v.span.clone()); }
+                    if v.span.start <= offset && v.name == word {
+                        *found = Some(ident_span_in(source, &v.span, word).unwrap_or_else(|| v.span.clone()));
+                    }
                 }
-                FuncStmt::If(i) => { walk(&i.then_stmts, offset, word, found); walk(&i.else_stmts, offset, word, found); }
+                FuncStmt::If(i) => { walk(&i.then_stmts, source, offset, word, found); walk(&i.else_stmts, source, offset, word, found); }
                 FuncStmt::For(statement) => {
                     match &statement.binding {
                         spar::ast::ForBinding::Value { name, span } => {
@@ -57,7 +59,7 @@ fn local_decl_span(program: &Program, offset: usize, word: &str) -> Option<Span>
                             if value_span.start <= offset && value_name == word { *found = Some(value_span.clone()); }
                         }
                     }
-                    walk(&statement.body, offset, word, found);
+                    walk(&statement.body, source, offset, word, found);
                 }
                 FuncStmt::Return(_, _)
                 | FuncStmt::Assignment { .. }
@@ -68,15 +70,41 @@ fn local_decl_span(program: &Program, offset: usize, word: &str) -> Option<Span>
             }
         }
     }
-    for item in &program.items {
-        let TopLevelItem::Function(f) = item else { continue };
-        if !(f.span.start <= offset && offset <= f.span.end) { continue; }
-        if let Some(p) = f.params.iter().find(|p| p.name == word) { return Some(p.span.clone()); }
+    // `FunctionDecl::span` covers only the `function` keyword; the body's span is its
+    // closing brace, so the real extent runs from the keyword to the body's end.
+    let check = |f: &spar::ast::FunctionDecl| -> Option<Span> {
+        let end = f.body.span.end.max(f.span.end);
+        if !(f.span.start <= offset && offset <= end) { return None; }
+        if let Some(p) = f.params.iter().find(|p| p.name == word) {
+            // the parameter's span may start at its type; prefer the name itself
+            return Some(ident_span_in(source, &p.span, word).unwrap_or_else(|| p.span.clone()));
+        }
         let mut found = None;
-        walk(&f.body.stmts, offset, word, &mut found);
-        if found.is_some() { return found; }
+        walk(&f.body.stmts, source, offset, word, &mut found);
+        found
+    };
+    for item in &program.items {
+        match item {
+            TopLevelItem::Function(f) => {
+                if let Some(span) = check(f) { return Some(span); }
+            }
+            TopLevelItem::FunctionGroup(group) => {
+                for f in &group.functions {
+                    if let Some(span) = check(f) { return Some(span); }
+                }
+            }
+            _ => {}
+        }
     }
     None
+}
+
+/// The span of the whole-word `name` at or after the start of `span` (declaration
+/// spans often begin at a keyword, so this finds the identifier itself).
+fn ident_span_in(source: &str, span: &Span, name: &str) -> Option<Span> {
+    let byte = find_ident_byte(source, span.start.min(source.len()), name)?;
+    let (line, col) = byte_to_lsp_pos(source, byte);
+    Some(Span::new(byte, byte + name.len(), line + 1, col + 1))
 }
 
 /// Tasks aren't resolved into `SymbolTable` (unlike globals/functions/
@@ -143,7 +171,7 @@ fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Loca
     if word.is_empty() { return None; }
     let program = state.ast.as_ref()?;
     let offset = lsp_pos_to_byte_offset(&state.source, pos);
-    if let Some(span) = local_decl_span(program, offset, &word) {
+    if let Some(span) = local_decl_span(program, &state.source, offset, &word) {
         return Some(span_location(uri.clone(), &state.source, &span));
     }
     if let Some(span) = task_decl_span(program, &word) {
@@ -167,5 +195,7 @@ fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Loca
     let span = symbol_span(symbols, &prefix, &word).or_else(|| {
         symbols.sections.values().find_map(|s| s.fields.get(&word).map(|f| f.span.clone()))
     })?;
+    // Declaration spans often start at a keyword (`var`, `type`); point at the name.
+    let span = ident_span_in(&state.source, &span, &word).unwrap_or(span);
     Some(span_location(uri.clone(), &state.source, &span))
 }

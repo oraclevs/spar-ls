@@ -208,16 +208,26 @@ fn named_argument_completion_items(
         return None;
     };
     let signature = resolve_callable_named(state, index, uri, &callee)?;
-    if let Some(param_name) = value_of {
-        // Value position: rank in-scope locals of the parameter's type first. With
-        // no locals, return None so general expression completion takes over.
-        let expected = signature
-            .params
-            .iter()
-            .find(|param| param.name == param_name)
-            .map(|param| param.ty.clone())?;
-        let items = value_items_for_type(&local_names_at(source, offset), &expected);
-        return (!items.is_empty()).then_some(items);
+    if value_of.is_some() {
+        // Value position: general expression completion takes over (see `expected_value_type`).
+        return None;
     }
     Some(named_parameter_items(&signature, &supplied))
+}
+
+/// In `f(param: |)`, the declared type of `param`, used to rank matching locals first.
+fn expected_value_type(
+    state: &DocumentState,
+    index: &WorkspaceIndex,
+    uri: &Url,
+    source: &str,
+    offset: usize,
+) -> Option<String> {
+    let EditorContext::CallArguments { callee, value_of: Some(param_name), .. } =
+        editor_context(source, state.ast.as_ref(), offset)
+    else {
+        return None;
+    };
+    let signature = resolve_callable_named(state, index, uri, &callee)?;
+    signature.params.into_iter().find(|param| param.name == param_name).map(|param| param.ty)
 }
