@@ -1007,3 +1007,57 @@ fn value_items_prefer_locals_matching_the_parameter_type() {
     assert_eq!(items[0].label, "label");
     assert!(items[0].sort_text.as_deref().unwrap() < items[1].sort_text.as_deref().unwrap());
 }
+
+#[test]
+fn selective_import_context_reports_close_brace_when_from_is_missing() {
+    let ctx = context_from_marked("import pkg { | };\n");
+    let EditorContext::SelectiveImport { path, close_at, package, .. } = ctx else { panic!("expected import") };
+    assert!(package);
+    assert_eq!(path, None);
+    // Marker removed leaves `import pkg {  };`, so `}` is at byte 14.
+    assert_eq!(close_at, Some("import pkg {  ".len()));
+    let ctx = context_from_marked("import pkg { | ");
+    let EditorContext::SelectiveImport { close_at, .. } = ctx else { panic!("expected import") };
+    assert_eq!(close_at, None);
+}
+
+#[test]
+fn export_discovery_offers_std_exports_with_from_clause_edit() {
+    let source = "import pkg {  };\n";
+    let cursor = "import pkg { ".len();
+    let close = source.find('}').unwrap();
+    let items = import_export_discovery_items(
+        std::path::Path::new("."), true, false, &HashSet::new(), source, cursor, Some(close),
+    );
+    let write_text = items.iter().find(|i| i.label == "writeText").expect("writeText from std/fs");
+    assert_eq!(write_text.detail.as_deref(), Some("std/fs"));
+    let edits = write_text.additional_text_edits.as_ref().expect("from clause edit");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, " from \"std/fs\"");
+    // the edit is inserted immediately after the `}` (offset close + 1) on line 0
+    assert_eq!(edits[0].range.start.character as usize, close + 1);
+}
+
+#[test]
+fn export_discovery_completes_whole_statement_when_brace_missing() {
+    let source = "import pkg { ";
+    let items = import_export_discovery_items(
+        std::path::Path::new("."), true, false, &HashSet::new(), source, source.len(), None,
+    );
+    let write_text = items.iter().find(|i| i.label == "writeText").expect("writeText");
+    assert_eq!(write_text.insert_text.as_deref(), Some("writeText } from \"std/fs\";"));
+    assert!(write_text.additional_text_edits.is_none());
+}
+
+#[test]
+fn export_discovery_skips_names_already_listed_and_non_package_imports() {
+    let mut already = HashSet::new();
+    already.insert("writeText".to_string());
+    let items = import_export_discovery_items(
+        std::path::Path::new("."), true, false, &already, "import pkg { writeText, ", 24, None,
+    );
+    assert!(!items.iter().any(|i| i.label == "writeText"));
+    assert!(import_export_discovery_items(
+        std::path::Path::new("."), false, false, &HashSet::new(), "import { ", 9, None,
+    ).is_empty());
+}

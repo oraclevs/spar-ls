@@ -1304,16 +1304,21 @@ impl LanguageServer for SparLanguageServer {
                 let items = import_path_completion_items(&base, prefix, *package);
                 return Ok(Some(CompletionResponse::Array(items)));
             }
-            EditorContext::SelectiveImport { type_only, package, path: Some(path), already } => {
+            EditorContext::SelectiveImport { type_only, package, path, already, close_at } => {
                 let base = base_dir_from_uri(&uri);
-                if let Some(items) = selective_import_completion_items(
-                    &base,
-                    path,
-                    *package,
-                    *type_only,
-                    already,
-                ) {
-                    return Ok(Some(CompletionResponse::Array(items)));
+                if let Some(path) = path {
+                    if let Some(items) =
+                        selective_import_completion_items(&base, path, *package, *type_only, already)
+                    {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                } else {
+                    let items = import_export_discovery_items(
+                        &base, *package, *type_only, already, &state.source, offset, *close_at,
+                    );
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
                 }
             }
             EditorContext::CallArguments { .. } => {

@@ -304,3 +304,53 @@ fn enrich_completion_from_index(
     }
     item
 }
+
+/// `import pkg { | ` before any `from "..."` exists: list exports of every
+/// bundled std module, and add the `from "<module>"` clause when one is picked.
+fn import_export_discovery_items(
+    base_dir: &std::path::Path,
+    package: bool,
+    type_only: bool,
+    already: &HashSet<String>,
+    source: &str,
+    _cursor: usize,
+    close_at: Option<usize>,
+) -> Vec<CompletionItem> {
+    if !package {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    for module in spar::bundled_stdlib_module_names() {
+        if module == "std" || module == "std/prelude" {
+            continue;
+        }
+        let Some(module_items) =
+            selective_import_completion_items(base_dir, &module, true, type_only, already)
+        else {
+            continue;
+        };
+        for mut item in module_items {
+            let name = item.label.clone();
+            item.detail = Some(module.clone());
+            match close_at {
+                Some(close) => {
+                    // Names go inside the braces; the clause goes right after `}`.
+                    item.insert_text = Some(name);
+                    let position = byte_offset_to_lsp_position(source, close + 1);
+                    item.additional_text_edits = Some(vec![TextEdit {
+                        range: Range { start: position, end: position },
+                        new_text: format!(" from \"{module}\""),
+                    }]);
+                }
+                None => {
+                    // No closing brace yet: complete the whole statement.
+                    item.insert_text = Some(format!("{name} }} from \"{module}\";"));
+                    item.additional_text_edits = None;
+                }
+            }
+            items.push(item);
+        }
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.detail.cmp(&b.detail)));
+    items
+}
