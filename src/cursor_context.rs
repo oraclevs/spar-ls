@@ -16,6 +16,8 @@ enum EditorContext {
         callee: String,
         supplied: Vec<String>,
         active_parameter: u32,
+        /// `Some(param)` when the cursor sits after `param:` of the current argument.
+        value_of: Option<String>,
     },
     Expression,
     Suppressed,
@@ -320,7 +322,13 @@ fn call_context(source: &str, offset: usize) -> Option<EditorContext> {
     let args_source = &prefix[open + 1..];
     let args_masked = &masked[open + 1..];
     let (segments, active_parameter) = split_top_level_arguments(args_source, args_masked);
-    let supplied = segments
+    let current_segment = segments.last().map(String::as_str).unwrap_or("");
+    let value_of = current_segment.find(':').and_then(|colon| {
+        let name = current_segment[..colon].trim();
+        (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .then(|| name.to_string())
+    });
+    let supplied = segments[..segments.len().saturating_sub(1)]
         .iter()
         .filter_map(|segment| {
             let colon = segment.find(':')?;
@@ -329,7 +337,7 @@ fn call_context(source: &str, offset: usize) -> Option<EditorContext> {
                 .then(|| candidate.to_string())
         })
         .collect();
-    Some(EditorContext::CallArguments { callee, supplied, active_parameter })
+    Some(EditorContext::CallArguments { callee, supplied, active_parameter, value_of })
 }
 
 fn editor_context(source: &str, _ast: Option<&Program>, offset: usize) -> EditorContext {
