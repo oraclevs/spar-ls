@@ -1112,3 +1112,47 @@ fn legend_appends_declaration_keyword() {
     assert_eq!(TOKEN_TYPES[21], SemanticTokenType::new("declarationKeyword"));
     assert_eq!(TT_DECLARATION_KEYWORD, 21);
 }
+
+fn assert_symbols_valid(symbols: &[DocumentSymbol], path: &str) {
+    let le = |a: Position, b: Position| (a.line, a.character) <= (b.line, b.character);
+    for symbol in symbols {
+        let here = format!("{path}/{}", symbol.name);
+        assert!(!symbol.name.is_empty(), "empty symbol name under {path}");
+        assert!(
+            le(symbol.range.start, symbol.selection_range.start)
+                && le(symbol.selection_range.end, symbol.range.end),
+            "selectionRange must lie inside range for {here}: {:?} vs {:?}",
+            symbol.range,
+            symbol.selection_range
+        );
+        for child in symbol.children.iter().flatten() {
+            assert!(
+                le(symbol.range.start, child.range.start) && le(child.range.end, symbol.range.end),
+                "child {} must lie inside parent range {here}",
+                child.name
+            );
+        }
+        assert_symbols_valid(symbol.children.as_deref().unwrap_or(&[]), &here);
+    }
+}
+
+#[test]
+fn document_symbol_ranges_always_contain_their_names_and_children() {
+    // `struct Name {` and `function f` declarations carry a span covering only
+    // their first token; VS Code throws unless selectionRange is inside range.
+    let source = concat!(
+        "struct Config {\n",
+        "    aliases: int = 1;\n",
+        "    prompt: str = \"x\";\n",
+        "};\n",
+        "function startup() -> shell {\n",
+        "    return shell { pwd; };\n",
+        "};\n",
+        "type Thing { n: int; };\n",
+        "export var top: int = 1;\n",
+    );
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
+    let symbols = document_symbols(&state);
+    assert!(!symbols.is_empty());
+    assert_symbols_valid(&symbols, "");
+}

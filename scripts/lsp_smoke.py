@@ -46,7 +46,8 @@ class Client:
         self.send({"jsonrpc": "2.0", "method": method, "params": params})
 
     def start(self):
-        caps = {"textDocument": {"completion": {"completionItem": {"snippetSupport": True}}}}
+        caps = {"textDocument": {"completion": {"completionItem": {"snippetSupport": True}},
+                                 "documentSymbol": {"hierarchicalDocumentSymbolSupport": True}}}
         self.request("initialize", {"processId": None, "rootUri": "file://" + self.root, "capabilities": caps})
         self.notify("initialized", {})
 
@@ -132,6 +133,26 @@ with tempfile.TemporaryDirectory() as root:
     edit(base + "var z: int = 1\nvar w: int = 2;\n")
     tokens = client.request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
     check("semantic tokens survive syntax errors", tokens is not None and len(tokens["data"]) > 0)
+
+    def symbols_valid(symbols):
+        def le(a, b):
+            return (a["line"], a["character"]) <= (b["line"], b["character"])
+        for symbol in symbols:
+            if not symbol["name"]:
+                return False
+            if not (le(symbol["range"]["start"], symbol["selectionRange"]["start"])
+                    and le(symbol["selectionRange"]["end"], symbol["range"]["end"])):
+                return False
+            if not symbols_valid(symbol.get("children") or []):
+                return False
+        return True
+
+    outline = ('struct Config {\n    a: int = 1;\n};\n'
+               'function startup() -> shell {\n    return shell { pwd; };\n};\n')
+    edit(base + outline)
+    symbols = client.request("textDocument/documentSymbol", {"textDocument": {"uri": uri}})
+    check("document symbols have selectionRange inside range (VS Code rejects otherwise)",
+          isinstance(symbols, list) and len(symbols) > 0 and symbols_valid(symbols), symbols)
 
     client.proc.terminate()
 
