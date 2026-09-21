@@ -37,6 +37,15 @@ fn completion_data(symbol_id: String, origin: &str) -> serde_json::Value {
     })
 }
 
+fn declaration_documentation(source: &str, start: usize) -> Option<Documentation> {
+    leading_documentation(source, start).map(|value| {
+        Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        })
+    })
+}
+
 fn selective_import_completion_items(
     base_dir: &std::path::Path,
     path: &str,
@@ -61,15 +70,27 @@ fn selective_import_completion_items(
                     GlobalEntry::Var { ty, .. } => Some(format_spar_type(ty)),
                     _ => None,
                 });
+                let indexed_kind = match symbols.globals.get(&decl.name) {
+                    Some(GlobalEntry::Var {
+                        ty: spar::ast::SparType::Function { .. },
+                        ..
+                    }) => IndexedSymbolKind::Callable,
+                    _ => IndexedSymbolKind::Variable,
+                };
                 items.push(CompletionItem {
                     label: decl.name.clone(),
-                    kind: Some(CompletionItemKind::VARIABLE),
+                    kind: Some(if indexed_kind == IndexedSymbolKind::Callable {
+                        CompletionItemKind::FUNCTION
+                    } else {
+                        CompletionItemKind::VARIABLE
+                    }),
                     detail,
                     filter_text: Some(decl.name.clone()),
                     data: Some(completion_data(
-                        import_symbol_id(&uri, IndexedSymbolKind::Variable, &decl.name, &decl.span),
+                        import_symbol_id(&uri, indexed_kind, &decl.name, &decl.span),
                         path,
                     )),
+                    documentation: declaration_documentation(&source, decl.span.start),
                     ..Default::default()
                 });
             }
@@ -78,15 +99,25 @@ fn selective_import_completion_items(
             {
                 let name = &decl.path[0];
                 if already.contains(name) { continue; }
+                let indexed_kind = if decl.canonical {
+                    IndexedSymbolKind::Struct
+                } else {
+                    IndexedSymbolKind::Section
+                };
                 items.push(CompletionItem {
                     label: name.clone(),
-                    kind: Some(CompletionItemKind::MODULE),
-                    detail: Some("section".to_string()),
+                    kind: Some(if decl.canonical {
+                        CompletionItemKind::STRUCT
+                    } else {
+                        CompletionItemKind::MODULE
+                    }),
+                    detail: Some(if decl.canonical { "struct" } else { "section" }.to_string()),
                     filter_text: Some(name.clone()),
                     data: Some(completion_data(
-                        import_symbol_id(&uri, IndexedSymbolKind::Section, name, &decl.span),
+                        import_symbol_id(&uri, indexed_kind, name, &decl.span),
                         path,
                     )),
+                    documentation: declaration_documentation(&source, decl.span.start),
                     ..Default::default()
                 });
             }
@@ -113,6 +144,7 @@ fn selective_import_completion_items(
                         import_symbol_id(&uri, IndexedSymbolKind::Function, &decl.name, span),
                         path,
                     )),
+                    documentation: declaration_documentation(&source, decl.span.start),
                     ..Default::default()
                 });
             }
@@ -128,6 +160,7 @@ fn selective_import_completion_items(
                         import_symbol_id(&uri, IndexedSymbolKind::Type, &decl.name, span),
                         path,
                     )),
+                    documentation: declaration_documentation(&source, decl.span.start),
                     ..Default::default()
                 });
             }
@@ -143,6 +176,7 @@ fn selective_import_completion_items(
                         import_symbol_id(&uri, IndexedSymbolKind::Enum, &decl.name, span),
                         path,
                     )),
+                    documentation: declaration_documentation(&source, decl.span.start),
                     ..Default::default()
                 });
             }
@@ -162,6 +196,7 @@ fn selective_import_completion_items(
                         import_symbol_id(&uri, IndexedSymbolKind::FunctionGroup, &decl.name, span),
                         path,
                     )),
+                    documentation: declaration_documentation(&source, decl.span.start),
                     ..Default::default()
                 });
             }
@@ -297,9 +332,16 @@ fn enrich_completion_from_index(
     }
     if include_documentation && item.documentation.is_none() {
         let origin = symbol.container_name.clone().unwrap_or_else(|| symbol.uri.to_string());
+        let mut value = symbol.documentation.clone().unwrap_or_else(|| {
+            format!("**Spar {}** `{}`", symbol.kind.as_key(), symbol.name)
+        });
+        if !value.is_empty() {
+            value.push_str("\n\n");
+        }
+        value.push_str(&format!("Defined in `{origin}`"));
         item.documentation = Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: format!("**Spar {}** `{}`\n\nDefined in `{origin}`", symbol.kind.as_key(), symbol.name),
+            value,
         }));
     }
     item

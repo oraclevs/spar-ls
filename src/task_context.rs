@@ -60,18 +60,15 @@ pub fn task_context(source: &str, offset: usize) -> Option<TaskScope> {
     let mut depth = 0i32;
     while i < bytes.len() {
         match bytes[i] {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => match skip_line_comment(bytes, i) {
-                Some(next) => i = next,
-                None => return None,
-            },
-            b'/' if bytes.get(i + 1) == Some(&b'*') => match skip_block_comment(bytes, i) {
-                Some(next) => i = next,
-                None => return None,
-            },
-            b'"' => match skip_string(bytes, i) {
-                Some(next) => i = next,
-                None => return None,
-            },
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = skip_line_comment(bytes, i)?;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = skip_block_comment(bytes, i)?;
+            }
+            b'"' => {
+                i = skip_string(bytes, i)?;
+            }
             b'{' | b'(' | b'[' => {
                 depth += 1;
                 i += 1;
@@ -575,23 +572,38 @@ mod tests {
     fn run_header_tracks_completed_words_only() {
         assert_eq!(
             context("task X {\n    run |"),
-            TaskContext::RunHeader { shell_seen: false, os_seen: false }
+            TaskContext::RunHeader {
+                shell_seen: false,
+                os_seen: false
+            }
         );
         assert_eq!(
             context("task X {\n    run ba|"),
-            TaskContext::RunHeader { shell_seen: false, os_seen: false }
+            TaskContext::RunHeader {
+                shell_seen: false,
+                os_seen: false
+            }
         );
         assert_eq!(
             context("task X {\n    run bash |"),
-            TaskContext::RunHeader { shell_seen: true, os_seen: false }
+            TaskContext::RunHeader {
+                shell_seen: true,
+                os_seen: false
+            }
         );
         assert_eq!(
             context("task X {\n    run bash macos |"),
-            TaskContext::RunHeader { shell_seen: true, os_seen: true }
+            TaskContext::RunHeader {
+                shell_seen: true,
+                os_seen: true
+            }
         );
         assert_eq!(
             context("task X {\n    run windows |"),
-            TaskContext::RunHeader { shell_seen: false, os_seen: true }
+            TaskContext::RunHeader {
+                shell_seen: false,
+                os_seen: true
+            }
         );
     }
 
@@ -645,8 +657,7 @@ mod tests {
 
     #[test]
     fn innermost_open_task_wins_over_earlier_closed_tasks() {
-        let scope =
-            at("task A { run { a; }; };\ntask B {\n    |").expect("inside B");
+        let scope = at("task A { run { a; }; };\ntask B {\n    |").expect("inside B");
         assert_eq!(scope.name, "B");
         assert!(scope.used_os_slots.is_empty());
     }

@@ -244,7 +244,7 @@ fn import_context(source: &str, offset: usize) -> Option<EditorContext> {
     let already = body
         .split(',')
         .filter_map(|part| {
-            let name = part.trim().split_whitespace().next()?;
+            let name = part.split_whitespace().next()?;
             (!name.is_empty()).then(|| name.to_string())
         })
         .collect::<HashSet<_>>();
@@ -343,7 +343,7 @@ fn call_context(source: &str, offset: usize) -> Option<EditorContext> {
     let mut start = end;
     while start > 0 {
         let b = before.as_bytes()[start - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b':' {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'.' {
             start -= 1;
         } else {
             break;

@@ -94,12 +94,501 @@ fn value_items(values: &[&str]) -> Vec<CompletionItem> {
         .collect()
 }
 
+
+// ── Structured-pipe completion ─────────────────────────────────────────────
+
+/// Return the byte offsets of top-level `|>` operators in `text`. Strings and
+/// comments are already blanked by `masked_code`; nesting keeps pipes inside
+/// call arguments/closures from being mistaken for the current pipeline.
+fn structured_pipe_statement_start(source: &str, offset: usize) -> usize {
+    let end = offset.min(source.len());
+    let masked = masked_code(&source[..end]);
+    let bytes = masked.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b')' => paren += 1,
+            b'(' if paren > 0 => paren -= 1,
+            b']' => bracket += 1,
+            b'[' if bracket > 0 => bracket -= 1,
+            b'}' => brace += 1,
+            b'{' if brace > 0 => brace -= 1,
+            b';' if paren == 0 && bracket == 0 && brace == 0 => return index + 1,
+            b'{' if paren == 0 && bracket == 0 && brace == 0 => return index + 1,
+            _ => {}
+        }
+    }
+    0
+}
+
+fn top_level_structured_pipes(text: &str) -> Vec<usize> {
+    let masked = masked_code(text);
+    let bytes = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        match bytes[index] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b'|' if bytes[index + 1] == b'>' && paren == 0 && bracket == 0 && brace == 0 => {
+                out.push(index);
+                index += 2;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    out
+}
+
+fn strip_pipeline_assignment_prefix(text: &str) -> &str {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("return ") {
+        return rest.trim();
+    }
+    // A pipeline commonly appears as the RHS of `var x = ...` or an
+    // assignment. The final standalone `=` before the pipeline is the RHS
+    // boundary; comparison operators are deliberately ignored.
+    let bytes = trimmed.as_bytes();
+    let mut candidate = None;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'=' {
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|at| bytes.get(at)).copied();
+        let next = bytes.get(index + 1).copied();
+        if previous != Some(b'=')
+            && previous != Some(b'!')
+            && previous != Some(b'<')
+            && previous != Some(b'>')
+            && next != Some(b'=')
+            && next != Some(b'>')
+        {
+            candidate = Some(index);
+        }
+    }
+    candidate.map_or(trimmed, |at| trimmed[at + 1..].trim())
+}
+
+fn parse_chain_text(text: &str) -> Option<Chain> {
+    let lexed = Lexer::new(text.trim()).tokenize().ok()?;
+    let tokens = lexed.iter().map(|token| &token.token).collect::<Vec<_>>();
+    parse_chain_tokens(&tokens, 0)
+}
+
+fn atomic_pipeline_input_type(
+    text: &str,
+    source: &str,
+    at: usize,
+    symbols: &SymbolTable,
+) -> Option<SparType> {
+    let text = strip_pipeline_assignment_prefix(text);
+    if let Some(chain) = parse_chain_text(text) {
+        let scope = local_names_at(source, at);
+        if let Some(ty) = type_of_chain(&chain, &scope, symbols, 0) {
+            return Some(ty);
+        }
+    }
+
+    let trimmed = text.trim();
+    if trimmed == "true" || trimmed == "false" {
+        return Some(SparType::Bool);
+    }
+    if trimmed.parse::<i64>().is_ok() {
+        return Some(SparType::Int);
+    }
+    if trimmed.parse::<f64>().is_ok() && trimmed.contains('.') {
+        return Some(SparType::Float);
+    }
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        return Some(SparType::Str);
+    }
+
+    // A simple function/constructor call is enough to keep chained pipeline
+    // completion type-aware without reparsing the user's incomplete statement.
+    if let Some(open) = trimmed.find('(') {
+        let name = trimmed[..open].trim();
+        if name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':') {
+            if let Some(entry) = symbols
+                .functions
+                .get(name)
+                .or_else(|| symbols.imported_functions.get(name))
+            {
+                return Some(entry.ret.clone());
+            }
+            let path = vec![name.to_string()];
+            if symbols.sections.get(&path).is_some_and(|section| section.canonical) {
+                return Some(SparType::Named(name.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn bind_pipeline_type_parameters(
+    expected: &SparType,
+    actual: &SparType,
+    bindings: &mut HashMap<String, SparType>,
+) -> bool {
+    match expected {
+        SparType::TypeParameter(name) => match bindings.get(name) {
+            Some(bound) => bound == actual,
+            None => {
+                bindings.insert(name.clone(), actual.clone());
+                true
+            }
+        },
+        SparType::List(expected_inner) => match actual {
+            SparType::List(actual_inner) => {
+                bind_pipeline_type_parameters(expected_inner, actual_inner, bindings)
+            }
+            SparType::Applied { name, arguments } if name == "List" && arguments.len() == 1 => {
+                bind_pipeline_type_parameters(expected_inner, &arguments[0], bindings)
+            }
+            _ => false,
+        },
+        SparType::Applied { name, arguments } => match actual {
+            SparType::Applied { name: actual_name, arguments: actual_arguments }
+                if name == actual_name && arguments.len() == actual_arguments.len() =>
+            {
+                arguments.iter().zip(actual_arguments).all(|(expected, actual)| {
+                    bind_pipeline_type_parameters(expected, actual, bindings)
+                })
+            }
+            SparType::List(actual_inner) if name == "List" && arguments.len() == 1 => {
+                bind_pipeline_type_parameters(&arguments[0], actual_inner, bindings)
+            }
+            _ => false,
+        },
+        SparType::Function { params, return_type } => match actual {
+            SparType::Function { params: actual_params, return_type: actual_return }
+                if params.len() == actual_params.len() =>
+            {
+                params.iter().zip(actual_params).all(|(expected, actual)| {
+                    bind_pipeline_type_parameters(expected, actual, bindings)
+                }) && bind_pipeline_type_parameters(return_type, actual_return, bindings)
+            }
+            _ => false,
+        },
+        _ => expected == actual,
+    }
+}
+
+fn substitute_pipeline_type(ty: &SparType, bindings: &HashMap<String, SparType>) -> SparType {
+    match ty {
+        SparType::TypeParameter(name) => bindings.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        SparType::List(inner) => {
+            SparType::List(Box::new(substitute_pipeline_type(inner, bindings)))
+        }
+        SparType::Applied { name, arguments } => SparType::Applied {
+            name: name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_pipeline_type(argument, bindings))
+                .collect(),
+        },
+        SparType::Function { params, return_type } => SparType::Function {
+            params: params
+                .iter()
+                .map(|param| substitute_pipeline_type(param, bindings))
+                .collect(),
+            return_type: Box::new(substitute_pipeline_type(return_type, bindings)),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn pipeline_function_result(
+    entry: &FunctionEntry,
+    input: &SparType,
+) -> Option<(Vec<(String, SparType)>, SparType)> {
+    let (_, first) = entry.params.first()?;
+    let mut bindings = HashMap::new();
+    if !bind_pipeline_type_parameters(first, input, &mut bindings) {
+        return None;
+    }
+    let remaining = entry
+        .params
+        .iter()
+        .skip(1)
+        .map(|(name, ty)| (name.clone(), substitute_pipeline_type(ty, &bindings)))
+        .collect();
+    let output = substitute_pipeline_type(&entry.ret, &bindings);
+    Some((remaining, output))
+}
+
+fn pipeline_callable_result(ty: &SparType, input: &SparType) -> Option<(Vec<SparType>, SparType)> {
+    let SparType::Function { params, return_type } = ty else {
+        return None;
+    };
+    let first = params.first()?;
+    let mut bindings = HashMap::new();
+    if !bind_pipeline_type_parameters(first, input, &mut bindings) {
+        return None;
+    }
+    Some((
+        params
+            .iter()
+            .skip(1)
+            .map(|param| substitute_pipeline_type(param, &bindings))
+            .collect(),
+        substitute_pipeline_type(return_type, &bindings),
+    ))
+}
+
+fn pipeline_stage_name(stage: &str) -> Option<&str> {
+    let trimmed = stage.trim();
+    let end = trimmed.find('(').unwrap_or(trimmed.len());
+    let name = trimmed[..end].trim();
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+    .then_some(name)
+}
+
+fn infer_pipeline_prefix_type(
+    text: &str,
+    source: &str,
+    absolute_start: usize,
+    symbols: &SymbolTable,
+) -> Option<SparType> {
+    let pipes = top_level_structured_pipes(text);
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    for pipe in &pipes {
+        segments.push(&text[start..*pipe]);
+        start = *pipe + 2;
+    }
+    segments.push(&text[start..]);
+    let mut current = atomic_pipeline_input_type(
+        segments.first()?.trim(),
+        source,
+        absolute_start + text.len(),
+        symbols,
+    )?;
+    for stage in segments.iter().skip(1) {
+        let name = pipeline_stage_name(stage)?;
+        if let Some(entry) = symbols
+            .functions
+            .get(name)
+            .or_else(|| symbols.imported_functions.get(name))
+        {
+            current = pipeline_function_result(entry, &current)?.1;
+            continue;
+        }
+        let callable = match symbols.globals.get(name) {
+            Some(GlobalEntry::Var { ty, .. }) => ty,
+            _ => return None,
+        };
+        current = pipeline_callable_result(callable, &current)?.1;
+    }
+    Some(current)
+}
+
+fn pipeline_completion_insert(name: &str, params: &[(String, SparType)], snippets: bool) -> String {
+    if params.is_empty() {
+        return format!("{name}()");
+    }
+    if !snippets {
+        return format!("{name}()");
+    }
+    let arguments = params
+        .iter()
+        .enumerate()
+        .map(|(index, (param, _))| format!("${{{}:{}}}", index + 1, param))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({arguments})")
+}
+
+/// Completion immediately after a structured-value pipe. `Some` means the
+/// cursor is in a `|>` stage position; an empty vector deliberately suppresses
+/// unrelated expression completion when no callable accepts the input type.
+fn structured_pipe_contextual_diagnostic(
+    state: &DocumentState,
+    error: &SparError,
+) -> Option<String> {
+    let raw = diagnostics::error_message(error);
+    let stage = raw
+        .strip_prefix("structured pipe stage '")?
+        .split_once('\'')?
+        .0;
+    let symbols = state.effective_symbols()?;
+    let span = diagnostics::error_span(error);
+    let statement_start = structured_pipe_statement_start(&state.source, span.start);
+    let statement_end = state.source[statement_start..]
+        .find(';')
+        .map(|relative| statement_start + relative)
+        .unwrap_or(state.source.len());
+    let statement = &state.source[statement_start..statement_end];
+    let pipes = top_level_structured_pipes(statement);
+
+    let mut input_type = None;
+    for (index, pipe) in pipes.iter().enumerate() {
+        let stage_start = pipe + 2;
+        let stage_end = pipes.get(index + 1).copied().unwrap_or(statement.len());
+        let stage_text = &statement[stage_start..stage_end];
+        if pipeline_stage_name(stage_text) == Some(stage) {
+            input_type = infer_pipeline_prefix_type(
+                &statement[..*pipe],
+                &state.source,
+                statement_start,
+                symbols,
+            );
+            break;
+        }
+    }
+    let input_type = input_type?;
+    let expected = if let Some(entry) = symbols
+        .functions
+        .get(stage)
+        .or_else(|| symbols.imported_functions.get(stage))
+    {
+        entry.params.first().map(|(_, ty)| ty.clone())
+    } else {
+        match symbols.globals.get(stage) {
+            Some(GlobalEntry::Var {
+                ty: SparType::Function { params, .. },
+                ..
+            }) => params.first().cloned(),
+            _ => None,
+        }
+    }?;
+
+    if input_type == expected {
+        return None;
+    }
+    Some(format!(
+        "structured pipe stage '{stage}': cannot pass {} into a first parameter of type {}",
+        format_spar_type(&input_type),
+        format_spar_type(&expected),
+    ))
+}
+
+fn structured_pipe_completion_items(
+    source: &str,
+    offset: usize,
+    symbols: &SymbolTable,
+    snippets: bool,
+) -> Option<Vec<CompletionItem>> {
+    let statement_start = structured_pipe_statement_start(source, offset);
+    let prefix = source.get(statement_start..offset.min(source.len()))?;
+    let pipes = top_level_structured_pipes(prefix);
+    let current_pipe = *pipes.last()?;
+    let stage_prefix = prefix[current_pipe + 2..].trim();
+    if !stage_prefix
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+    {
+        return None;
+    }
+    let pipeline_prefix = &prefix[..current_pipe];
+    let input_type = infer_pipeline_prefix_type(
+        pipeline_prefix,
+        source,
+        statement_start,
+        symbols,
+    )?;
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for (name, entry) in symbols
+        .functions
+        .iter()
+        .chain(symbols.imported_functions.iter())
+    {
+        if !name.starts_with(stage_prefix) || seen.contains(name) {
+            continue;
+        }
+        let Some((remaining, output)) = pipeline_function_result(entry, &input_type) else {
+            continue;
+        };
+        seen.insert(name.clone());
+        let detail = format!(
+            "{} |> {}({}) -> {}",
+            format_spar_type(&input_type),
+            name,
+            remaining
+                .iter()
+                .map(|(param, ty)| format!("{param}: {}", format_spar_type(ty)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            format_spar_type(&output)
+        );
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some(detail),
+            insert_text: Some(pipeline_completion_insert(name, &remaining, snippets)),
+            insert_text_format: Some(if snippets {
+                InsertTextFormat::SNIPPET
+            } else {
+                InsertTextFormat::PLAIN_TEXT
+            }),
+            sort_text: Some(format!("0_{name}")),
+            ..Default::default()
+        });
+    }
+
+    for (name, entry) in &symbols.globals {
+        if !name.starts_with(stage_prefix) || seen.contains(name) {
+            continue;
+        }
+        let GlobalEntry::Var { ty, .. } = entry else {
+            continue;
+        };
+        let Some((remaining, output)) = pipeline_callable_result(ty, &input_type) else {
+            continue;
+        };
+        seen.insert(name.clone());
+        let params = remaining
+            .into_iter()
+            .enumerate()
+            .map(|(index, ty)| (format!("arg{}", index + 1), ty))
+            .collect::<Vec<_>>();
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some(format!(
+                "{} |> {}(...) -> {}",
+                format_spar_type(&input_type),
+                name,
+                format_spar_type(&output)
+            )),
+            insert_text: Some(pipeline_completion_insert(name, &params, snippets)),
+            insert_text_format: Some(if snippets {
+                InsertTextFormat::SNIPPET
+            } else {
+                InsertTextFormat::PLAIN_TEXT
+            }),
+            sort_text: Some(format!("1_{name}")),
+            ..Default::default()
+        });
+    }
+    items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text).then_with(|| a.label.cmp(&b.label)));
+    Some(items)
+}
+
 fn top_level_start(item: &TopLevelItem) -> usize {
     match item {
         TopLevelItem::Import(d) => d.span.start,
         TopLevelItem::Var(d) => d.span.start,
         TopLevelItem::Dynamic(d) => d.span.start,
         TopLevelItem::Section(d) => d.span.start,
+        TopLevelItem::Impl(d) => d.span.start,
         TopLevelItem::Function(d) => d.span.start,
         TopLevelItem::SchemaSection(d) => d.span.start,
         TopLevelItem::Type(d) => d.span.start,
@@ -110,6 +599,7 @@ fn top_level_start(item: &TopLevelItem) -> usize {
         TopLevelItem::Statement(statement) => match statement {
             FuncStmt::LocalVar(d) => d.span.start,
             FuncStmt::Assignment { span, .. }
+            | FuncStmt::FieldAssignment { span, .. }
             | FuncStmt::Expression(_, span)
             | FuncStmt::Return(_, span)
             | FuncStmt::Break(span)
@@ -219,6 +709,11 @@ fn native_interpolation_at_offset(
             ShellStep::Pipeline(commands) => commands
                 .iter()
                 .find_map(|command| interpolation_in_command(command, offset)),
+            ShellStep::MixedPipeline(pipeline) => pipeline
+                .input
+                .iter()
+                .chain(pipeline.output.iter())
+                .find_map(|command| interpolation_in_command(command, offset)),
         })
         .or_else(|| {
             shell.statements.iter().find_map(|statement| match statement {
@@ -235,6 +730,7 @@ fn interpolation_in_command(
     offset: usize,
 ) -> Option<&spar::ast::Expr> {
     std::iter::once(&command.program)
+        .chain(command.environment.iter().map(|entry| &entry.value))
         .chain(command.args.iter())
         .find_map(|word| {
             word.parts.iter().find_map(|part| match part {
@@ -543,6 +1039,58 @@ fn type_keyword_items() -> Vec<CompletionItem> {
             ..Default::default()
         })
         .collect()
+}
+
+
+fn constructor_completion_items(
+    symbols: &SymbolTable,
+    index: &WorkspaceIndex,
+    uri: &Url,
+    snippets: bool,
+) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for (path, section) in &symbols.sections {
+        if path.len() != 1 || !section.canonical {
+            continue;
+        }
+        let owner = &path[0];
+        if !seen.insert(owner.clone()) {
+            continue;
+        }
+        let Some(constructor) = index.visible_constructor_for_owner(uri, owner) else {
+            continue;
+        };
+        let Some(signature) = constructor.signature.as_ref() else {
+            continue;
+        };
+        let (insert_text, insert_text_format) = if snippets {
+            let required = signature
+                .params
+                .iter()
+                .filter(|param| !param.has_default)
+                .enumerate()
+                .map(|(position, param)| format!("{}: ${{{}}}", param.name, position + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                Some(format!("{}({required})", owner)),
+                Some(InsertTextFormat::SNIPPET),
+            )
+        } else {
+            (Some(owner.clone()), Some(InsertTextFormat::PLAIN_TEXT))
+        };
+        items.push(CompletionItem {
+            label: owner.clone(),
+            kind: Some(CompletionItemKind::CONSTRUCTOR),
+            detail: Some(signature.label()),
+            insert_text,
+            insert_text_format,
+            sort_text: Some(format!("1_constructor_{owner}")),
+            ..Default::default()
+        });
+    }
+    items
 }
 
 fn builtin_items() -> Vec<CompletionItem> {

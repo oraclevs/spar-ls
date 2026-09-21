@@ -58,11 +58,122 @@ fn workspace_index_preserves_exports_and_callable_metadata() {
     let exports = index.exports_for_uri(&uri);
     assert!(exports.iter().any(|symbol| symbol.name == "build"));
     assert!(!exports.iter().any(|symbol| symbol.name == "secret"));
-    let build = exports.iter().find(|symbol| symbol.name == "build").unwrap();
+    let build = exports
+        .iter()
+        .find(|symbol| symbol.name == "build")
+        .unwrap();
     let signature = build.signature.as_ref().unwrap();
     assert_eq!(signature.params[1].name, "mode");
     assert!(signature.params[1].has_default);
-    assert_eq!(signature.params[1].default_repr.as_deref(), Some("\"debug\""));
+    assert_eq!(
+        signature.params[1].default_repr.as_deref(),
+        Some("\"debug\"")
+    );
+}
+
+#[test]
+fn workspace_index_models_structs_constructors_methods_and_callable_values() {
+    let source = r#"
+export struct User { name: str = "Obi"; age: int = 24; };
+impl User {
+    function label(self, prefix: str) -> str { return prefix + self.name; };
+    function create(name: str) -> User { return User(name: name); };
+    private function secret(mut self) -> str { return self.name; };
+};
+export var transform: fn(int) -> int = fn(value: int) -> int => value + 1;
+"#;
+    let uri = Url::parse("file:///workspace/models.spar").unwrap();
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let symbols = index.symbols_for_uri(&uri);
+
+    let user = symbols
+        .iter()
+        .find(|symbol| symbol.name == "User" && symbol.kind == IndexedSymbolKind::Struct)
+        .expect("canonical struct should have its own indexed kind");
+    assert!(user.exported);
+    assert_eq!(user.detail.as_deref(), Some("struct"));
+
+    let constructor = symbols
+        .iter()
+        .find(|symbol| symbol.kind == IndexedSymbolKind::Constructor && symbol.name == "User")
+        .expect("struct constructor should be indexed separately");
+    assert_eq!(constructor.container_name.as_deref(), Some("User"));
+    let constructor_signature = constructor
+        .signature
+        .as_ref()
+        .expect("constructor signature");
+    assert_eq!(constructor_signature.return_type, "User");
+    assert_eq!(
+        constructor_signature
+            .params
+            .iter()
+            .map(|param| (param.name.as_str(), param.ty.as_str(), param.has_default))
+            .collect::<Vec<_>>(),
+        vec![("name", "str", true), ("age", "int", true)]
+    );
+
+    let label = symbols
+        .iter()
+        .find(|symbol| symbol.semantic_path == "User::label")
+        .expect("instance method should be indexed");
+    assert_eq!(label.kind, IndexedSymbolKind::Method);
+    assert_eq!(label.method_receiver, Some(IndexedMethodReceiver::Shared));
+    assert_eq!(label.signature.as_ref().unwrap().params[0].name, "prefix");
+
+    let create = symbols
+        .iter()
+        .find(|symbol| symbol.semantic_path == "User::create")
+        .expect("static impl function should be indexed as a method");
+    assert_eq!(create.method_receiver, Some(IndexedMethodReceiver::Static));
+
+    let secret = symbols
+        .iter()
+        .find(|symbol| symbol.semantic_path == "User::secret")
+        .expect("private methods remain indexed inside their owning document");
+    assert!(secret.private);
+    assert_eq!(secret.method_receiver, Some(IndexedMethodReceiver::Mutable));
+
+    let transform = symbols
+        .iter()
+        .find(|symbol| symbol.name == "transform")
+        .expect("callable variable should be indexed");
+    assert_eq!(transform.kind, IndexedSymbolKind::Callable);
+    let transform_signature = transform.signature.as_ref().expect("callable signature");
+    assert_eq!(transform_signature.params[0].name, "value");
+    assert_eq!(transform_signature.params[0].ty, "int");
+    assert_eq!(transform_signature.return_type, "int");
+
+    let exports = index.exports_for_uri(&uri);
+    assert!(exports
+        .iter()
+        .any(|symbol| symbol.kind == IndexedSymbolKind::Struct && symbol.name == "User"));
+    assert!(!exports
+        .iter()
+        .any(|symbol| symbol.kind == IndexedSymbolKind::Constructor && symbol.name == "User"));
+    assert!(exports
+        .iter()
+        .any(|symbol| symbol.kind == IndexedSymbolKind::Callable && symbol.name == "transform"));
+    assert!(!exports
+        .iter()
+        .any(|symbol| symbol.kind == IndexedSymbolKind::Method));
+
+    assert_eq!(
+        index
+            .constructor_for_owner(&uri, "User")
+            .and_then(|symbol| symbol.signature.as_ref())
+            .map(|signature| signature.return_type.as_str()),
+        Some("User")
+    );
+    assert_eq!(
+        index
+            .methods_for_owner(&uri, "User")
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["create", "label", "secret"]
+    );
 }
 
 fn context_from_marked(source: &str) -> EditorContext {
@@ -72,26 +183,187 @@ fn context_from_marked(source: &str) -> EditorContext {
 }
 
 #[test]
+fn task25_instance_member_completion_merges_fields_and_methods() {
+    let declarations = r#"
+struct User { name: str = "Obi"; age: int = 24; };
+impl User {
+    function label(self, prefix: str) -> str { return prefix + self.name; };
+    function create(name: str) -> User { return User(name: name); };
+};
+"#;
+    let analyzed = format!(
+        "{declarations}\nfunction demo() -> void {{ var user: User = User(); user.name; }};"
+    );
+    let source =
+        format!("{declarations}\nfunction demo() -> void {{ var user: User = User(); user.");
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(&analyzed, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let offset = source.rfind("user.").unwrap() + "user.".len();
+    let items = typed_member_items_indexed(
+        &source,
+        offset,
+        state.effective_symbols().expect("symbols"),
+        &index,
+        &uri,
+    )
+    .expect("member access");
+    assert!(items
+        .iter()
+        .any(|item| item.label == "name" && item.kind == Some(CompletionItemKind::FIELD)));
+    assert!(items
+        .iter()
+        .any(|item| item.label == "label" && item.kind == Some(CompletionItemKind::METHOD)));
+    assert!(
+        !items.iter().any(|item| item.label == "create"),
+        "static methods do not belong on instances"
+    );
+}
+
+#[test]
+fn task25_static_member_completion_uses_impl_index() {
+    let declarations = r#"
+struct User { name: str = "Obi"; };
+impl User {
+    function label(self) -> str { return self.name; };
+    function create(name: str) -> User { return User(name: name); };
+};
+"#;
+    let source = format!("{declarations}\nfunction demo() -> void {{ User.");
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(declarations, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let offset = source.rfind("User.").unwrap() + "User.".len();
+    let items = typed_member_items_indexed(
+        &source,
+        offset,
+        state.effective_symbols().expect("symbols"),
+        &index,
+        &uri,
+    )
+    .expect("static member access");
+    assert!(items
+        .iter()
+        .any(|item| item.label == "create" && item.kind == Some(CompletionItemKind::METHOD)));
+    assert!(
+        !items.iter().any(|item| item.label == "label"),
+        "instance methods do not belong on the struct value"
+    );
+}
+
+#[test]
+fn task25_constructor_and_method_signature_help_use_workspace_index() {
+    let declarations = r#"
+struct User { name: str = "Obi"; age: int = 24; };
+impl User { function label(self, prefix: str, suffix: str) -> str { return prefix + self.name + suffix; }; };
+"#;
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(declarations, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+
+    let constructors = constructor_completion_items(
+        state.effective_symbols().expect("symbols"),
+        &index,
+        &uri,
+        true,
+    );
+    let user_constructor = constructors
+        .iter()
+        .find(|item| item.label == "User")
+        .expect("User constructor completion");
+    assert_eq!(user_constructor.kind, Some(CompletionItemKind::CONSTRUCTOR));
+    assert!(user_constructor
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("User(")));
+
+    let constructor_call = format!("{declarations}\nvar user: User = User(name: \"Ada\", ");
+    let help = signature_help_at(
+        &state,
+        &index,
+        &uri,
+        &constructor_call,
+        constructor_call.len(),
+    )
+    .expect("constructor signature help");
+    assert!(help.signatures[0].label.contains("User(name: str ="));
+    assert_eq!(help.active_parameter, Some(1));
+
+    let method_call = format!(
+        "{declarations}\nfunction demo() -> void {{ var user: User = User(); user.label(\"Ms \", "
+    );
+    let help = signature_help_at(&state, &index, &uri, &method_call, method_call.len())
+        .expect("method signature help");
+    assert!(help.signatures[0]
+        .label
+        .contains("label(prefix: str, suffix: str)"));
+    assert_eq!(help.active_parameter, Some(1));
+}
+
+#[test]
+fn task25_call_context_keeps_dotted_method_callee() {
+    let ctx = context_from_marked("user.label(|)");
+    let EditorContext::CallArguments { callee, .. } = ctx else {
+        panic!("expected call context");
+    };
+    assert_eq!(callee, "user.label");
+}
+
+#[test]
+fn task25_callable_values_get_positional_signature_help_without_named_completion() {
+    let source = r#"export var transform: fn(int) -> int = fn(value: int) -> int => value + 1;"#;
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let call = format!("{source}\ntransform(");
+    let help = signature_help_at(&state, &index, &uri, &call, call.len())
+        .expect("callable signature help");
+    assert!(help.signatures[0]
+        .label
+        .contains("transform(value: int) -> int"));
+    assert!(named_argument_completion_items(&state, &index, &uri, &call, call.len()).is_none());
+}
+
+#[test]
 fn editor_context_recovers_selective_imports_and_paths() {
     assert!(matches!(
         context_from_marked("import { rea| } from \"std/fs\";"),
-        EditorContext::SelectiveImport { type_only: false, .. }
+        EditorContext::SelectiveImport {
+            type_only: false,
+            ..
+        }
     ));
     assert!(matches!(
         context_from_marked("import type { Con| } from \"./types.spar\";"),
-        EditorContext::SelectiveImport { type_only: true, .. }
+        EditorContext::SelectiveImport {
+            type_only: true,
+            ..
+        }
     ));
     assert!(matches!(
         context_from_marked("import pkg { x } from \"std/f|\";"),
         EditorContext::ImportPath { package: true, .. }
     ));
-    assert!(matches!(context_from_marked("// import { | }"), EditorContext::Suppressed));
+    assert!(matches!(
+        context_from_marked("// import { | }"),
+        EditorContext::Suppressed
+    ));
 }
 
 #[test]
 fn editor_context_recovers_incomplete_call_arguments() {
     let context = context_from_marked("vidShrink(input: file, |");
-    let EditorContext::CallArguments { callee, supplied, active_parameter, .. } = context else {
+    let EditorContext::CallArguments {
+        callee,
+        supplied,
+        active_parameter,
+        ..
+    } = context
+    else {
         panic!("expected call context");
     };
     assert_eq!(callee, "vidShrink");
@@ -103,15 +375,20 @@ fn editor_context_recovers_incomplete_call_arguments() {
 fn import_completion_filters_type_only_private_and_duplicates() {
     let temp = tempfile::tempdir().unwrap();
     let module = temp.path().join("types.spar");
-    std::fs::write(&module, concat!(
-        "export type Config { name: str; };\n",
-        "export enum Mode { Fast, Safe };\n",
-        "function build(input: str) -> int { return 0; };\n",
-        "private function secret() -> int { return 0; };\n",
-    )).unwrap();
+    std::fs::write(
+        &module,
+        concat!(
+            "export type Config { name: str; };\n",
+            "export enum Mode { Fast, Safe };\n",
+            "function build(input: str) -> int { return 0; };\n",
+            "private function secret() -> int { return 0; };\n",
+        ),
+    )
+    .unwrap();
     let mut already = HashSet::new();
     already.insert("Mode".to_string());
-    let items = selective_import_completion_items(temp.path(), "types.spar", false, true, &already).unwrap();
+    let items = selective_import_completion_items(temp.path(), "types.spar", false, true, &already)
+        .unwrap();
     let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
     assert!(labels.contains(&"Config".to_string()));
     assert!(!labels.contains(&"Mode".to_string()));
@@ -136,14 +413,9 @@ fn selective_import_completion_exposes_only_target_owned_exports() {
     )
     .unwrap();
 
-    let items = selective_import_completion_items(
-        temp.path(),
-        "api.spar",
-        false,
-        false,
-        &HashSet::new(),
-    )
-    .unwrap();
+    let items =
+        selective_import_completion_items(temp.path(), "api.spar", false, false, &HashSet::new())
+            .unwrap();
     let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
     assert!(labels.contains(&"build".to_string()));
     assert!(
@@ -159,7 +431,11 @@ fn package_selective_import_completion_uses_lockfile_exports() {
     let package = temp.path().join("toolkit");
     std::fs::create_dir_all(package.join("src")).unwrap();
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::write(project.join(spar::package::PACKAGE_MANIFEST_FILE), "// fixture\n").unwrap();
+    std::fs::write(
+        project.join(spar::package::PACKAGE_MANIFEST_FILE),
+        "// fixture\n",
+    )
+    .unwrap();
     std::fs::write(
         package.join("src/lib.spar"),
         concat!(
@@ -172,7 +448,9 @@ fn package_selective_import_completion_uses_lockfile_exports() {
 
     let package_id = "path-toolkit".to_string();
     let mut lockfile = spar::package::Lockfile::default();
-    lockfile.root.insert("toolkit".to_string(), package_id.clone());
+    lockfile
+        .root
+        .insert("toolkit".to_string(), package_id.clone());
     lockfile.packages.insert(
         package_id,
         spar::package::LockedPackage {
@@ -190,15 +468,13 @@ fn package_selective_import_completion_uses_lockfile_exports() {
         .write_atomically(&project.join(spar::package::PACKAGE_LOCK_FILE))
         .unwrap();
 
-    let values = selective_import_completion_items(
-        &project,
-        "toolkit",
-        true,
-        false,
-        &HashSet::new(),
-    )
-    .unwrap();
-    let labels = values.into_iter().map(|item| item.label).collect::<Vec<_>>();
+    let values =
+        selective_import_completion_items(&project, "toolkit", true, false, &HashSet::new())
+            .unwrap();
+    let labels = values
+        .into_iter()
+        .map(|item| item.label)
+        .collect::<Vec<_>>();
     assert!(labels.contains(&"readText".to_string()));
     assert!(labels.contains(&"Options".to_string()));
     assert!(!labels.contains(&"secret".to_string()));
@@ -224,20 +500,23 @@ fn signature_help_tracks_required_and_default_parameters() {
     let state = SparLanguageServer::analyze(declaration, std::path::Path::new("/workspace"));
     let mut index = WorkspaceIndex::default();
     index.replace_document(&uri, &state);
-    let help = signature_help_at(&state, &index, &uri, source, source.len()).expect("signature help");
+    let help =
+        signature_help_at(&state, &index, &uri, source, source.len()).expect("signature help");
     assert!(help.signatures[0].label.contains("targetMb: float = 9.3"));
     assert_eq!(help.active_parameter, Some(1));
 }
 
 #[test]
 fn named_argument_completion_omits_supplied_and_sorts_required_first() {
-    let valid = "function deploy(input: str, output: str, mode: str = \"debug\") -> int { return 0; };\n";
+    let valid =
+        "function deploy(input: str, output: str, mode: str = \"debug\") -> int { return 0; };\n";
     let uri = Url::parse("file:///workspace/main.spar").unwrap();
     let state = SparLanguageServer::analyze(valid, std::path::Path::new("/workspace"));
     let mut index = WorkspaceIndex::default();
     index.replace_document(&uri, &state);
     let source = "deploy(input: \"x\", ";
-    let items = named_argument_completion_items(&state, &index, &uri, source, source.len()).unwrap();
+    let items =
+        named_argument_completion_items(&state, &index, &uri, source, source.len()).unwrap();
     assert_eq!(items[0].label, "output:");
     assert!(items.iter().any(|item| item.label == "mode:"));
     assert!(!items.iter().any(|item| item.label == "input:"));
@@ -253,11 +532,21 @@ fn document_symbol_response_has_hierarchy_and_flat_fallback() {
     let uri = Url::parse("file:///workspace/main.spar").unwrap();
     let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
     let nested = document_symbol_response(&uri, &state, true);
-    let DocumentSymbolResponse::Nested(symbols) = nested else { panic!("expected nested symbols"); };
-    assert!(symbols.iter().any(|symbol| symbol.name == "Config" && symbol.children.as_ref().is_some_and(|children| children.iter().any(|child| child.name == "name"))));
+    let DocumentSymbolResponse::Nested(symbols) = nested else {
+        panic!("expected nested symbols");
+    };
+    assert!(symbols.iter().any(|symbol| symbol.name == "Config"
+        && symbol
+            .children
+            .as_ref()
+            .is_some_and(|children| children.iter().any(|child| child.name == "name"))));
     let flat = document_symbol_response(&uri, &state, false);
-    let DocumentSymbolResponse::Flat(symbols) = flat else { panic!("expected flat symbols"); };
-    assert!(symbols.iter().any(|symbol| symbol.name == "input" && symbol.container_name.as_deref() == Some("build")));
+    let DocumentSymbolResponse::Flat(symbols) = flat else {
+        panic!("expected flat symbols");
+    };
+    assert!(symbols
+        .iter()
+        .any(|symbol| symbol.name == "input" && symbol.container_name.as_deref() == Some("build")));
 }
 
 #[test]
@@ -290,10 +579,18 @@ fn document_highlight_respects_local_shadowing() {
     let pos = byte_offset_to_lsp_position(source, call_offset);
     let target = semantic_target_at(&uri, &state, pos, &index).expect("semantic target");
     assert!(target.local_decl_byte.is_some());
-    let occurrences = semantic_occurrences_in_document(&uri, &state, &target);
-    assert_eq!(occurrences.len(), 2, "parameter declaration + its return use only");
-    assert!(occurrences.iter().any(|occurrence| occurrence.role == SemanticOccurrenceRole::Declaration));
-    assert!(occurrences.iter().any(|occurrence| occurrence.role == SemanticOccurrenceRole::Read));
+    let occurrences = semantic_occurrences_in_document(&uri, &state, &target, &index);
+    assert_eq!(
+        occurrences.len(),
+        2,
+        "parameter declaration + its return use only"
+    );
+    assert!(occurrences
+        .iter()
+        .any(|occurrence| occurrence.role == SemanticOccurrenceRole::Declaration));
+    assert!(occurrences
+        .iter()
+        .any(|occurrence| occurrence.role == SemanticOccurrenceRole::Read));
 }
 
 #[test]
@@ -302,7 +599,8 @@ fn document_highlight_tracks_selective_import_origin() {
     let lib = temp.path().join("lib.spar");
     let main = temp.path().join("main.spar");
     std::fs::write(&lib, "function build() -> int { return 1; };\n").unwrap();
-    let source = "import { build } from \"lib.spar\";\nfunction run() -> int { return build(); };\n";
+    let source =
+        "import { build } from \"lib.spar\";\nfunction run() -> int { return build(); };\n";
     std::fs::write(&main, source).unwrap();
     let state = SparLanguageServer::analyze_path(source, &main);
     let lib_source = std::fs::read_to_string(&lib).unwrap();
@@ -313,10 +611,19 @@ fn document_highlight_tracks_selective_import_origin() {
     index.replace_document(&uri, &state);
     index.replace_document(&lib_uri, &lib_state);
     let offset = source.rfind("build()").unwrap();
-    let target = semantic_target_at(&uri, &state, byte_offset_to_lsp_position(source, offset), &index).unwrap();
+    let target = semantic_target_at(
+        &uri,
+        &state,
+        byte_offset_to_lsp_position(source, offset),
+        &index,
+    )
+    .unwrap();
     assert_eq!(target.declaration.uri, lib_uri);
-    let occurrences = semantic_occurrences_in_document(&uri, &state, &target);
-    assert!(occurrences.len() >= 2, "import item and call should share identity");
+    let occurrences = semantic_occurrences_in_document(&uri, &state, &target, &index);
+    assert!(
+        occurrences.len() >= 2,
+        "import item and call should share identity"
+    );
 }
 
 #[test]
@@ -338,8 +645,12 @@ fn document_highlight_includes_native_shell_interpolation() {
         &index,
     )
     .expect("semantic target");
-    let occurrences = semantic_occurrences_in_document(&uri, &state, &target);
-    assert_eq!(occurrences.len(), 2, "parameter declaration + shell interpolation use");
+    let occurrences = semantic_occurrences_in_document(&uri, &state, &target, &index);
+    assert_eq!(
+        occurrences.len(),
+        2,
+        "parameter declaration + shell interpolation use"
+    );
 }
 
 #[test]
@@ -348,7 +659,8 @@ fn semantic_occurrences_follow_exported_symbol_across_files() {
     let lib = temp.path().join("lib.spar");
     let main = temp.path().join("main.spar");
     let lib_source = "function build() -> int { return 1; };\n";
-    let main_source = "import { build } from \"lib.spar\";\nfunction run() -> int { return build(); };\n";
+    let main_source =
+        "import { build } from \"lib.spar\";\nfunction run() -> int { return build(); };\n";
     std::fs::write(&lib, lib_source).unwrap();
     std::fs::write(&main, main_source).unwrap();
     let lib_uri = Url::from_file_path(&lib).unwrap();
@@ -368,8 +680,9 @@ fn semantic_occurrences_follow_exported_symbol_across_files() {
     )
     .expect("target");
     assert_eq!(target.declaration.uri, lib_uri);
-    let lib_occurrences = semantic_occurrences_in_document(&lib_uri, &lib_state, &target);
-    let main_occurrences = semantic_occurrences_in_document(&main_uri, &main_state, &target);
+    let lib_occurrences = semantic_occurrences_in_document(&lib_uri, &lib_state, &target, &index);
+    let main_occurrences =
+        semantic_occurrences_in_document(&main_uri, &main_state, &target, &index);
     assert_eq!(lib_occurrences.len(), 1, "declaration");
     assert_eq!(main_occurrences.len(), 2, "selective import + call");
 }
@@ -385,7 +698,10 @@ fn prepare_rename_rejects_bundled_stdlib_declaration() {
         definition_key: Location::new(uri, Range::default()),
         local_decl_byte: None,
     };
-    assert!(!declaration_is_editable(&target, Some(std::path::Path::new("/workspace"))));
+    assert!(!declaration_is_editable(
+        &target,
+        Some(std::path::Path::new("/workspace"))
+    ));
 }
 
 #[test]
@@ -403,7 +719,9 @@ fn rename_name_validation_tracks_symbol_kind() {
         exported: true,
         private: false,
         signature: None,
+        method_receiver: None,
         detail: None,
+        documentation: None,
     };
     assert!(is_valid_rename(Some(&symbol), "ServerConfig"));
     assert!(!is_valid_rename(Some(&symbol), "serverConfig"));
@@ -416,7 +734,11 @@ fn auto_import_candidate_and_new_import_edit_are_portable() {
     let main = temp.path().join("main.spar");
     let lib_source = "function writeText(path: str, content: str) -> int { return 0; };\n";
     std::fs::write(&lib, lib_source).unwrap();
-    std::fs::write(&main, "var result: int = writeText(path: \"x\", content: \"y\");\n").unwrap();
+    std::fs::write(
+        &main,
+        "var result: int = writeText(path: \"x\", content: \"y\");\n",
+    )
+    .unwrap();
     let lib_uri = Url::from_file_path(&lib).unwrap();
     let main_uri = Url::from_file_path(&main).unwrap();
     let lib_state = SparLanguageServer::analyze_path(lib_source, &lib);
@@ -428,7 +750,9 @@ fn auto_import_candidate_and_new_import_edit_are_portable() {
     let edit = build_import_workspace_edit("var x: int = 1;\n", &main_uri, &candidates[0]);
     let mut changes = edit.changes.unwrap();
     let edits = changes.remove(&main_uri).unwrap();
-    assert!(edits[0].new_text.contains("import { writeText } from \"./lib.spar\";"));
+    assert!(edits[0]
+        .new_text
+        .contains("import { writeText } from \"./lib.spar\";"));
 }
 
 #[test]
@@ -458,8 +782,16 @@ fn auto_import_candidate_maps_dependency_submodule_to_package_request() {
     let package = temp.path().join("toolkit");
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::create_dir_all(package.join("src")).unwrap();
-    std::fs::write(project.join(spar::package::PACKAGE_MANIFEST_FILE), "// fixture\n").unwrap();
-    std::fs::write(package.join("src/lib.spar"), "function root() -> int { return 0; };\n").unwrap();
+    std::fs::write(
+        project.join(spar::package::PACKAGE_MANIFEST_FILE),
+        "// fixture\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("src/lib.spar"),
+        "function root() -> int { return 0; };\n",
+    )
+    .unwrap();
     let module = package.join("src/io.spar");
     let module_source = "function writeText(path: str) -> int { return 0; };\n";
     std::fs::write(&module, module_source).unwrap();
@@ -468,7 +800,9 @@ fn auto_import_candidate_maps_dependency_submodule_to_package_request() {
 
     let package_id = "path-toolkit".to_string();
     let mut lockfile = spar::package::Lockfile::default();
-    lockfile.root.insert("toolkit".to_string(), package_id.clone());
+    lockfile
+        .root
+        .insert("toolkit".to_string(), package_id.clone());
     lockfile.packages.insert(
         package_id,
         spar::package::LockedPackage {
@@ -516,7 +850,6 @@ fn import_edit_merges_compatible_import_without_duplicate() {
     assert_eq!(edits[0].new_text, ", writeText");
 }
 
-
 #[test]
 fn auto_import_code_action_requires_matching_unresolved_diagnostic() {
     let temp = tempfile::tempdir().unwrap();
@@ -547,13 +880,7 @@ fn auto_import_code_action_requires_matching_unresolved_diagnostic() {
         message: "undefined function `writeText`".to_string(),
         ..Diagnostic::default()
     };
-    let actions = code_actions_for_unresolved(
-        &main_state,
-        &index,
-        &main_uri,
-        range,
-        &[diagnostic],
-    );
+    let actions = code_actions_for_unresolved(&main_state, &index, &main_uri, range, &[diagnostic]);
     assert_eq!(actions.len(), 1);
     let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
         panic!("expected direct CodeAction");
@@ -571,7 +898,10 @@ fn semantic_token_legend_keeps_existing_indices_and_appends_shell_types() {
     assert_eq!(TOKEN_TYPES[13], SemanticTokenType::new("shellBuiltin"));
     assert_eq!(TOKEN_TYPES[14], SemanticTokenType::new("shellArgument"));
     assert_eq!(TOKEN_TYPES[15], SemanticTokenType::new("shellFlag"));
-    assert_eq!(TOKEN_TYPES[19], SemanticTokenType::new("shellInterpolation"));
+    assert_eq!(
+        TOKEN_TYPES[19],
+        SemanticTokenType::new("shellInterpolation")
+    );
 }
 
 #[test]
@@ -590,18 +920,24 @@ fn command_resolution_is_non_executing_and_path_aware() {
     let resolver = CommandResolver::with_path(Some(path.as_os_str()));
     assert_eq!(resolver.resolve("cd"), CommandResolution::Builtin);
     assert_eq!(resolver.resolve("fake-tool"), CommandResolution::Resolved);
-    assert_eq!(resolver.resolve("missing-tool"), CommandResolution::Unresolved);
+    assert_eq!(
+        resolver.resolve("missing-tool"),
+        CommandResolution::Unresolved
+    );
 }
 
 #[test]
 fn shell_semantic_tokens_classify_command_flags_and_interpolation() {
-    let source = "function demo(input: str) -> shell { return shell { echo -n \"${input}\"; }; };\n";
+    let source =
+        "function demo(input: str) -> shell { return shell { echo -n \"${input}\"; }; };\n";
     let program = raw_program_for_source(source).expect("program");
     let mut raw = Vec::new();
     collect_tokens_from_program(&program, source, &mut raw);
     assert!(raw.iter().any(|token| token.token_type == TT_SHELL_BUILTIN));
     assert!(raw.iter().any(|token| token.token_type == TT_SHELL_FLAG));
-    assert!(raw.iter().any(|token| token.token_type == TT_SHELL_INTERPOLATION));
+    assert!(raw
+        .iter()
+        .any(|token| token.token_type == TT_SHELL_INTERPOLATION));
 }
 
 #[test]
@@ -621,7 +957,9 @@ fn signature_help_resolves_cross_file_function_group_member() {
     let call = "shared::Tools::run(input: \"x\", ";
     let uri = Url::from_file_path(&main).unwrap();
     let help = signature_help_at(&state, &index, &uri, call, call.len()).expect("signature help");
-    assert!(help.signatures[0].label.contains("run(input: str, mode: str ="));
+    assert!(help.signatures[0]
+        .label
+        .contains("run(input: str, mode: str ="));
     assert_eq!(help.active_parameter, Some(1));
 }
 
@@ -637,7 +975,8 @@ fn foreign_shell_does_not_emit_native_shell_semantic_classes() {
     let mut raw = Vec::new();
     collect_tokens_from_program(&program, source, &mut raw);
     assert!(
-        !raw.iter().any(|token| (TT_SHELL_COMMAND..=TT_SHELL_INTERPOLATION).contains(&token.token_type)),
+        !raw.iter()
+            .any(|token| (TT_SHELL_COMMAND..=TT_SHELL_INTERPOLATION).contains(&token.token_type)),
         "foreign-shell contents must be left to the editor's embedded grammar"
     );
 }
@@ -668,22 +1007,35 @@ fn advertised_capabilities_cover_portable_intelligence_core() {
 
 #[test]
 fn minimal_client_completion_is_plain_and_rich_client_gets_required_arg_snippet() {
-    let source = "function deploy(input: str, output: str, mode: str = \"debug\") -> int { return 0; };\n";
+    let source =
+        "function deploy(input: str, output: str, mode: str = \"debug\") -> int { return 0; };\n";
     let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
     let symbols = state.effective_symbols().expect("symbols");
 
     let plain = function_completion_items(&symbols.functions, false);
-    let plain_deploy = plain.iter().find(|item| item.label == "deploy").expect("deploy");
+    let plain_deploy = plain
+        .iter()
+        .find(|item| item.label == "deploy")
+        .expect("deploy");
     assert_eq!(plain_deploy.insert_text.as_deref(), Some("deploy"));
-    assert_eq!(plain_deploy.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
+    assert_eq!(
+        plain_deploy.insert_text_format,
+        Some(InsertTextFormat::PLAIN_TEXT)
+    );
 
     let snippets = function_completion_items(&symbols.functions, true);
-    let snippet = snippets.iter().find(|item| item.label == "deploy").expect("deploy");
+    let snippet = snippets
+        .iter()
+        .find(|item| item.label == "deploy")
+        .expect("deploy");
     assert_eq!(snippet.insert_text_format, Some(InsertTextFormat::SNIPPET));
     let inserted = snippet.insert_text.as_deref().expect("snippet text");
     assert!(inserted.contains("input: ${1}"));
     assert!(inserted.contains("output: ${2}"));
-    assert!(!inserted.contains("mode:"), "defaulted args stay opt-in through Ctrl+Space");
+    assert!(
+        !inserted.contains("mode:"),
+        "defaulted args stay opt-in through Ctrl+Space"
+    );
 }
 
 #[test]
@@ -718,7 +1070,10 @@ fn portable_payloads_have_no_editor_specific_commands_or_uris() {
     });
     let serialized = serde_json::to_string(&action).unwrap();
     assert!(!serialized.to_ascii_lowercase().contains("vscode"));
-    assert!(!serialized.contains("command"), "core auto-import uses direct WorkspaceEdit");
+    assert!(
+        !serialized.contains("command"),
+        "core auto-import uses direct WorkspaceEdit"
+    );
     assert!(serialized.contains("file:///workspace/main.spar"));
 }
 
@@ -743,6 +1098,18 @@ fn completion_resolve_respects_negotiated_properties() {
     assert!(rich.documentation.is_some());
 }
 
+fn utf16_column_to_byte(line: &str, column: u32) -> usize {
+    let target = column as usize;
+    let mut units = 0usize;
+    for (byte, character) in line.char_indices() {
+        if units >= target {
+            return byte;
+        }
+        units += character.len_utf16();
+    }
+    line.len()
+}
+
 fn rendered_tokens(source: &str) -> Vec<(String, u32, u32)> {
     let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
     let lines: Vec<&str> = source.split('\n').collect();
@@ -750,11 +1117,9 @@ fn rendered_tokens(source: &str) -> Vec<(String, u32, u32)> {
         .iter()
         .map(|token| {
             let line = lines[token.line as usize];
-            let text: String = line
-                .chars()
-                .skip(token.start_char as usize)
-                .take(token.length as usize)
-                .collect();
+            let start = utf16_column_to_byte(line, token.start_char);
+            let end = utf16_column_to_byte(line, token.start_char + token.length);
+            let text = line[start..end].to_string();
             (text, token.token_type, token.modifiers)
         })
         .collect()
@@ -786,7 +1151,10 @@ fn semantic_tokens_are_in_bounds_sorted_and_non_overlapping() {
                 "not strictly sorted: {prev:?} then {token:?}"
             );
             if prev.line == token.line {
-                assert!(token.start_char >= prev.start_char + prev.length, "overlap: {prev:?} {token:?}");
+                assert!(
+                    token.start_char >= prev.start_char + prev.length,
+                    "overlap: {prev:?} {token:?}"
+                );
             }
         }
         previous = Some(token);
@@ -798,13 +1166,19 @@ fn semantic_tokens_text_is_identifier_like_for_non_shell_types() {
     for (text, token_type, _) in rendered_tokens(TOKEN_FIXTURE) {
         let shell = matches!(
             token_type,
-            TT_SHELL_COMMAND | TT_SHELL_BUILTIN | TT_SHELL_ARGUMENT | TT_SHELL_FLAG
-                | TT_SHELL_OPERATOR | TT_SHELL_REDIRECT | TT_SHELL_ENVIRONMENT
+            TT_SHELL_COMMAND
+                | TT_SHELL_BUILTIN
+                | TT_SHELL_ARGUMENT
+                | TT_SHELL_FLAG
+                | TT_SHELL_OPERATOR
+                | TT_SHELL_REDIRECT
+                | TT_SHELL_ENVIRONMENT
                 | TT_SHELL_INTERPOLATION
         );
         if !shell {
             assert!(
-                text.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+                text.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
                 "non-identifier token text {text:?}"
             );
         }
@@ -814,7 +1188,10 @@ fn semantic_tokens_text_is_identifier_like_for_non_shell_types() {
 #[test]
 fn imported_names_produce_a_single_token_on_the_import_line() {
     let tokens = rendered_tokens(TOKEN_FIXTURE);
-    let write_text = tokens.iter().filter(|(text, _, _)| text == "writeText").count();
+    let write_text = tokens
+        .iter()
+        .filter(|(text, _, _)| text == "writeText")
+        .count();
     // one on the import line, one at the call site on line 4
     assert_eq!(write_text, 2);
 }
@@ -826,20 +1203,45 @@ fn broken_syntax_still_yields_keyword_tokens() {
     let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
     assert!(state.ast.is_none(), "fixture must fail to parse");
     let tokens = rendered_tokens(source);
-    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_DECLARATION_KEYWORD));
-    assert!(tokens.iter().any(|(text, ty, _)| text == "int" && *ty == TT_TYPE));
+    assert!(tokens
+        .iter()
+        .any(|(text, ty, _)| text == "var" && *ty == TT_DECLARATION_KEYWORD));
+    assert!(tokens
+        .iter()
+        .any(|(text, ty, _)| text == "int" && *ty == TT_TYPE));
 }
 
 #[test]
 fn encode_semantic_tokens_produces_lsp_relative_offsets() {
     let raw = vec![
-        RawToken { line: 0, start_char: 4, length: 3, token_type: TT_KEYWORD, modifiers: 0 },
-        RawToken { line: 0, start_char: 8, length: 2, token_type: TT_TYPE, modifiers: 0 },
-        RawToken { line: 2, start_char: 1, length: 5, token_type: TT_FUNCTION, modifiers: 1 },
+        RawToken {
+            line: 0,
+            start_char: 4,
+            length: 3,
+            token_type: TT_KEYWORD,
+            modifiers: 0,
+        },
+        RawToken {
+            line: 0,
+            start_char: 8,
+            length: 2,
+            token_type: TT_TYPE,
+            modifiers: 0,
+        },
+        RawToken {
+            line: 2,
+            start_char: 1,
+            length: 5,
+            token_type: TT_FUNCTION,
+            modifiers: 1,
+        },
     ];
     let encoded = encode_semantic_tokens(&raw);
     assert_eq!(
-        encoded.iter().map(|t| (t.delta_line, t.delta_start)).collect::<Vec<_>>(),
+        encoded
+            .iter()
+            .map(|t| (t.delta_line, t.delta_start))
+            .collect::<Vec<_>>(),
         vec![(0, 4), (0, 4), (2, 1)]
     );
 }
@@ -850,13 +1252,18 @@ fn keywords_and_types_inside_strings_and_comments_are_not_tokens() {
     for token in build_semantic_raw_tokens(&state) {
         // line index 4 is `var msg: str = "error and var inside string";`
         if token.line == 4 {
-            assert!(token.start_char < 16 || token.start_char >= 40, "token inside string: {token:?}");
+            assert!(
+                token.start_char < 16 || token.start_char >= 40,
+                "token inside string: {token:?}"
+            );
         }
         // line index 5 is the comment line
         assert_ne!(token.line, 5, "token inside comment: {token:?}");
     }
     let tokens = rendered_tokens(TOKEN_FIXTURE);
-    assert!(tokens.iter().any(|(text, ty, _)| text == "var" && *ty == TT_DECLARATION_KEYWORD));
+    assert!(tokens
+        .iter()
+        .any(|(text, ty, _)| text == "var" && *ty == TT_DECLARATION_KEYWORD));
 }
 
 #[test]
@@ -875,19 +1282,43 @@ fn builtin_types_and_functions_carry_default_library() {
         raw.iter()
             .filter(|t| t.line as usize == line)
             .filter(|t| {
-                let text: String = lines[line].chars().skip(t.start_char as usize).take(t.length as usize).collect();
+                let text: String = lines[line]
+                    .chars()
+                    .skip(t.start_char as usize)
+                    .take(t.length as usize)
+                    .collect();
                 text == name
             })
             .map(|t| (t.token_type, t.modifiers))
             .collect()
     };
-    assert!(find("int", 1).iter().any(|(ty, m)| *ty == TT_TYPE && m & MOD_DEFAULT_LIBRARY != 0),
-        "builtin type must be defaultLibrary: {:?}", find("int", 1));
-    assert!(find("int", 2).iter().any(|(ty, m)| *ty == TT_FUNCTION && m & MOD_DEFAULT_LIBRARY != 0),
-        "int(...) call must be defaultLibrary: {:?}", find("int", 2));
-    assert!(find("f", 3).iter().all(|(_, m)| m & MOD_DEFAULT_LIBRARY == 0), "user fn must not be defaultLibrary");
-    assert!(find("writeText", 4).iter().any(|(ty, m)| *ty == TT_FUNCTION && m & MOD_DEFAULT_LIBRARY != 0),
-        "std fn call must be defaultLibrary: {:?}", find("writeText", 4));
+    assert!(
+        find("int", 1)
+            .iter()
+            .any(|(ty, m)| *ty == TT_TYPE && m & MOD_DEFAULT_LIBRARY != 0),
+        "builtin type must be defaultLibrary: {:?}",
+        find("int", 1)
+    );
+    assert!(
+        find("int", 2)
+            .iter()
+            .any(|(ty, m)| *ty == TT_FUNCTION && m & MOD_DEFAULT_LIBRARY != 0),
+        "int(...) call must be defaultLibrary: {:?}",
+        find("int", 2)
+    );
+    assert!(
+        find("f", 3)
+            .iter()
+            .all(|(_, m)| m & MOD_DEFAULT_LIBRARY == 0),
+        "user fn must not be defaultLibrary"
+    );
+    assert!(
+        find("writeText", 4)
+            .iter()
+            .any(|(ty, m)| *ty == TT_FUNCTION && m & MOD_DEFAULT_LIBRARY != 0),
+        "std fn call must be defaultLibrary: {:?}",
+        find("writeText", 4)
+    );
 }
 
 #[test]
@@ -897,22 +1328,37 @@ fn generic_type_arguments_and_type_parameters_are_typed() {
         "var xs: List<Thing> = [];\n",
         "function identity<T>(value: T) -> T { return value; };\n",
     );
-    assert!(SparLanguageServer::analyze(source, std::path::Path::new(".")).ast.is_some(),
-        "fixture must parse");
+    assert!(
+        SparLanguageServer::analyze(source, std::path::Path::new("."))
+            .ast
+            .is_some(),
+        "fixture must parse"
+    );
     let tokens = rendered_tokens(source);
     // `Thing` appears as a declaration on line 1 and as a generic argument on line 2.
-    let thing_types = tokens.iter().filter(|(t, ty, _)| t == "Thing" && *ty == TT_TYPE).count();
+    let thing_types = tokens
+        .iter()
+        .filter(|(t, ty, _)| t == "Thing" && *ty == TT_TYPE)
+        .count();
     assert_eq!(thing_types, 2, "tokens: {tokens:?}");
     // `List` is a built-in generic.
-    assert!(tokens.iter().any(|(t, ty, m)| t == "List" && *ty == TT_TYPE && m & MOD_DEFAULT_LIBRARY != 0));
+    assert!(tokens
+        .iter()
+        .any(|(t, ty, m)| t == "List" && *ty == TT_TYPE && m & MOD_DEFAULT_LIBRARY != 0));
     // Type parameter: declaration + parameter type + return type.
-    let tp = tokens.iter().filter(|(t, ty, _)| t == "T" && *ty == TT_TYPE_PARAMETER).count();
+    let tp = tokens
+        .iter()
+        .filter(|(t, ty, _)| t == "T" && *ty == TT_TYPE_PARAMETER)
+        .count();
     assert!(tp >= 3, "expected T tokens, got {tokens:?}");
 }
 
 #[test]
 fn legend_appends_type_parameter_without_reordering() {
-    assert_eq!(TOKEN_TYPES[19], SemanticTokenType::new("shellInterpolation"));
+    assert_eq!(
+        TOKEN_TYPES[19],
+        SemanticTokenType::new("shellInterpolation")
+    );
     assert_eq!(TOKEN_TYPES[20], SemanticTokenType::TYPE_PARAMETER);
     assert_eq!(TT_TYPE_PARAMETER, 20);
 }
@@ -934,9 +1380,15 @@ fn local_names_include_params_locals_and_loop_bindings_in_scope() {
         "    return 0;\n",
         "};\n",
     ));
-    let names: Vec<String> = local_names_at(&source, offset).into_iter().map(|n| n.name).collect();
+    let names: Vec<String> = local_names_at(&source, offset)
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
     for expected in ["p", "q", "loc", "item", "inner"] {
-        assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected}: {names:?}"
+        );
     }
 }
 
@@ -946,7 +1398,10 @@ fn local_names_exclude_names_from_closed_blocks_and_other_functions() {
         "function a(x: int) -> int { var hidden: int = 1; return x; };\n",
         "function b(y: int) -> int { return |; };\n",
     ));
-    let names: Vec<String> = local_names_at(&source, offset).into_iter().map(|n| n.name).collect();
+    let names: Vec<String> = local_names_at(&source, offset)
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
     assert!(names.contains(&"y".to_string()));
     assert!(!names.contains(&"x".to_string()), "{names:?}");
     assert!(!names.contains(&"hidden".to_string()), "{names:?}");
@@ -954,13 +1409,25 @@ fn local_names_exclude_names_from_closed_blocks_and_other_functions() {
 
 #[test]
 fn scope_items_are_ranked_before_file_level_and_keywords() {
-    let names = vec![ScopeName::new("loc", ScopeNameKind::Variable, Some("int".into()))];
+    let names = vec![ScopeName::new(
+        "loc",
+        ScopeNameKind::Variable,
+        Some("int".into()),
+    )];
     let items = scope_completion_items(&names);
     assert_eq!(items[0].label, "loc");
     assert_eq!(items[0].sort_text.as_deref(), Some("0_loc"));
     assert_eq!(items[0].detail.as_deref(), Some("int"));
     assert_eq!(
-        with_tier(CompletionItem { label: "if".into(), ..Default::default() }, 9).sort_text.as_deref(),
+        with_tier(
+            CompletionItem {
+                label: "if".into(),
+                ..Default::default()
+            },
+            9
+        )
+        .sort_text
+        .as_deref(),
         Some("9_if")
     );
 }
@@ -968,10 +1435,17 @@ fn scope_items_are_ranked_before_file_level_and_keywords() {
 #[test]
 fn call_context_reports_value_position_after_param_colon() {
     let ctx = context_from_marked("f(a: |)");
-    let EditorContext::CallArguments { value_of, .. } = ctx else { panic!("expected call context") };
+    let EditorContext::CallArguments { value_of, .. } = ctx else {
+        panic!("expected call context")
+    };
     assert_eq!(value_of.as_deref(), Some("a"));
     let ctx = context_from_marked("f(a: 1, |)");
-    let EditorContext::CallArguments { value_of, supplied, .. } = ctx else { panic!("expected call context") };
+    let EditorContext::CallArguments {
+        value_of, supplied, ..
+    } = ctx
+    else {
+        panic!("expected call context")
+    };
     assert_eq!(value_of, None);
     assert_eq!(supplied, vec!["a".to_string()]);
 }
@@ -981,20 +1455,42 @@ fn named_argument_items_follow_declared_parameter_order() {
     let signature = CallableSignature {
         name: "writeText".into(),
         params: vec![
-            CallableParam { name: "path".into(), ty: "str".into(), has_default: false, default_repr: None },
-            CallableParam { name: "content".into(), ty: "str".into(), has_default: false, default_repr: None },
-            CallableParam { name: "mode".into(), ty: "str".into(), has_default: true, default_repr: Some("\"w\"".into()) },
+            CallableParam {
+                name: "path".into(),
+                ty: "str".into(),
+                has_default: false,
+                default_repr: None,
+            },
+            CallableParam {
+                name: "content".into(),
+                ty: "str".into(),
+                has_default: false,
+                default_repr: None,
+            },
+            CallableParam {
+                name: "mode".into(),
+                ty: "str".into(),
+                has_default: true,
+                default_repr: Some("\"w\"".into()),
+            },
         ],
         return_type: "void".into(),
         is_async: false,
         origin: None,
+        argument_style: CallableArgumentStyle::Named,
     };
     let mut items = named_parameter_items(&signature, &[]);
     items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
-    assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["path:", "content:", "mode:"]);
+    assert_eq!(
+        items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+        vec!["path:", "content:", "mode:"]
+    );
     let mut items = named_parameter_items(&signature, &["path".to_string()]);
     items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
-    assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["content:", "mode:"]);
+    assert_eq!(
+        items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+        vec!["content:", "mode:"]
+    );
 }
 
 #[test]
@@ -1011,13 +1507,23 @@ fn value_items_prefer_locals_matching_the_parameter_type() {
 #[test]
 fn selective_import_context_reports_close_brace_when_from_is_missing() {
     let ctx = context_from_marked("import pkg { | };\n");
-    let EditorContext::SelectiveImport { path, close_at, package, .. } = ctx else { panic!("expected import") };
+    let EditorContext::SelectiveImport {
+        path,
+        close_at,
+        package,
+        ..
+    } = ctx
+    else {
+        panic!("expected import")
+    };
     assert!(package);
     assert_eq!(path, None);
     // Marker removed leaves `import pkg {  };`, so `}` is at byte 14.
     assert_eq!(close_at, Some("import pkg {  ".len()));
     let ctx = context_from_marked("import pkg { | ");
-    let EditorContext::SelectiveImport { close_at, .. } = ctx else { panic!("expected import") };
+    let EditorContext::SelectiveImport { close_at, .. } = ctx else {
+        panic!("expected import")
+    };
     assert_eq!(close_at, None);
 }
 
@@ -1027,11 +1533,23 @@ fn export_discovery_offers_std_exports_with_from_clause_edit() {
     let cursor = "import pkg { ".len();
     let close = source.find('}').unwrap();
     let items = import_export_discovery_items(
-        std::path::Path::new("."), true, false, &HashSet::new(), source, cursor, Some(close),
+        std::path::Path::new("."),
+        true,
+        false,
+        &HashSet::new(),
+        source,
+        cursor,
+        Some(close),
     );
-    let write_text = items.iter().find(|i| i.label == "writeText").expect("writeText from std/fs");
+    let write_text = items
+        .iter()
+        .find(|i| i.label == "writeText")
+        .expect("writeText from std/fs");
     assert_eq!(write_text.detail.as_deref(), Some("std/fs"));
-    let edits = write_text.additional_text_edits.as_ref().expect("from clause edit");
+    let edits = write_text
+        .additional_text_edits
+        .as_ref()
+        .expect("from clause edit");
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].new_text, " from \"std/fs\"");
     // the edit is inserted immediately after the `}` (offset close + 1) on line 0
@@ -1042,10 +1560,22 @@ fn export_discovery_offers_std_exports_with_from_clause_edit() {
 fn export_discovery_completes_whole_statement_when_brace_missing() {
     let source = "import pkg { ";
     let items = import_export_discovery_items(
-        std::path::Path::new("."), true, false, &HashSet::new(), source, source.len(), None,
+        std::path::Path::new("."),
+        true,
+        false,
+        &HashSet::new(),
+        source,
+        source.len(),
+        None,
     );
-    let write_text = items.iter().find(|i| i.label == "writeText").expect("writeText");
-    assert_eq!(write_text.insert_text.as_deref(), Some("writeText } from \"std/fs\";"));
+    let write_text = items
+        .iter()
+        .find(|i| i.label == "writeText")
+        .expect("writeText");
+    assert_eq!(
+        write_text.insert_text.as_deref(),
+        Some("writeText } from \"std/fs\";")
+    );
     assert!(write_text.additional_text_edits.is_none());
 }
 
@@ -1054,24 +1584,50 @@ fn export_discovery_skips_names_already_listed_and_non_package_imports() {
     let mut already = HashSet::new();
     already.insert("writeText".to_string());
     let items = import_export_discovery_items(
-        std::path::Path::new("."), true, false, &already, "import pkg { writeText, ", 24, None,
+        std::path::Path::new("."),
+        true,
+        false,
+        &already,
+        "import pkg { writeText, ",
+        24,
+        None,
     );
     assert!(!items.iter().any(|i| i.label == "writeText"));
     assert!(import_export_discovery_items(
-        std::path::Path::new("."), false, false, &HashSet::new(), "import { ", 9, None,
-    ).is_empty());
+        std::path::Path::new("."),
+        false,
+        false,
+        &HashSet::new(),
+        "import { ",
+        9,
+        None,
+    )
+    .is_empty());
 }
 
 #[test]
 fn advertised_capabilities_use_wide_trigger_characters_and_v2_tag() {
     let caps = advertised_server_capabilities();
-    let triggers = caps.completion_provider.unwrap().trigger_characters.unwrap();
+    let triggers = caps
+        .completion_provider
+        .unwrap()
+        .trigger_characters
+        .unwrap();
     for expected in [":", "{", ".", "(", ",", "\"", "/"] {
-        assert!(triggers.contains(&expected.to_string()), "missing trigger {expected:?}");
+        assert!(
+            triggers.contains(&expected.to_string()),
+            "missing trigger {expected:?}"
+        );
     }
-    assert!(!triggers.contains(&" ".to_string()), "space trigger would fire after every space");
+    assert!(
+        !triggers.contains(&" ".to_string()),
+        "space trigger would fire after every space"
+    );
     let signature = caps.signature_help_provider.unwrap();
-    assert!(signature.trigger_characters.unwrap().contains(&":".to_string()));
+    assert!(signature
+        .trigger_characters
+        .unwrap()
+        .contains(&":".to_string()));
     assert_eq!(FOUNDATION_BUILD_TAG, "intelligence-core-v2");
 }
 
@@ -1079,7 +1635,10 @@ fn advertised_capabilities_use_wide_trigger_characters_and_v2_tag() {
 fn stdio_flag_may_repeat_because_clients_append_their_own() {
     // vscode-languageclient appends `--stdio` for TransportKind.stdio even when
     // the launch args already contain it.
-    assert_eq!(startup_mode_from_args(["--stdio", "--stdio"]), Ok(StartupMode::Serve));
+    assert_eq!(
+        startup_mode_from_args(["--stdio", "--stdio"]),
+        Ok(StartupMode::Serve)
+    );
     assert_eq!(startup_mode_from_args(["--stdio"]), Ok(StartupMode::Serve));
     assert_eq!(
         startup_mode_from_args(["--stdio", "--clientProcessId=1234"]),
@@ -1097,19 +1656,35 @@ fn declaration_and_control_keywords_are_different_token_types() {
         "type Thing { n: int; };\n",
     );
     let tokens = rendered_tokens(source);
-    let ty = |word: &str| tokens.iter().find(|(text, _, _)| text == word).map(|(_, ty, _)| *ty);
+    let ty = |word: &str| {
+        tokens
+            .iter()
+            .find(|(text, _, _)| text == word)
+            .map(|(_, ty, _)| *ty)
+    };
     for word in ["export", "var", "function", "type"] {
-        assert_eq!(ty(word), Some(TT_DECLARATION_KEYWORD), "{word} should be a declaration keyword");
+        assert_eq!(
+            ty(word),
+            Some(TT_DECLARATION_KEYWORD),
+            "{word} should be a declaration keyword"
+        );
     }
     for word in ["if", "return"] {
-        assert_eq!(ty(word), Some(TT_KEYWORD), "{word} should be a control keyword");
+        assert_eq!(
+            ty(word),
+            Some(TT_KEYWORD),
+            "{word} should be a control keyword"
+        );
     }
 }
 
 #[test]
 fn legend_appends_declaration_keyword() {
     assert_eq!(TOKEN_TYPES[20], SemanticTokenType::TYPE_PARAMETER);
-    assert_eq!(TOKEN_TYPES[21], SemanticTokenType::new("declarationKeyword"));
+    assert_eq!(
+        TOKEN_TYPES[21],
+        SemanticTokenType::new("declarationKeyword")
+    );
     assert_eq!(TT_DECLARATION_KEYWORD, 21);
 }
 
@@ -1199,14 +1774,26 @@ fn imported_shell_functions_do_not_leak_tokens_onto_the_import_line() {
 
     for (line, text, token_type, _) in &tokens {
         if *line <= 4 {
-            assert!(!is_shell_semantic_type(*token_type), "shell token {text:?} leaked onto import line {line}");
+            assert!(
+                !is_shell_semantic_type(*token_type),
+                "shell token {text:?} leaked onto import line {line}"
+            );
         }
     }
-    let kind = |line: u32, name: &str| tokens.iter().find(|t| t.0 == line && t.1 == name).map(|t| t.2);
+    let kind = |line: u32, name: &str| {
+        tokens
+            .iter()
+            .find(|t| t.0 == line && t.1 == name)
+            .map(|t| t.2)
+    };
     assert_eq!(kind(1, "build"), Some(TT_FUNCTION));
     assert_eq!(kind(2, "other"), Some(TT_FUNCTION));
     assert_eq!(kind(4, "Widget"), Some(TT_TYPE));
-    assert_eq!(kind(5, "other"), Some(TT_FUNCTION), "the call site still resolves");
+    assert_eq!(
+        kind(5, "other"),
+        Some(TT_FUNCTION),
+        "the call site still resolves"
+    );
 }
 
 const HUMAN_SOURCE: &str = concat!(
@@ -1239,7 +1826,11 @@ fn definition_of_a_loop_variable_finds_the_loop_binding_not_the_global() {
     let use_site = position_of(HUMAN_SOURCE, "person.name", 1);
     let location = definition_at(&uri, &state, use_site).expect("definition");
     // line index 9 is `    for person in people {`; the global `var person` is line 7
-    assert_eq!(location.range.start.line, 9, "jumped to {:?}", location.range);
+    assert_eq!(
+        location.range.start.line, 9,
+        "jumped to {:?}",
+        location.range
+    );
 }
 
 #[test]
@@ -1248,7 +1839,11 @@ fn definition_of_a_parameter_finds_the_parameter() {
     let state = SparLanguageServer::analyze(HUMAN_SOURCE, std::path::Path::new("/workspace"));
     let use_site = position_of(HUMAN_SOURCE, "in people {", 4);
     let location = definition_at(&uri, &state, use_site).expect("definition");
-    assert_eq!(location.range.start.line, 8, "the parameter is declared on line 8: {:?}", location.range);
+    assert_eq!(
+        location.range.start.line, 8,
+        "the parameter is declared on line 8: {:?}",
+        location.range
+    );
 }
 
 fn human_symbols() -> SymbolTable {
@@ -1265,32 +1860,66 @@ fn member_labels(source_with_marker: &str) -> Option<Vec<String>> {
 #[test]
 fn member_completion_after_a_loop_variable_inside_call_arguments() {
     // The screenshot case: `person` is a `for` binding over List<Human>.
-    let source = HUMAN_SOURCE.replace("println(message: person.name);", "println(message: person.|);");
-    assert_eq!(member_labels(&source), Some(vec!["name".to_string(), "age".to_string()]));
+    let source = HUMAN_SOURCE.replace(
+        "println(message: person.name);",
+        "println(message: person.|);",
+    );
+    assert_eq!(
+        member_labels(&source),
+        Some(vec!["name".to_string(), "age".to_string()])
+    );
 }
 
 #[test]
 fn member_completion_filters_nothing_for_a_partial_member_name() {
-    let source = HUMAN_SOURCE.replace("println(message: person.name);", "println(message: person.na|);");
-    assert_eq!(member_labels(&source), Some(vec!["name".to_string(), "age".to_string()]));
+    let source = HUMAN_SOURCE.replace(
+        "println(message: person.name);",
+        "println(message: person.na|);",
+    );
+    assert_eq!(
+        member_labels(&source),
+        Some(vec!["name".to_string(), "age".to_string()])
+    );
 }
 
 #[test]
 fn member_completion_through_parameters_locals_and_index_chains() {
-    let params = HUMAN_SOURCE.replace("return 6;", "var h: Human = person;\n        var s: str = h.|;\n        return 6;");
-    assert_eq!(member_labels(&params), Some(vec!["name".to_string(), "age".to_string()]));
+    let params = HUMAN_SOURCE.replace(
+        "return 6;",
+        "var h: Human = person;\n        var s: str = h.|;\n        return 6;",
+    );
+    assert_eq!(
+        member_labels(&params),
+        Some(vec!["name".to_string(), "age".to_string()])
+    );
 
-    let inferred = HUMAN_SOURCE.replace("return 6;", "var g = people[0];\n        var s: str = g.|;\n        return 6;");
-    assert_eq!(member_labels(&inferred), Some(vec!["name".to_string(), "age".to_string()]));
+    let inferred = HUMAN_SOURCE.replace(
+        "return 6;",
+        "var g = people[0];\n        var s: str = g.|;\n        return 6;",
+    );
+    assert_eq!(
+        member_labels(&inferred),
+        Some(vec!["name".to_string(), "age".to_string()])
+    );
 
-    let indexed = HUMAN_SOURCE.replace("return 0;\n};", "var x: str = people[0].|;\n    return 0;\n};");
-    assert_eq!(member_labels(&indexed), Some(vec!["name".to_string(), "age".to_string()]));
+    let indexed = HUMAN_SOURCE.replace(
+        "return 0;\n};",
+        "var x: str = people[0].|;\n    return 0;\n};",
+    );
+    assert_eq!(
+        member_labels(&indexed),
+        Some(vec!["name".to_string(), "age".to_string()])
+    );
 }
 
 #[test]
 fn member_completion_on_a_list_offers_no_fields() {
     let source = HUMAN_SOURCE.replace("return 0;\n};", "var x: int = people.|;\n    return 0;\n};");
-    assert_eq!(member_labels(&source), Some(Vec::new()));
+    // A list has no fields (the element's fields are not its own), but it does
+    // have the built-in list methods.
+    let labels = member_labels(&source).expect("member access");
+    assert!(labels.contains(&"length".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"name".to_string()), "{labels:?}");
 }
 
 #[test]
@@ -1306,12 +1935,22 @@ fn one_broken_statement_does_not_recolor_the_rest_of_the_file() {
     // While typing `person.` the file does not parse. Everything outside that one
     // statement must keep its full semantic tokens (this is what caused the
     // whole-file color flip while typing).
-    let broken = HUMAN_SOURCE.replace("println(message: person.name);", "println(message: person.);");
+    let broken = HUMAN_SOURCE.replace(
+        "println(message: person.name);",
+        "println(message: person.);",
+    );
     let state = SparLanguageServer::analyze(&broken, std::path::Path::new("."));
     assert!(state.ast.is_none(), "fixture must not parse");
     let tokens = rendered_tokens(&broken);
-    let has = |text: &str, ty: u32| tokens.iter().any(|(t, token_type, _)| t == text && *token_type == ty);
-    assert!(has("looper", TT_FUNCTION), "function declaration lost: {tokens:?}");
+    let has = |text: &str, ty: u32| {
+        tokens
+            .iter()
+            .any(|(t, token_type, _)| t == text && *token_type == ty)
+    };
+    assert!(
+        has("looper", TT_FUNCTION),
+        "function declaration lost: {tokens:?}"
+    );
     assert!(has("people", TT_PARAMETER), "parameter lost");
     assert!(has("Human", TT_TYPE), "type reference lost");
     assert!(has("name", TT_PROPERTY), "type field lost");
@@ -1321,25 +1960,37 @@ fn one_broken_statement_does_not_recolor_the_rest_of_the_file() {
 #[test]
 fn several_broken_statements_still_leave_the_healthy_ones_colored() {
     let broken = HUMAN_SOURCE
-        .replace("println(message: person.name);", "println(message: person.);")
+        .replace(
+            "println(message: person.name);",
+            "println(message: person.);",
+        )
         .replace("var person: Human = people[0];", "var person: Human = ;");
     let tokens = rendered_tokens(&broken);
-    assert!(tokens.iter().any(|(t, ty, _)| t == "looper" && *ty == TT_FUNCTION), "{tokens:?}");
-    assert!(tokens.iter().any(|(t, ty, _)| t == "Human" && *ty == TT_TYPE));
+    assert!(
+        tokens
+            .iter()
+            .any(|(t, ty, _)| t == "looper" && *ty == TT_FUNCTION),
+        "{tokens:?}"
+    );
+    assert!(tokens
+        .iter()
+        .any(|(t, ty, _)| t == "Human" && *ty == TT_TYPE));
 }
 
 #[test]
 fn references_to_a_type_include_uses_inside_type_annotations() {
     let uri = Url::parse("file:///workspace/main.spar").unwrap();
     let state = SparLanguageServer::analyze(HUMAN_SOURCE, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
     let target = semantic_target_at(
         &uri,
         &state,
         position_of(HUMAN_SOURCE, "type Human", 6),
-        &WorkspaceIndex::default(),
+        &index,
     )
     .expect("target");
-    let occurrences = semantic_occurrences_in_document(&uri, &state, &target);
+    let occurrences = semantic_occurrences_in_document(&uri, &state, &target, &index);
     // declaration + `List<Human>` (global) + `List<Human>` (parameter) + `var person: Human`
     assert_eq!(occurrences.len(), 4, "{occurrences:?}");
 }
@@ -1380,7 +2031,8 @@ fn removed_task_bracket_syntax_reports_the_migration_hint_and_offers_a_quick_fix
 #[test]
 fn removed_shell_field_reports_the_migration_hint() {
     let source = "task B { shell: [\"sh\"]; run { true; }; };\n";
-    let state = SparLanguageServer::analyze_path(source, std::path::Path::new("/tmp/spar-ls-shell.spar"));
+    let state =
+        SparLanguageServer::analyze_path(source, std::path::Path::new("/tmp/spar-ls-shell.spar"));
     assert!(
         state
             .diagnostics()
@@ -1393,7 +2045,10 @@ fn removed_shell_field_reports_the_migration_hint() {
 
 fn local_name_list(marked_source: &str) -> Vec<String> {
     let (source, offset) = marked(marked_source);
-    local_names_at(&source, offset).into_iter().map(|n| n.name).collect()
+    local_names_at(&source, offset)
+        .into_iter()
+        .map(|n| n.name)
+        .collect()
 }
 
 #[test]
@@ -1406,7 +2061,10 @@ fn locals_are_found_while_typing_inside_a_string_interpolation() {
         "};\n",
     ));
     for expected in ["p", "local"] {
-        assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected}: {names:?}"
+        );
     }
 }
 
@@ -1426,11 +2084,20 @@ fn locals_are_found_inside_an_unfinished_native_run_body() {
 #[test]
 fn completion_is_offered_inside_string_interpolation_but_not_plain_strings() {
     let (source, offset) = marked("var a: str = \"hi ${|\";\n");
-    assert!(!matches!(editor_context(&source, None, offset), EditorContext::Suppressed));
+    assert!(!matches!(
+        editor_context(&source, None, offset),
+        EditorContext::Suppressed
+    ));
     let (source, offset) = marked("var a: str = \"hi |\";\n");
-    assert!(matches!(editor_context(&source, None, offset), EditorContext::Suppressed));
+    assert!(matches!(
+        editor_context(&source, None, offset),
+        EditorContext::Suppressed
+    ));
     let (source, offset) = marked("var a: str = \"${b} and |\";\n");
-    assert!(matches!(editor_context(&source, None, offset), EditorContext::Suppressed));
+    assert!(matches!(
+        editor_context(&source, None, offset),
+        EditorContext::Suppressed
+    ));
 }
 
 #[test]
@@ -1453,4 +2120,465 @@ fn a_native_shell_lex_error_is_reported_on_its_real_line() {
         .find(|d| d.message.contains("unexpected character"))
         .expect("lex diagnostic");
     assert_eq!(diagnostic.range.start.line, 5, "{diagnostic:?}");
+}
+
+#[test]
+fn task26_method_definition_hover_and_occurrences_use_owner_identity() {
+    let source = r#"
+struct User { name: str = "Obi"; };
+impl User {
+    function label(self, prefix: str) -> str { return prefix + self.name; };
+};
+struct Team { name: str = "Core"; };
+impl Team {
+    function label(self, prefix: str) -> str { return prefix + self.name; };
+};
+function demo() -> str {
+    var user: User = User();
+    var team: Team = Team();
+    var first: str = user.label("Ms ");
+    var second: str = team.label("Team ");
+    return first + second;
+};
+"#;
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+
+    let call_byte = source.find("user.label").unwrap() + "user.".len();
+    let pos = byte_offset_to_lsp_position(source, call_byte);
+    let symbol = method_symbol_at_position(&uri, &state, pos, &index).expect("method symbol");
+    assert_eq!(symbol.semantic_path, "User::label");
+
+    let definition = indexed_definition_at(&uri, &state, pos, &index).expect("method definition");
+    assert_eq!(definition.uri, uri);
+    assert_eq!(definition.range, symbol.selection_range);
+
+    let hover = indexed_method_hover_at(&uri, &state, pos, &index).expect("method hover");
+    assert!(hover.contains("User::label"));
+    assert!(hover.contains("label(prefix: str) -> str"));
+
+    let target = semantic_target_at(&uri, &state, pos, &index).expect("semantic target");
+    let occurrences = semantic_occurrences_in_document(&uri, &state, &target, &index);
+    assert_eq!(
+        occurrences.len(),
+        2,
+        "User::label declaration + user.label call only; Team::label must stay separate"
+    );
+    assert!(is_valid_rename(Some(symbol), "displayLabel"));
+}
+
+#[test]
+fn task26_closure_parameter_definition_references_rename_and_hover_are_local() {
+    let source = "var transform: fn(int) -> int = fn(value: int) -> int => value + 1;\n";
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+
+    let use_byte = source.rfind("value + 1").unwrap();
+    let pos = byte_offset_to_lsp_position(source, use_byte);
+    let definition =
+        indexed_definition_at(&uri, &state, pos, &index).expect("closure parameter definition");
+    let decl_byte = source.find("value: int").unwrap();
+    assert_eq!(
+        definition.range.start,
+        byte_offset_to_lsp_position(source, decl_byte)
+    );
+
+    let target = semantic_target_at(&uri, &state, pos, &index).expect("closure target");
+    assert!(target.local_decl_byte.is_some());
+    let occurrences = semantic_occurrences_in_document(&uri, &state, &target, &index);
+    assert_eq!(
+        occurrences.len(),
+        2,
+        "closure parameter declaration + body use"
+    );
+
+    let hover = local_binding_hover_at(&state, pos).expect("closure binding hover");
+    assert!(hover.contains("(local binding) value: int"));
+    assert!(is_valid_rename(None, "item"));
+}
+
+#[test]
+fn task27_structured_pipe_completion_filters_by_piped_input_type() {
+    let marked = r#"
+struct User { name: str = "Obi"; };
+function keepUsers(values: List<User>) -> List<User> { return values; };
+function takeUsers(values: List<User>, limit: int) -> List<User> { return values; };
+function takeInts(values: List<int>, limit: int) -> List<int> { return values; };
+var users: List<User> = [];
+var result: List<User> = users |> keepUsers() |> ta<CURSOR>
+"#;
+    let offset = marked.find("<CURSOR>").unwrap();
+    let source = marked.replace("<CURSOR>", "");
+    let state = SparLanguageServer::analyze(&source, std::path::Path::new("/workspace"));
+    let symbols = state
+        .effective_symbols()
+        .expect("symbols survive incomplete pipe stage");
+    let items = structured_pipe_completion_items(&source, offset, symbols, true)
+        .expect("structured pipe completion context");
+    let labels = items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"takeUsers"), "{labels:?}");
+    assert!(!labels.contains(&"takeInts"), "{labels:?}");
+    let users = items.iter().find(|item| item.label == "takeUsers").unwrap();
+    assert_eq!(users.insert_text.as_deref(), Some("takeUsers(${1:limit})"));
+    assert!(users
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .contains("List<User>"));
+}
+
+#[test]
+fn task27_structured_pipe_type_errors_are_tagged_as_lsp_pipeline_diagnostics() {
+    let source = r#"
+function onlyInts(values: List<int>) -> int { return 1; };
+var names: List<str> = [];
+var count: int = names |> onlyInts();
+"#;
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let diagnostic = state
+        .diagnostics()
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("structured pipe"))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing structured-pipe diagnostic: {:?}",
+                state.diagnostics()
+            )
+        });
+    assert_eq!(
+        diagnostic.code,
+        Some(NumberOrString::String("structured-pipe".to_string()))
+    );
+    assert!(
+        diagnostic.message.contains("List<str>"),
+        "{}",
+        diagnostic.message
+    );
+    assert!(
+        diagnostic.message.contains("List<int>"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn task27_structured_pipe_operator_and_stage_receive_semantic_tokens() {
+    let source = r#"
+function countInts(values: List<int>) -> int { return 1; };
+var values: List<int> = [];
+var count: int = values |> countInts();
+"#;
+    let tokens = rendered_tokens(source);
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, token_type, _)| text == "|>" && *token_type == TT_STRUCTURED_PIPE),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, token_type, _)| text == "countInts" && *token_type == TT_FUNCTION),
+        "{tokens:?}"
+    );
+    assert_eq!(
+        TOKEN_TYPES[TT_STRUCTURED_PIPE as usize],
+        SemanticTokenType::new("structuredPipe")
+    );
+}
+
+#[test]
+fn mixed_pipeline_semantic_tokens_cover_bridges_codecs_and_structured_stage() {
+    let source = r#"
+import pkg { where } from "std/data";
+function demo() -> shell {
+    return shell {
+        printf 'name,age\nObi,24\n'
+            | from csv
+            |> where(fn(row) => row.age > 20)
+            |> to json;
+    };
+};
+"#;
+    let tokens = rendered_tokens(source);
+
+    assert!(
+        tokens
+            .iter()
+            .filter(|(text, ty, _)| text == "from" && *ty == TT_KEYWORD)
+            .count()
+            == 1
+            && tokens
+                .iter()
+                .any(|(text, ty, _)| text == "from" && *ty == TT_DECLARATION_KEYWORD),
+        "expected the import `from` as a declaration keyword and the mixed-pipeline `from` as a keyword: {tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, ty, _)| text == "csv" && *ty == TT_SHELL_ARGUMENT),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .filter(|(text, ty, _)| text == "|>" && *ty == TT_STRUCTURED_PIPE)
+            .count()
+            >= 2,
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, ty, _)| text == "where" && *ty == TT_FUNCTION),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, ty, _)| text == "row" && *ty == TT_PARAMETER),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, ty, _)| text == "age" && *ty == TT_PROPERTY),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, ty, _)| text == "to" && *ty == TT_KEYWORD),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|(text, ty, _)| text == "json" && *ty == TT_SHELL_ARGUMENT),
+        "{tokens:?}"
+    );
+}
+
+#[test]
+fn mixed_pipeline_semantic_ranges_survive_utf16_prefixes() {
+    let source = r#"function demo() -> shell { return shell { printf '猫🙂\n' | from lines |> to json; }; };"#;
+    let tokens = rendered_tokens(source);
+    for needle in ["from", "lines", "|>", "to", "json"] {
+        assert!(
+            tokens.iter().any(|(text, _, _)| text == needle),
+            "missing {needle}: {tokens:?}"
+        );
+    }
+}
+
+#[test]
+fn task27_pipeline_generic_matcher_preserves_bound_container_types() {
+    let expected = SparType::Applied {
+        name: "Table".to_string(),
+        arguments: vec![SparType::TypeParameter("T".to_string())],
+    };
+    let actual = SparType::Applied {
+        name: "Table".to_string(),
+        arguments: vec![SparType::Named("User".to_string())],
+    };
+    let mut bindings = HashMap::new();
+    assert!(bind_pipeline_type_parameters(
+        &expected,
+        &actual,
+        &mut bindings
+    ));
+    assert_eq!(
+        substitute_pipeline_type(&expected, &bindings),
+        actual,
+        "the piped row type must flow through generic Table<T> stages"
+    );
+}
+
+#[test]
+fn task28_formatter_round_trips_impl_closure_and_structured_pipe_syntax() {
+    let source = concat!(
+        "struct User { name: str = \"Obi\"; };\n",
+        "impl User { function label(self, prefix: str) -> str { return prefix + self.name; }; };\n",
+        "var users: List<User> = [];\n",
+        "var names: List<str> = users |> map(fn(user: User) -> str => user.name);\n",
+    );
+
+    let formatted = format_document_source(source).expect("Task 28 syntax must be formatter-safe");
+    assert!(formatted.contains("impl User"), "{formatted}");
+    assert!(
+        formatted.contains("fn(user: User) -> str => user.name"),
+        "{formatted}"
+    );
+    assert!(formatted.contains("|> map("), "{formatted}");
+    assert_eq!(format_document_source(&formatted).unwrap(), formatted);
+}
+
+#[test]
+fn task28_auto_import_uses_value_import_for_constructible_structs() {
+    let temp = tempfile::tempdir().unwrap();
+    let lib_path = temp.path().join("models.spar");
+    let main_path = temp.path().join("main.spar");
+    let lib_source = "export struct User { name: str = \"Obi\"; };\n";
+    std::fs::write(&lib_path, lib_source).unwrap();
+    std::fs::write(&main_path, "var user: User = User();\n").unwrap();
+
+    let lib_uri = Url::from_file_path(&lib_path).unwrap();
+    let main_uri = Url::from_file_path(&main_path).unwrap();
+    let lib_state = SparLanguageServer::analyze_path(lib_source, &lib_path);
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&lib_uri, &lib_state);
+
+    let constructor_candidates = auto_import_candidates(&index, "User", &main_uri, false);
+    let constructor = constructor_candidates
+        .iter()
+        .find(|candidate| candidate.name == "User")
+        .expect("constructible struct should be auto-importable in value context");
+    assert!(
+        !constructor.type_only,
+        "constructor use requires a normal import"
+    );
+
+    let type_candidates = auto_import_candidates(&index, "User", &main_uri, true);
+    let type_candidate = type_candidates
+        .iter()
+        .find(|candidate| candidate.name == "User")
+        .expect("struct should also be auto-importable in type context");
+    assert!(
+        !type_candidate.type_only,
+        "Spar `import type` accepts type/enum only; structs must use a normal import"
+    );
+}
+
+#[test]
+fn task28_import_completion_and_resolve_expose_leading_documentation() {
+    let temp = tempfile::tempdir().unwrap();
+    let lib_path = temp.path().join("lib.spar");
+    let source = concat!(
+        "// Build a friendly greeting for a user.\n",
+        "function greet(name: str) -> str { return \"hello \" + name; };\n",
+        "\n",
+        "// Canonical user value used by callers.\n",
+        "export struct User { name: str = \"Obi\"; };\n",
+        "impl User {\n",
+        "    // Render the public user label.\n",
+        "    function label(self) -> str { return self.name; };\n",
+        "};\n",
+    );
+    std::fs::write(&lib_path, source).unwrap();
+
+    let items =
+        selective_import_completion_items(temp.path(), "lib.spar", false, false, &HashSet::new())
+            .expect("import completion");
+    let greet = items
+        .iter()
+        .find(|item| item.label == "greet")
+        .expect("greet completion");
+    let import_docs = match greet
+        .documentation
+        .as_ref()
+        .expect("inline import documentation")
+    {
+        Documentation::String(value) => value.clone(),
+        Documentation::MarkupContent(content) => content.value.clone(),
+    };
+    assert!(import_docs.contains("friendly greeting"), "{import_docs}");
+
+    let uri = Url::from_file_path(&lib_path).unwrap();
+    let state = SparLanguageServer::analyze_path(source, &lib_path);
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let user = index
+        .symbols_for_uri(&uri)
+        .iter()
+        .find(|symbol| symbol.kind == IndexedSymbolKind::Struct && symbol.name == "User")
+        .expect("indexed struct");
+    assert_eq!(
+        user.documentation.as_deref(),
+        Some("Canonical user value used by callers.")
+    );
+    let method = index
+        .symbols_for_uri(&uri)
+        .iter()
+        .find(|symbol| symbol.semantic_path == "User::label")
+        .expect("indexed method");
+    assert_eq!(
+        method.documentation.as_deref(),
+        Some("Render the public user label.")
+    );
+    assert!(format_hover_indexed_method(method)
+        .expect("method hover")
+        .contains("Render the public user label."));
+
+    let item = CompletionItem {
+        label: "User".into(),
+        data: Some(completion_data(user.id.0.clone(), "lib.spar")),
+        ..CompletionItem::default()
+    };
+    let resolved = enrich_completion_from_index(item, &index, true, true);
+    let resolved_docs = match resolved.documentation.expect("resolved documentation") {
+        Documentation::String(value) => value,
+        Documentation::MarkupContent(content) => content.value,
+    };
+    assert!(
+        resolved_docs.contains("Canonical user value"),
+        "{resolved_docs}"
+    );
+}
+
+#[test]
+fn builtin_type_methods_and_record_dynamic_fields_are_completed() {
+    let declarations = r#"
+import pkg { collectTable } from "std/data";
+struct User { name: str = "Obi"; age: int = 24; };
+"#;
+    let analyzed = format!(
+        "{declarations}\nfunction demo() -> void {{ var s: str = \"x\"; var xs: [int] = [1]; var r: Record = {{ a: 1; }}; var people: [User] = [User()]; var t: Table<User> = people |> collectTable(); s; xs; r; t; }};"
+    );
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(&analyzed, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+
+    let labels_after = |receiver: &str| -> Vec<String> {
+        let source = format!(
+            "{declarations}\nfunction demo() -> void {{ var s: str = \"x\"; var xs: [int] = [1]; var r: Record = {{ a: 1; }}; var people: [User] = [User()]; var t: Table<User> = people |> collectTable(); {receiver}"
+        );
+        let offset = source.len();
+        typed_member_items_indexed(
+            &source,
+            offset,
+            state.effective_symbols().expect("symbols"),
+            &index,
+            &uri,
+        )
+        .expect("member access")
+        .into_iter()
+        .map(|item| item.label)
+        .collect()
+    };
+
+    let text = labels_after("s.");
+    assert!(text.contains(&"length".to_string()), "{text:?}");
+    let list = labels_after("xs.");
+    assert!(list.contains(&"length".to_string()), "{list:?}");
+    let record = labels_after("r.");
+    for expected in ["has", "keys", "asStr", "asInt", "asFloat", "asBool"] {
+        assert!(record.contains(&expected.to_string()), "{record:?}");
+    }
+    // A field of a dynamic Record is dynamic too, so the bridge methods apply.
+    let field = labels_after("r.a.");
+    assert!(field.contains(&"asInt".to_string()), "{field:?}");
+    let table = labels_after("t.");
+    assert!(table.contains(&"filter".to_string()), "{table:?}");
+    assert!(
+        table.contains(&"name".to_string()) || table.contains(&"length".to_string()),
+        "{table:?}"
+    );
 }

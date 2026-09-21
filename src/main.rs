@@ -8,14 +8,15 @@ use std::path::PathBuf;
 
 use diagnostics::spar_error_to_diagnostic;
 use spar::ast::{FuncStmt, Program, SparType, TopLevelItem};
-use spar::evaluator::{EvalResult, Evaluator};
+use spar::evaluator::EvalResult;
 use spar::formatter::{format_program, format_source, FormatConfig};
 use spar::lexer::Lexer;
 use spar::loader::ImportLoader;
 use spar::parser::Parser;
+#[cfg(test)]
+use spar::resolver::Resolver;
 use spar::resolver::{
-    EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, Resolver, SectionEntry, SymbolTable,
-    TypeEntry,
+    EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, SectionEntry, SymbolTable, TypeEntry,
 };
 use spar::typechecker::TypeChecker;
 use spar::{Compilation, CompileOptions, Compiler, Span, SparError};
@@ -121,6 +122,18 @@ fn format_spar_type(ty: &SparType) -> String {
                 .map(format_spar_type)
                 .collect::<Vec<_>>()
                 .join(", ")
+        ),
+        SparType::Function {
+            params,
+            return_type,
+        } => format!(
+            "fn({}) -> {}",
+            params
+                .iter()
+                .map(format_spar_type)
+                .collect::<Vec<_>>()
+                .join(", "),
+            format_spar_type(return_type)
         ),
     }
 }
@@ -231,11 +244,17 @@ pub fn word_at_position(source: &str, pos: Position) -> String {
     char_offsets.push(line.len());
     let mut index = match char_offsets.binary_search(&relative) {
         Ok(i) => i.min(char_offsets.len().saturating_sub(2)),
-        Err(i) => i.saturating_sub(1).min(char_offsets.len().saturating_sub(2)),
+        Err(i) => i
+            .saturating_sub(1)
+            .min(char_offsets.len().saturating_sub(2)),
     };
     let chars = line.chars().collect::<Vec<_>>();
-    if chars.is_empty() { return String::new(); }
-    if index >= chars.len() { index = chars.len() - 1; }
+    if chars.is_empty() {
+        return String::new();
+    }
+    if index >= chars.len() {
+        index = chars.len() - 1;
+    }
     if !is_ident(chars[index]) {
         if index > 0 && relative == line.len() && is_ident(chars[index - 1]) {
             index -= 1;
@@ -244,9 +263,13 @@ pub fn word_at_position(source: &str, pos: Position) -> String {
         }
     }
     let mut start = index;
-    while start > 0 && is_ident(chars[start - 1]) { start -= 1; }
+    while start > 0 && is_ident(chars[start - 1]) {
+        start -= 1;
+    }
     let mut end = index + 1;
-    while end < chars.len() && is_ident(chars[end]) { end += 1; }
+    while end < chars.len() && is_ident(chars[end]) {
+        end += 1;
+    }
     chars[start..end].iter().collect()
 }
 
@@ -258,12 +281,24 @@ pub fn path_prefix_before_word(source: &str, pos: Position) -> Option<Vec<String
     let before = &source[line_start..offset];
     let chars = before.chars().collect::<Vec<_>>();
     let mut i = chars.len();
-    while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') { i -= 1; }
-    if i < 2 || chars[i - 1] != ':' || chars[i - 2] != ':' { return None; }
+    while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+        i -= 1;
+    }
+    if i < 2 || chars[i - 1] != ':' || chars[i - 2] != ':' {
+        return None;
+    }
     let prefix = chars[..i - 2].iter().collect::<String>();
     let segments = prefix
         .split("::")
-        .map(|part| part.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().chars().rev().collect::<String>())
+        .map(|part| {
+            part.chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        })
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     (!segments.is_empty()).then_some(segments)
@@ -282,26 +317,50 @@ pub fn is_cursor_in_block_comment(source: &str, pos: Position) -> bool {
         let byte = bytes[i];
         let next = bytes.get(i + 1).copied();
         if in_line {
-            if byte == b'\n' { in_line = false; }
+            if byte == b'\n' {
+                in_line = false;
+            }
             i += 1;
             continue;
         }
         if depth > 0 {
-            if byte == b'/' && next == Some(b'*') { depth += 1; i += 2; continue; }
-            if byte == b'*' && next == Some(b'/') { depth = depth.saturating_sub(1); i += 2; continue; }
+            if byte == b'/' && next == Some(b'*') {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            if byte == b'*' && next == Some(b'/') {
+                depth = depth.saturating_sub(1);
+                i += 2;
+                continue;
+            }
             i += 1;
             continue;
         }
         if in_string {
-            if escaped { escaped = false; }
-            else if byte == b'\\' { escaped = true; }
-            else if byte == b'"' { in_string = false; }
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
             i += 1;
             continue;
         }
-        if byte == b'/' && next == Some(b'/') { in_line = true; i += 2; continue; }
-        if byte == b'/' && next == Some(b'*') { depth = 1; i += 2; continue; }
-        if byte == b'"' { in_string = true; }
+        if byte == b'/' && next == Some(b'/') {
+            in_line = true;
+            i += 2;
+            continue;
+        }
+        if byte == b'/' && next == Some(b'*') {
+            depth = 1;
+            i += 2;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+        }
         i += 1;
     }
     depth > 0
@@ -315,11 +374,21 @@ pub fn path_before_cursor(source: &str, pos: Position) -> Option<Vec<String>> {
     let offset = lsp_pos_to_byte_offset(source, pos).min(source.len());
     let line_start = source[..offset].rfind('\n').map_or(0, |at| at + 1);
     let text_before = &source[line_start..offset];
-    if !text_before.ends_with("::") { return None; }
+    if !text_before.ends_with("::") {
+        return None;
+    }
     let without_suffix = &text_before[..text_before.len() - 2];
     let segments = without_suffix
         .split("::")
-        .map(|part| part.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>().chars().rev().collect::<String>())
+        .map(|part| {
+            part.chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        })
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     (!segments.is_empty()).then_some(segments)
@@ -385,6 +454,7 @@ include!("symbols.rs");
 include!("rename.rs");
 include!("code_actions.rs");
 include!("shell_semantic.rs");
+include!("decoder_intelligence.rs");
 include!("scope_completion.rs");
 include!("member_completion.rs");
 // ── Import hover / completion helpers ────────────────────────────────────────
@@ -488,6 +558,7 @@ fn base_dir_from_uri(uri: &Url) -> std::path::PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
+#[cfg(test)]
 fn analyze_single_file(
     source: &str,
     program: Program,
@@ -529,7 +600,7 @@ fn analyze_single_file(
         result: None,
         errors,
         last_good_symbols: None,
-                repaired_symbols: None,
+        repaired_symbols: None,
         last_good_import_symbols: HashMap::new(),
     }
 }
@@ -573,7 +644,7 @@ fn advertised_server_capabilities() -> ServerCapabilities {
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(
-                [":", "{", ".", "(", ",", "\"", "/"]
+                [":", "{", ".", "(", ",", "\"", "/", ">"]
                     .iter()
                     .map(|c| c.to_string())
                     .collect(),
@@ -586,19 +657,17 @@ fn advertised_server_capabilities() -> ServerCapabilities {
             retrigger_characters: None,
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
-        semantic_tokens_provider: Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(
-                SemanticTokensOptions {
-                    legend: SemanticTokensLegend {
-                        token_types: TOKEN_TYPES.to_vec(),
-                        token_modifiers: TOKEN_MODIFIERS.to_vec(),
-                    },
-                    full: Some(SemanticTokensFullOptions::Bool(true)),
-                    range: Some(false),
-                    ..Default::default()
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: TOKEN_TYPES.to_vec(),
+                    token_modifiers: TOKEN_MODIFIERS.to_vec(),
                 },
-            ),
-        ),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: Some(false),
+                ..Default::default()
+            },
+        )),
         document_formatting_provider: Some(OneOf::Left(true)),
         ..Default::default()
     }
@@ -799,7 +868,11 @@ impl LanguageServer for SparLanguageServer {
         let disk_state = uri
             .to_file_path()
             .ok()
-            .and_then(|path| std::fs::read_to_string(&path).ok().map(|source| (path, source)))
+            .and_then(|path| {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|source| (path, source))
+            })
             .map(|(path, source)| Self::analyze_path(&source, &path));
         if let Some(state) = disk_state {
             self.index_document(&uri, &state).await;
@@ -906,6 +979,17 @@ impl LanguageServer for SparLanguageServer {
             Some(s) => s,
             None => return Ok(None),
         };
+        let decoder_offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(value) = decoder_hover_at(&state.source, decoder_offset) {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }));
+        }
+
         let symbols = match state.effective_symbols() {
             Some(s) => s,
             None => return Ok(None),
@@ -925,6 +1009,27 @@ impl LanguageServer for SparLanguageServer {
                         range: None,
                     }));
                 }
+            }
+
+            if let Some(value) = local_binding_hover_at(state, pos) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+
+            let index = self.workspace_index.lock().await;
+            if let Some(value) = indexed_method_hover_at(&uri, state, pos, &index) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
             }
         }
 
@@ -1303,6 +1408,9 @@ impl LanguageServer for SparLanguageServer {
         }
 
         let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(items) = decoder_completion_items(&state.source, offset) {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
         if let Ok(path) = uri.to_file_path() {
             if let Some(items) = package_metadata_completion_items(&path, &state.source, offset) {
                 return Ok(Some(CompletionResponse::Array(items)));
@@ -1310,11 +1418,45 @@ impl LanguageServer for SparLanguageServer {
         }
 
         let context = editor_context(&state.source, state.ast.as_ref(), offset);
+
+        // `|>` is a typed expression boundary, so stage completion is narrower
+        // than ordinary expression completion: only callables whose first
+        // parameter accepts the piped value are offered. This path is text
+        // tolerant and therefore works while the stage itself is incomplete.
+        if !matches!(
+            context,
+            EditorContext::Suppressed
+                | EditorContext::ImportPath { .. }
+                | EditorContext::SelectiveImport { .. }
+        ) {
+            if let Some(symbols) = state.effective_symbols() {
+                let snippets = self.client_features.lock().await.completion_snippets;
+                if let Some(items) =
+                    structured_pipe_completion_items(&state.source, offset, symbols, snippets)
+                {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+        }
+
+        let structured_pipe_trigger = params.context.as_ref().is_some_and(|ctx| {
+            ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
+                && ctx.trigger_character.as_deref() == Some(">")
+        });
+        if structured_pipe_trigger {
+            // `>` is registered only so `|>` can request completion. A plain
+            // comparison/generic closer should not pop the full expression list.
+            return Ok(None);
+        }
+
         // Punctuation triggers ("(", ",", quote, "/") only help inside calls and
         // imports; elsewhere they would pop a full list after every comma.
         let punctuation_trigger = params.context.as_ref().is_some_and(|ctx| {
             ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
-                && matches!(ctx.trigger_character.as_deref(), Some("(" | "," | "\"" | "/"))
+                && matches!(
+                    ctx.trigger_character.as_deref(),
+                    Some("(" | "," | "\"" | "/")
+                )
         });
         if punctuation_trigger && matches!(context, EditorContext::Expression) {
             return Ok(None);
@@ -1323,10 +1465,15 @@ impl LanguageServer for SparLanguageServer {
         // including inside call arguments: offer the receiver type's members only.
         if !matches!(
             context,
-            EditorContext::Suppressed | EditorContext::ImportPath { .. } | EditorContext::SelectiveImport { .. }
+            EditorContext::Suppressed
+                | EditorContext::ImportPath { .. }
+                | EditorContext::SelectiveImport { .. }
         ) {
             if let Some(symbols) = state.effective_symbols() {
-                if let Some(items) = typed_member_items(&state.source, offset, symbols) {
+                let index = self.workspace_index.lock().await;
+                if let Some(items) =
+                    typed_member_items_indexed(&state.source, offset, symbols, &index, &uri)
+                {
                     return Ok(Some(CompletionResponse::Array(items)));
                 }
             }
@@ -1338,17 +1485,29 @@ impl LanguageServer for SparLanguageServer {
                 let items = import_path_completion_items(&base, prefix, *package);
                 return Ok(Some(CompletionResponse::Array(items)));
             }
-            EditorContext::SelectiveImport { type_only, package, path, already, close_at } => {
+            EditorContext::SelectiveImport {
+                type_only,
+                package,
+                path,
+                already,
+                close_at,
+            } => {
                 let base = base_dir_from_uri(&uri);
                 if let Some(path) = path {
-                    if let Some(items) =
-                        selective_import_completion_items(&base, path, *package, *type_only, already)
-                    {
+                    if let Some(items) = selective_import_completion_items(
+                        &base, path, *package, *type_only, already,
+                    ) {
                         return Ok(Some(CompletionResponse::Array(items)));
                     }
                 } else {
                     let items = import_export_discovery_items(
-                        &base, *package, *type_only, already, &state.source, offset, *close_at,
+                        &base,
+                        *package,
+                        *type_only,
+                        already,
+                        &state.source,
+                        offset,
+                        *close_at,
                     );
                     if !items.is_empty() {
                         return Ok(Some(CompletionResponse::Array(items)));
@@ -1357,13 +1516,9 @@ impl LanguageServer for SparLanguageServer {
             }
             EditorContext::CallArguments { .. } => {
                 let index = self.workspace_index.lock().await;
-                if let Some(items) = named_argument_completion_items(
-                    state,
-                    &index,
-                    &uri,
-                    &state.source,
-                    offset,
-                ) {
+                if let Some(items) =
+                    named_argument_completion_items(state, &index, &uri, &state.source, offset)
+                {
                     return Ok(Some(CompletionResponse::Array(items)));
                 }
             }
@@ -1372,8 +1527,7 @@ impl LanguageServer for SparLanguageServer {
 
         // Task positions are classified from the text alone, so they work even
         // when the file doesn't parse or resolve (no symbols yet).
-        if let Some(items) =
-            task_completion_items(&state.source, state.effective_symbols(), offset)
+        if let Some(items) = task_completion_items(&state.source, state.effective_symbols(), offset)
         {
             return Ok(Some(CompletionResponse::Array(items)));
         }
@@ -1429,7 +1583,13 @@ impl LanguageServer for SparLanguageServer {
 
         // Case 2: after bare `:` — type annotation position → offer type keywords
         // `f(a: |)` has a colon too, but it is a named argument, not a type annotation.
-        let in_call_value = matches!(&context, EditorContext::CallArguments { value_of: Some(_), .. });
+        let in_call_value = matches!(
+            &context,
+            EditorContext::CallArguments {
+                value_of: Some(_),
+                ..
+            }
+        );
         if !in_call_value && is_in_type_position(&state.source, pos) {
             return Ok(Some(CompletionResponse::Array(type_keyword_items())));
         }
@@ -1438,12 +1598,22 @@ impl LanguageServer for SparLanguageServer {
         let snippets = self.client_features.lock().await.completion_snippets;
         let mut items: Vec<CompletionItem> =
             scope_completion_items(&local_names_at(&state.source, offset));
+        {
+            let index = self.workspace_index.lock().await;
+            items.extend(constructor_completion_items(
+                symbols, &index, &uri, snippets,
+            ));
+        }
         items.extend(run_interpolation_params(&state.source, offset));
         items.extend(
             function_completion_items(&symbols.functions, snippets)
                 .into_iter()
                 .map(|item| {
-                    let tier = if BUILTIN_FUNCTION_NAMES.contains(&item.label.as_str()) { 3 } else { 1 };
+                    let tier = if BUILTIN_FUNCTION_NAMES.contains(&item.label.as_str()) {
+                        3
+                    } else {
+                        1
+                    };
                     with_tier(item, tier)
                 }),
         );
@@ -1462,7 +1632,10 @@ impl LanguageServer for SparLanguageServer {
                 1,
             ));
         }
-        for path in symbols.sections.keys() {
+        for (path, section) in &symbols.sections {
+            if section.canonical {
+                continue;
+            }
             if let Some(first) = path.first() {
                 items.push(with_tier(
                     CompletionItem {
@@ -1485,15 +1658,23 @@ impl LanguageServer for SparLanguageServer {
             ));
         }
         items.extend(builtin_items().into_iter().map(|item| with_tier(item, 3)));
-        items.extend(type_keyword_items().into_iter().map(|item| with_tier(item, 4)));
+        items.extend(
+            type_keyword_items()
+                .into_iter()
+                .map(|item| with_tier(item, 4)),
+        );
         items.extend(keyword_items().into_iter().map(|item| with_tier(item, 9)));
 
         // In `f(param: |)`, locals whose type matches the parameter come first.
         {
             let index = self.workspace_index.lock().await;
-            if let Some(expected) = expected_value_type(state, &index, &uri, &state.source, offset) {
+            if let Some(expected) = expected_value_type(state, &index, &uri, &state.source, offset)
+            {
                 for item in &mut items {
-                    let is_local = item.sort_text.as_deref().is_some_and(|text| text.starts_with("0_"));
+                    let is_local = item
+                        .sort_text
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with("0_"));
                     if is_local && item.detail.as_deref() == Some(expected.as_str()) {
                         item.sort_text = Some(format!("00_{}", item.label));
                     }
@@ -1525,50 +1706,84 @@ impl LanguageServer for SparLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
-        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
         let offset = lsp_pos_to_byte_offset(&state.source, pos);
         let index = self.workspace_index.lock().await;
-        Ok(signature_help_at(state, &index, &uri, &state.source, offset))
+        Ok(signature_help_at(
+            state,
+            &index,
+            &uri,
+            &state.source,
+            offset,
+        ))
     }
 
-    async fn document_symbol(&self, params: DocumentSymbolParams) -> Result<Option<DocumentSymbolResponse>> {
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
         let docs = self.documents.lock().await;
-        let Some(state) = docs.get(&uri) else { return Ok(None); };
-        let hierarchical = self.client_features.lock().await.hierarchical_document_symbols;
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let hierarchical = self
+            .client_features
+            .lock()
+            .await
+            .hierarchical_document_symbols;
         Ok(Some(document_symbol_response(&uri, state, hierarchical)))
     }
 
-    async fn symbol(&self, params: WorkspaceSymbolParams) -> Result<Option<Vec<SymbolInformation>>> {
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
         let index = self.workspace_index.lock().await;
         Ok(Some(workspace_symbols(&index, &params.query)))
     }
 
-    async fn document_highlight(&self, params: DocumentHighlightParams) -> Result<Option<Vec<DocumentHighlight>>> {
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let docs = self.documents.lock().await;
-        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
         let index = self.workspace_index.lock().await;
-        let Some(target) = semantic_target_at(&uri, state, pos, &index) else { return Ok(None); };
-        let highlights = semantic_occurrences_in_document(&uri, state, &target)
+        let Some(target) = semantic_target_at(&uri, state, pos, &index) else {
+            return Ok(None);
+        };
+        let highlights = semantic_occurrences_in_document(&uri, state, &target, &index)
             .into_iter()
             .map(|occurrence| DocumentHighlight {
                 range: occurrence.range,
                 kind: Some(match occurrence.role {
                     SemanticOccurrenceRole::Read => DocumentHighlightKind::READ,
-                    SemanticOccurrenceRole::Write | SemanticOccurrenceRole::Declaration => DocumentHighlightKind::WRITE,
+                    SemanticOccurrenceRole::Write | SemanticOccurrenceRole::Declaration => {
+                        DocumentHighlightKind::WRITE
+                    }
                 }),
             })
             .collect::<Vec<_>>();
         Ok((!highlights.is_empty()).then_some(highlights))
     }
 
-    async fn prepare_rename(&self, params: TextDocumentPositionParams) -> Result<Option<PrepareRenameResponse>> {
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri;
         let pos = params.position;
         let docs = self.documents.lock().await;
-        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
         let index = self.workspace_index.lock().await;
         let root = self.workspace_root.lock().await.clone();
         Ok(prepare_rename_at(&uri, state, pos, &index, root.as_deref()))
@@ -1580,45 +1795,73 @@ impl LanguageServer for SparLanguageServer {
         let new_name = params.new_name;
         let docs = self.documents.lock().await;
         let index = self.workspace_index.lock().await;
-        let Some(state) = docs.get(&uri) else { return Ok(None); };
-        let Some(target) = semantic_target_at(&uri, state, pos, &index) else { return Ok(None); };
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(target) = semantic_target_at(&uri, state, pos, &index) else {
+            return Ok(None);
+        };
         let indexed = index.find_by_id(&target.id.0);
-        if !is_valid_rename(indexed, &new_name) { return Ok(None); }
+        if !is_valid_rename(indexed, &new_name) {
+            return Ok(None);
+        }
         let root = self.workspace_root.lock().await.clone();
-        if !declaration_is_editable(&target, root.as_deref()) { return Ok(None); }
+        if !declaration_is_editable(&target, root.as_deref()) {
+            return Ok(None);
+        }
 
         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
         let candidate_uris = if target.local_decl_byte.is_some() {
             vec![uri.clone()]
         } else {
             let mut uris = index.modules.keys().cloned().collect::<Vec<_>>();
-            if !uris.contains(&uri) { uris.push(uri.clone()); }
+            if !uris.contains(&uri) {
+                uris.push(uri.clone());
+            }
             uris
         };
         for candidate_uri in candidate_uris {
             if let Some(open_state) = docs.get(&candidate_uri) {
-                let occurrences = semantic_occurrences_in_document(&candidate_uri, open_state, &target);
+                let occurrences =
+                    semantic_occurrences_in_document(&candidate_uri, open_state, &target, &index);
                 if !occurrences.is_empty() {
-                    changes.insert(candidate_uri.clone(), occurrences.into_iter().map(|occurrence| TextEdit {
-                        range: occurrence.range,
-                        new_text: new_name.clone(),
-                    }).collect());
+                    changes.insert(
+                        candidate_uri.clone(),
+                        occurrences
+                            .into_iter()
+                            .map(|occurrence| TextEdit {
+                                range: occurrence.range,
+                                new_text: new_name.clone(),
+                            })
+                            .collect(),
+                    );
                 }
                 continue;
             }
-            let Ok(path) = candidate_uri.to_file_path() else { continue; };
-            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
+            let Ok(path) = candidate_uri.to_file_path() else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let disk_state = SparLanguageServer::analyze_path(&source, &path);
-            let occurrences = semantic_occurrences_in_document(&candidate_uri, &disk_state, &target);
+            let occurrences =
+                semantic_occurrences_in_document(&candidate_uri, &disk_state, &target, &index);
             if !occurrences.is_empty() {
-                changes.insert(candidate_uri.clone(), occurrences.into_iter().map(|occurrence| TextEdit {
-                    range: occurrence.range,
-                    new_text: new_name.clone(),
-                }).collect());
+                changes.insert(
+                    candidate_uri.clone(),
+                    occurrences
+                        .into_iter()
+                        .map(|occurrence| TextEdit {
+                            range: occurrence.range,
+                            new_text: new_name.clone(),
+                        })
+                        .collect(),
+                );
             }
         }
         for edits in changes.values_mut() {
-            edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+            edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
         }
         Ok((!changes.is_empty()).then_some(WorkspaceEdit {
             changes: Some(changes),
@@ -1630,7 +1873,9 @@ impl LanguageServer for SparLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let docs = self.documents.lock().await;
-        let Some(state) = docs.get(&uri) else { return Ok(None); };
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
         let index = self.workspace_index.lock().await;
         let mut actions = code_actions_for_unresolved(
             state,
@@ -1639,7 +1884,11 @@ impl LanguageServer for SparLanguageServer {
             params.range,
             &params.context.diagnostics,
         );
-        actions.extend(task_bracket_quick_fixes(state, &uri, &params.context.diagnostics));
+        actions.extend(task_bracket_quick_fixes(
+            state,
+            &uri,
+            &params.context.diagnostics,
+        ));
         Ok((!actions.is_empty()).then_some(actions))
     }
 
@@ -1653,7 +1902,8 @@ impl LanguageServer for SparLanguageServer {
         let Some(state) = docs.get(&uri) else {
             return Ok(None);
         };
-        Ok(definition_at(&uri, state, pos).map(GotoDefinitionResponse::Scalar))
+        let index = self.workspace_index.lock().await;
+        Ok(indexed_definition_at(&uri, state, pos, &index).map(GotoDefinitionResponse::Scalar))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -1901,7 +2151,10 @@ mod tests {
         let labels = task_labels_at_cursor("task X {\n    |").unwrap();
         assert!(!labels.contains(&"shell".to_string()));
         for expected in ["run", "run bash", "run windows", "run bash macos"] {
-            assert!(labels.contains(&expected.to_string()), "missing {expected}: {labels:?}");
+            assert!(
+                labels.contains(&expected.to_string()),
+                "missing {expected}: {labels:?}"
+            );
         }
     }
 
@@ -1910,7 +2163,10 @@ mod tests {
         let labels =
             task_labels_at_cursor("task X {\n    run bash windows { a; };\n    |").unwrap();
         assert!(!labels.contains(&"run windows".to_string()), "{labels:?}");
-        assert!(!labels.contains(&"run bash windows".to_string()), "{labels:?}");
+        assert!(
+            !labels.contains(&"run bash windows".to_string()),
+            "{labels:?}"
+        );
         assert!(labels.contains(&"run linux".to_string()));
         assert!(labels.contains(&"run".to_string()));
     }
@@ -1923,16 +2179,14 @@ mod tests {
         assert_eq!(after_shell, ["linux", "macos", "windows"]);
         let after_os = task_labels_at_cursor("task X {\n    run bash linux |").unwrap();
         assert!(after_os.is_empty());
-        let taken =
-            task_labels_at_cursor("task X {\n    run linux { a; };\n    run |").unwrap();
+        let taken = task_labels_at_cursor("task X {\n    run linux { a; };\n    run |").unwrap();
         assert!(!taken.contains(&"linux".to_string()), "{taken:?}");
     }
 
     #[test]
     fn boolean_fields_offer_true_and_false() {
         for field in ["quiet", "default", "private"] {
-            let labels =
-                task_labels_at_cursor(&format!("task X {{\n    {field}: |")).unwrap();
+            let labels = task_labels_at_cursor(&format!("task X {{\n    {field}: |")).unwrap();
             assert_eq!(labels, ["true", "false"], "{field}");
         }
     }
@@ -1964,7 +2218,10 @@ mod tests {
 
     #[test]
     fn bash_bodies_offer_nothing_but_native_bodies_fall_through() {
-        assert_eq!(task_labels_at_cursor("task X {\n    run bash { ec|").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            task_labels_at_cursor("task X {\n    run bash { ec|").unwrap(),
+            Vec::<String>::new()
+        );
         assert!(task_labels_at_cursor("task X {\n    run { ec|").is_none());
     }
 
@@ -2045,8 +2302,8 @@ mod tests {
         let tokens = Lexer::new(src).tokenize().expect("lex");
         let program = Parser::new(tokens).parse().expect("parse");
         let symbols = Resolver::new().resolve(&program, &[]).expect("resolve");
-        let items = task_completion_items(src, Some(&symbols), offset)
-            .expect("interpolation completion");
+        let items =
+            task_completion_items(src, Some(&symbols), offset).expect("interpolation completion");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "environment");
         assert!(!items.iter().any(|item| item.label == "region"));
@@ -2976,14 +3233,16 @@ mod tests {
         assert!(!parse_ok, "unparseable source must not produce a program");
     }
 
-
     #[test]
     fn lsp_formatter_preserves_nested_boolean_values() {
         let source = "var config: section = { python: { enabled: true; }; kids: true; };";
 
         let formatted = format_document_source(source).expect("safe LSP formatting");
 
-        assert!(formatted.contains("python: { enabled: true; };"), "{formatted}");
+        assert!(
+            formatted.contains("python: { enabled: true; };"),
+            "{formatted}"
+        );
         assert!(formatted.contains("kids: true;"), "{formatted}");
     }
 
@@ -2999,7 +3258,10 @@ mod tests {
 
         let formatted = format_document_source(source).expect("safe LSP formatting");
 
-        assert!(formatted.contains("RUST_LOG=debug cargo check;"), "{formatted}");
+        assert!(
+            formatted.contains("RUST_LOG=debug cargo check;"),
+            "{formatted}"
+        );
     }
 
     #[test]
@@ -3927,7 +4189,10 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
     fn semantic_tokens_classify_pkg_as_a_keyword() {
         let src = "import pkg { println } from \"std\";\n";
         let tokens = decode_semantic_tokens(src);
-        assert_eq!(find_tok(&tokens, "pkg", src).unwrap().token_type, TT_DECLARATION_KEYWORD);
+        assert_eq!(
+            find_tok(&tokens, "pkg", src).unwrap().token_type,
+            TT_DECLARATION_KEYWORD
+        );
     }
 
     #[test]
@@ -3935,13 +4200,15 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
         let temp = tempfile::tempdir().unwrap();
         let helper = temp.path().join("helper.spar");
         std::fs::write(&helper, "function answer() -> int { return 42; };\n").unwrap();
-        let source = "import { answer } from \"./helper\";\nfunction main() -> int { return answer(); };\n";
+        let source =
+            "import { answer } from \"./helper\";\nfunction main() -> int { return answer(); };\n";
         let main = temp.path().join("main.spar");
         let uri = Url::from_file_path(&main).unwrap();
         let state = SparLanguageServer::analyze_path(source, &main);
         assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
         assert_eq!(state.spliced_import_paths.get("./helper"), Some(&helper));
-        let location = definition_at(&uri, &state, word_pos(source, "answer", 1)).expect("definition");
+        let location =
+            definition_at(&uri, &state, word_pos(source, "answer", 1)).expect("definition");
         assert_eq!(location.uri, Url::from_file_path(&helper).unwrap());
     }
 
@@ -3961,8 +4228,13 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
             .get("std/fs")
             .cloned()
             .expect("resolved std/fs path");
-        assert!(expected.ends_with(std::path::Path::new("stdlib/src/fs.spar")), "{}", expected.display());
-        let location = definition_at(&uri, &state, word_pos(source, "readText", 1)).expect("std definition");
+        assert!(
+            expected.ends_with(std::path::Path::new("stdlib/src/fs.spar")),
+            "{}",
+            expected.display()
+        );
+        let location =
+            definition_at(&uri, &state, word_pos(source, "readText", 1)).expect("std definition");
         assert_eq!(location.uri, Url::from_file_path(&expected).unwrap());
     }
 
@@ -4048,8 +4320,8 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
             state.spliced_import_paths.get("toolkit"),
             Some(&toolkit_src.join("lib.spar"))
         );
-        let location = definition_at(&uri, &state, word_pos(source, "color", 1))
-            .expect("package definition");
+        let location =
+            definition_at(&uri, &state, word_pos(source, "color", 1)).expect("package definition");
         assert_eq!(
             location.uri,
             Url::from_file_path(toolkit_src.join("lib.spar")).unwrap()
@@ -4079,7 +4351,10 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
         let source = "import pkg \"std/fs\" as fs;\nfunction main() -> int { var text: str = fs::readText(path: \"x\"); return 0; };\n";
         let state = SparLanguageServer::analyze_path(source, &main);
         assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
-        let symbols = state.effective_import_symbols().get("fs").expect("std/fs symbols");
+        let symbols = state
+            .effective_import_symbols()
+            .get("fs")
+            .expect("std/fs symbols");
         assert!(symbols.functions.contains_key("readText"));
         let items = import_completion_items(symbols);
         assert!(items.iter().any(|item| item.label == "readText"));
@@ -4087,4 +4362,180 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
         assert!(hover.contains("readText"), "{hover}");
     }
 
+    #[test]
+    fn decoder_completion_offers_native_and_scoc_names() {
+        let source = "shell { df | from ";
+        let items = decoder_completion_items(source, source.len()).expect("decoder completion");
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"csv"), "{labels:?}");
+        assert!(labels.contains(&"df"), "{labels:?}");
+        assert!(labels.contains(&"env"), "{labels:?}");
+        assert!(
+            !labels.contains(&"ping-s"),
+            "compatibility aliases stay explicit: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn decoder_completion_scoc_namespace_includes_streaming_aliases() {
+        let source = "shell { ping 1.1.1.1 | from scoc::";
+        let items = decoder_completion_items(source, source.len()).expect("SCOC completion");
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"ping"), "{labels:?}");
+        assert!(labels.contains(&"ping-s"), "{labels:?}");
+        assert!(
+            !labels.contains(&"csv"),
+            "native codecs do not belong in scoc::: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn decoder_completion_codec_namespace_includes_native_aliases() {
+        let source = "shell { cat x | from codec::";
+        let items = decoder_completion_items(source, source.len()).expect("codec completion");
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"yaml"), "{labels:?}");
+        assert!(labels.contains(&"yml"), "{labels:?}");
+        assert!(labels.contains(&"jsonl"), "{labels:?}");
+        assert!(labels.contains(&"ndjson"), "{labels:?}");
+        assert!(
+            !labels.contains(&"df"),
+            "SCOC parsers do not belong in codec::: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn decoder_completion_custom_namespace_is_recognized_but_empty() {
+        let source = "shell { cat x | from custom::";
+        let items =
+            decoder_completion_items(source, source.len()).expect("custom completion context");
+        assert!(
+            items.is_empty(),
+            "custom parser declarations are not implemented yet: {items:?}"
+        );
+    }
+
+    #[test]
+    fn decoder_option_completion_is_capability_aware() {
+        let source = "shell { df | from df(";
+        let items = decoder_completion_items(source, source.len()).expect("df options");
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"raw"), "{labels:?}");
+        assert!(labels.contains(&"streaming"), "{labels:?}");
+        assert!(!labels.contains(&"ignoreErrors"), "{labels:?}");
+
+        let source = "shell { ping 1.1.1.1 | from ping(";
+        let items = decoder_completion_items(source, source.len()).expect("ping options");
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"raw"), "{labels:?}");
+        assert!(labels.contains(&"ignoreErrors"), "{labels:?}");
+        assert!(labels.contains(&"streaming"), "{labels:?}");
+    }
+
+    #[test]
+    fn decoder_option_completion_does_not_repeat_used_options() {
+        let source = "shell { ping 1.1.1.1 | from ping(raw: true, ";
+        let items = decoder_completion_items(source, source.len()).expect("remaining ping options");
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(!labels.contains(&"raw"), "{labels:?}");
+        assert!(labels.contains(&"ignoreErrors"), "{labels:?}");
+        assert!(labels.contains(&"streaming"), "{labels:?}");
+    }
+
+    #[test]
+    fn decoder_hover_describes_scoc_parser_and_alias() {
+        let source = "shell { df | from df }";
+        let offset = source.rfind("df").unwrap();
+        let hover = decoder_hover_at(source, offset).expect("df decoder hover");
+        assert!(hover.contains("SCOC command-output parser"), "{hover}");
+        assert!(hover.contains("Output: Table"), "{hover}");
+        assert!(hover.contains("Platforms: Linux, macOS"), "{hover}");
+        assert!(hover.contains("JC baseline: 1.26.0"), "{hover}");
+        assert!(hover.contains("Raw mode: yes"), "{hover}");
+        assert!(hover.contains("Streaming: no"), "{hover}");
+
+        let source = "shell { ping 1.1.1.1 | from scoc::ping-s }";
+        let offset = source.rfind("ping-s").unwrap();
+        let hover = decoder_hover_at(source, offset).expect("ping-s alias hover");
+        assert!(hover.contains("compatibility alias for `ping`"), "{hover}");
+    }
+
+    #[test]
+    fn lsp_compiler_diagnostics_cover_decoder_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.spar");
+
+        let cases = [
+            (
+                "function main() -> shell { return shell { printf x | from does-not-exist; }; };",
+                "unknown SCOC parser `does-not-exist`",
+            ),
+            (
+                "function main() -> shell { return shell { printf x | from df(nope: true); }; };",
+                "unknown option `nope`",
+            ),
+            (
+                "function main() -> shell { return shell { printf x | from df(raw: \"yes\"); }; };",
+                "decoder option `raw` expects bool",
+            ),
+            (
+                "function main() -> shell { return shell { printf x | from df(streaming: true); }; };",
+                "does not support streaming",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let state = SparLanguageServer::analyze_path(source, &main);
+            let rendered = state
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?}, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_classify_decoder_namespace_name_and_option() {
+        let src = "function main() -> shell { return shell { printf x | from scoc::ping(raw: true); }; };\n";
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(
+            find_tok(&tokens, "from", src).unwrap().token_type,
+            TT_KEYWORD
+        );
+        assert_eq!(
+            find_tok(&tokens, "scoc", src).unwrap().token_type,
+            TT_NAMESPACE
+        );
+        assert_eq!(
+            find_tok(&tokens, "ping", src).unwrap().token_type,
+            TT_SHELL_ARGUMENT
+        );
+        assert_eq!(
+            find_tok(&tokens, "raw", src).unwrap().token_type,
+            TT_PROPERTY
+        );
+    }
 }

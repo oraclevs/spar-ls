@@ -63,6 +63,7 @@ fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -
                 }
                 FuncStmt::Return(_, _)
                 | FuncStmt::Assignment { .. }
+                | FuncStmt::FieldAssignment { .. }
                 | FuncStmt::Expression(_, _)
                 | FuncStmt::Break(_)
                 | FuncStmt::Continue(_)
@@ -91,6 +92,11 @@ fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -
             TopLevelItem::FunctionGroup(group) => {
                 for f in &group.functions {
                     if let Some(span) = check(f) { return Some(span); }
+                }
+            }
+            TopLevelItem::Impl(imp) => {
+                for method in &imp.methods {
+                    if let Some(span) = check(&method.function) { return Some(span); }
                 }
             }
             _ => {}
@@ -166,11 +172,110 @@ fn spliced_definition(state: &DocumentState, _current: &Url, word: &str) -> Opti
     None
 }
 
+
+fn position_in_range(pos: Position, range: &Range) -> bool {
+    range.start <= pos && pos <= range.end
+}
+
+fn method_callee_at_position(source: &str, pos: Position) -> Option<(String, usize)> {
+    let offset = lsp_pos_to_byte_offset(source, pos).min(source.len());
+    let bytes = source.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+
+    let mut start = offset;
+    while start > 0 && is_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while end < bytes.len() && is_ident(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+
+    let method = source.get(start..end)?;
+    let mut dot = start;
+    while dot > 0 && bytes[dot - 1].is_ascii_whitespace() {
+        dot -= 1;
+    }
+    if dot == 0 || bytes[dot - 1] != b'.' {
+        return None;
+    }
+
+    let mut receiver_start = dot - 1;
+    while receiver_start > 0 {
+        let byte = bytes[receiver_start - 1];
+        if is_ident(byte) || byte == b'.' {
+            receiver_start -= 1;
+        } else {
+            break;
+        }
+    }
+    let receiver = source.get(receiver_start..dot - 1)?.trim();
+    if receiver.is_empty() {
+        return None;
+    }
+    Some((format!("{receiver}.{method}"), start))
+}
+
+fn method_symbol_at_position<'a>(
+    uri: &Url,
+    state: &DocumentState,
+    pos: Position,
+    index: &'a WorkspaceIndex,
+) -> Option<&'a IndexedSymbol> {
+    let word = word_at_position(&state.source, pos);
+    if word.is_empty() {
+        return None;
+    }
+
+    if let Some(symbol) = index.symbols_for_uri(uri).iter().find(|symbol| {
+        symbol.kind == IndexedSymbolKind::Method
+            && symbol.name == word
+            && position_in_range(pos, &symbol.selection_range)
+    }) {
+        return Some(symbol);
+    }
+
+    let (callee, offset) = method_callee_at_position(&state.source, pos)?;
+    resolve_method_symbol(
+        state,
+        index,
+        uri,
+        &state.source,
+        offset,
+        &callee,
+    )
+}
+
+fn indexed_definition_at(
+    uri: &Url,
+    state: &DocumentState,
+    pos: Position,
+    index: &WorkspaceIndex,
+) -> Option<Location> {
+    if let Some(symbol) = method_symbol_at_position(uri, state, pos, index) {
+        return Some(Location {
+            uri: symbol.uri.clone(),
+            range: symbol.selection_range,
+        });
+    }
+    definition_at(uri, state, pos)
+}
+
 fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Location> {
     let word = word_at_position(&state.source, pos);
     if word.is_empty() { return None; }
     let program = state.ast.as_ref()?;
     let offset = lsp_pos_to_byte_offset(&state.source, pos);
+    if let Some(binding) = local_binding_at_offset(state, &word, offset) {
+        let range = Range {
+            start: byte_offset_to_lsp_position(&state.source, binding.decl_start),
+            end: byte_offset_to_lsp_position(&state.source, binding.decl_end),
+        };
+        return Some(Location { uri: uri.clone(), range });
+    }
     if let Some(span) = local_decl_span(program, &state.source, offset, &word) {
         return Some(span_location(uri.clone(), &state.source, &span));
     }

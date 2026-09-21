@@ -39,7 +39,20 @@ struct DocumentState {
 
 impl DocumentState {
     fn diagnostics(&self) -> Vec<Diagnostic> {
-        self.errors.iter().map(spar_error_to_diagnostic).collect()
+        self.errors
+            .iter()
+            .map(|error| {
+                let mut diagnostic = spar_error_to_diagnostic(error);
+                if diagnostic.code
+                    == Some(NumberOrString::String("structured-pipe".to_string()))
+                {
+                    if let Some(message) = structured_pipe_contextual_diagnostic(self, error) {
+                        diagnostic.message = message;
+                    }
+                }
+                diagnostic
+            })
+            .collect()
     }
 
     fn effective_symbols(&self) -> Option<&SymbolTable> {

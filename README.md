@@ -28,7 +28,7 @@ spar-ls --version
 | `textDocument/publishDiagnostics` | Compiler lex/parse/resolve/type diagnostics |
 | `textDocument/hover` | Types, functions, fields, imports, callable signatures |
 | `textDocument/completion` | Locals and parameters, file-level and imported symbols, members, imports, import paths, named arguments (declared order) and argument values |
-| `completionItem/resolve` | Optional extra symbol detail/documentation when supported by the client |
+| `completionItem/resolve` | Symbol detail plus declaration documentation when supported by the client |
 | `textDocument/signatureHelp` | Function/task/function-group parameter signatures and active parameter |
 | `textDocument/definition` | Same-file and cross-file definitions |
 | `textDocument/references` | Cross-file references through Spar imports |
@@ -54,9 +54,16 @@ import pkg { | } from "std/fs";
 
 Before `from "..."` is typed, `import pkg { | ` lists the exports of every bundled `std/*` module. Accepting one adds the `from "std/fs"` clause automatically (as an additional edit after the closing `}`, or by completing the whole statement when no `}` exists yet).
 
-Only legal exported symbols are offered. `import type` filters to exported type/enum symbols, and already-selected names are omitted.
+Only legal exported symbols are offered. `import type` filters to exported `type`/`enum` declarations, and already-selected names are omitted. Canonical `struct` values use normal imports even when referenced in a type position, because structs are also constructible runtime values. Auto-import follows the same rule.
 
 Import-path completion covers local `.spar` modules, bundled `std/*` modules, and dependency aliases/submodules available from the current package lockfile. It performs no network access.
+
+
+## Formatting and documentation
+
+`textDocument/formatting` delegates to Spar's own safe source formatter. The LSP therefore formats the same modern syntax the compiler understands, including `impl` blocks, closures, method calls, and `|>` structured pipelines, and formatting is expected to be idempotent. If the source cannot be parsed safely, formatting fails soft instead of rewriting it heuristically.
+
+A contiguous standalone `// ...` or `/* ... */` comment immediately before a declaration is exposed as declaration documentation. Import completion includes that text directly, `completionItem/resolve` preserves it while adding origin information, and indexed method hover shows the same documentation. A blank line separates an ordinary comment from declaration documentation.
 
 ## Call IntelliSense
 
