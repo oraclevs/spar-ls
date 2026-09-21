@@ -3203,7 +3203,7 @@ mod tests {
     #[test]
     fn build_version_exposes_intelligence_core_identity() {
         let version = spar_ls_version();
-        assert!(version.contains("spar-ls 0.5.1"), "{version}");
+        assert!(version.contains("spar-ls 0.6.0"), "{version}");
         assert!(version.contains("intelligence-core-v2"), "{version}");
     }
 
@@ -3972,7 +3972,9 @@ mod tests {
         let schema_src = "schema Server { host: str; };\n";
         let schema_tokens = decode_semantic_tokens(schema_src);
         assert_eq!(
-            find_tok(&schema_tokens, "schema", schema_src).unwrap().token_type,
+            find_tok(&schema_tokens, "schema", schema_src)
+                .unwrap()
+                .token_type,
             TT_DECLARATION_KEYWORD
         );
     }
