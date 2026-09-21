@@ -57,6 +57,9 @@ fn collect_shell_command_expr_refs(
     out: &mut Vec<Span>,
 ) {
     collect_shell_word_refs(&command.program, target, out);
+    for entry in &command.environment {
+        collect_shell_word_refs(&entry.value, target, out);
+    }
     for arg in &command.args {
         collect_shell_word_refs(arg, target, out);
     }
@@ -82,6 +85,17 @@ fn collect_shell_expr_refs(shell: &spar::ast::ShellExpr, target: RefTarget, out:
             }
             spar::ast::ShellStep::Pipeline(commands) => {
                 for command in commands {
+                    collect_shell_command_expr_refs(command, target, out);
+                }
+            }
+            spar::ast::ShellStep::MixedPipeline(mixed) => {
+                for command in &mixed.input {
+                    collect_shell_command_expr_refs(command, target, out);
+                }
+                for stage in &mixed.stages {
+                    collect_expr_refs(stage, target, out);
+                }
+                for command in &mixed.output {
                     collect_shell_command_expr_refs(command, target, out);
                 }
             }
@@ -188,6 +202,23 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
                 out.push(field_span.clone());
             }
         }
+        Expr::Closure { body, .. } => match body {
+            spar::ast::ClosureBody::Expr(body) => collect_expr_refs(body, target, out),
+            spar::ast::ClosureBody::Block(body) => collect_stmts_refs(&body.stmts, target, out),
+        },
+        Expr::MethodCall { receiver, method, method_span, args, .. } => {
+            collect_expr_refs(receiver, target, out);
+            if method == target.word() {
+                out.push(method_span.clone());
+            }
+            for arg in args {
+                collect_expr_refs(arg, target, out);
+            }
+        }
+        Expr::StructuredPipe { input, stage, .. } => {
+            collect_expr_refs(input, target, out);
+            collect_expr_refs(stage, target, out);
+        }
         Expr::Shell(shell) | Expr::ExecShell(shell) | Expr::CommandSubstitution(shell) => {
             collect_shell_expr_refs(shell, target, out)
         }
@@ -214,7 +245,9 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
     for stmt in stmts {
         match stmt {
             FuncStmt::LocalVar(v) => collect_expr_refs(&v.value, target, out),
-            FuncStmt::Assignment { value, .. } | FuncStmt::Expression(value, _) => {
+            FuncStmt::Assignment { value, .. }
+            | FuncStmt::FieldAssignment { value, .. }
+            | FuncStmt::Expression(value, _) => {
                 collect_expr_refs(value, target, out)
             }
             FuncStmt::Break(_) | FuncStmt::Continue(_) => {}
@@ -234,7 +267,10 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
                 collect_expr_refs(&statement.iterable, target, out);
                 collect_stmts_refs(&statement.body, target, out);
             }
-            FuncStmt::Try(_) => {}
+            FuncStmt::Try(statement) => {
+                collect_stmts_refs(&statement.body, target, out);
+                collect_stmts_refs(&statement.handler, target, out);
+            }
         }
     }
 }
@@ -255,6 +291,11 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
             }
             TL::Section(sd) => collect_section_item_refs(&sd.items, target, out),
             TL::Function(fd) => collect_stmts_refs(&fd.body.stmts, target, out),
+            TL::Impl(imp) => {
+                for method in &imp.methods {
+                    collect_stmts_refs(&method.function.body.stmts, target, out);
+                }
+            }
             TL::FunctionGroup(gd) => {
                 for f in &gd.functions {
                     collect_stmts_refs(&f.body.stmts, target, out);
@@ -493,14 +534,20 @@ fn compute_references(
 
 impl SparLanguageServer {
     async fn references_at(&self, uri: &Url, pos: Position, include_declaration: bool) -> Vec<Location> {
-        let (word, defining_location, defining_source) = {
+        let (word, target, defining_location, defining_source, index_snapshot) = {
             let docs = self.documents.lock().await;
             let Some(state) = docs.get(uri) else { return Vec::new() };
             let word = word_at_position(&state.source, pos);
             if word.is_empty() {
                 return Vec::new();
             }
-            let Some(location) = definition_at(uri, state, pos) else { return Vec::new() };
+            let index = self.workspace_index.lock().await;
+            let Some(target) = semantic_target_at(uri, state, pos, &index) else {
+                return Vec::new();
+            };
+            let Some(location) = indexed_definition_at(uri, state, pos, &index) else {
+                return Vec::new();
+            };
             let defining_source = if location.uri == *uri {
                 state.source.clone()
             } else {
@@ -508,8 +555,49 @@ impl SparLanguageServer {
                 let Ok(src) = std::fs::read_to_string(path) else { return Vec::new() };
                 src
             };
-            (word, location, defining_source)
+            (word, target, location, defining_source, index.clone())
         };
+
+        if index_snapshot
+            .find_by_id(&target.id.0)
+            .is_some_and(|symbol| symbol.kind == IndexedSymbolKind::Method)
+        {
+            let docs = self.documents.lock().await;
+            let mut locations = Vec::new();
+            for candidate_uri in index_snapshot.modules.keys() {
+                let owned;
+                let state = if let Some(open) = docs.get(candidate_uri) {
+                    open
+                } else {
+                    let Ok(path) = candidate_uri.to_file_path() else { continue };
+                    let Ok(source) = std::fs::read_to_string(&path) else { continue };
+                    owned = SparLanguageServer::analyze_path(&source, &path);
+                    &owned
+                };
+                for occurrence in
+                    semantic_occurrences_in_document(candidate_uri, state, &target, &index_snapshot)
+                {
+                    if !include_declaration
+                        && occurrence.role == SemanticOccurrenceRole::Declaration
+                    {
+                        continue;
+                    }
+                    locations.push(Location {
+                        uri: candidate_uri.clone(),
+                        range: occurrence.range,
+                    });
+                }
+            }
+            locations.sort_by_key(|location| {
+                (
+                    location.uri.to_string(),
+                    location.range.start.line,
+                    location.range.start.character,
+                )
+            });
+            locations.dedup_by(|a, b| same_location_key(a, b));
+            return locations;
+        }
 
         let importers_snapshot = self.importers.lock().await.clone();
         let mut locations = compute_references(
@@ -523,20 +611,33 @@ impl SparLanguageServer {
         // (`List<Human>`); add this document's semantic occurrences, deduplicated.
         let docs = self.documents.lock().await;
         if let Some(state) = docs.get(uri) {
-            let index = self.workspace_index.lock().await;
-            if let Some(target) = semantic_target_at(uri, state, pos, &index) {
-                for occurrence in semantic_occurrences_in_document(uri, state, &target) {
-                    if !include_declaration && occurrence.role == SemanticOccurrenceRole::Declaration {
-                        continue;
-                    }
-                    let location = Location { uri: uri.clone(), range: occurrence.range };
-                    if !locations.iter().any(|existing| same_location_key(existing, &location)) {
-                        locations.push(location);
-                    }
+            for occurrence in
+                semantic_occurrences_in_document(uri, state, &target, &index_snapshot)
+            {
+                if !include_declaration
+                    && occurrence.role == SemanticOccurrenceRole::Declaration
+                {
+                    continue;
+                }
+                let location = Location {
+                    uri: uri.clone(),
+                    range: occurrence.range,
+                };
+                if !locations
+                    .iter()
+                    .any(|existing| same_location_key(existing, &location))
+                {
+                    locations.push(location);
                 }
             }
         }
-        locations.sort_by_key(|location| (location.uri.to_string(), location.range.start.line, location.range.start.character));
+        locations.sort_by_key(|location| {
+            (
+                location.uri.to_string(),
+                location.range.start.line,
+                location.range.start.character,
+            )
+        });
         locations
     }
 }
@@ -631,6 +732,120 @@ fn enclosing_block_bounds(masked: &str, offset: usize) -> Option<(usize, usize)>
     best
 }
 
+
+fn collect_local_bindings_from_expr(
+    source: &str,
+    masked: &str,
+    expr: &spar::ast::Expr,
+    out: &mut Vec<LocalBinding>,
+) {
+    use spar::ast::{ClosureBody, Expr, FieldValue, SectionItem, StringPart};
+    match expr {
+        Expr::Closure { params, body, span, .. } => {
+            let scope_start = params
+                .last()
+                .map(|param| param.span.end)
+                .unwrap_or(span.start);
+            let scope_end = match body {
+                ClosureBody::Expr(body) => body.span().map(|span| span.end).unwrap_or(span.end),
+                ClosureBody::Block(body) => body.span.end,
+            };
+            for param in params {
+                if let Some((decl_start, decl_end)) =
+                    find_ident_bytes_after(source, param.span.start, &param.name)
+                {
+                    out.push(LocalBinding {
+                        name: param.name.clone(),
+                        decl_start,
+                        decl_end,
+                        scope_start,
+                        scope_end,
+                    });
+                }
+            }
+            match body {
+                ClosureBody::Expr(body) => {
+                    collect_local_bindings_from_expr(source, masked, body, out)
+                }
+                ClosureBody::Block(body) => {
+                    collect_local_bindings_from_stmts(source, masked, &body.stmts, out)
+                }
+            }
+        }
+        Expr::BinaryOp(binary) => {
+            collect_local_bindings_from_expr(source, masked, &binary.lhs, out);
+            collect_local_bindings_from_expr(source, masked, &binary.rhs, out);
+        }
+        Expr::Unary { operand, .. } => {
+            collect_local_bindings_from_expr(source, masked, operand, out)
+        }
+        Expr::Await { value, .. } => collect_local_bindings_from_expr(source, masked, value, out),
+        Expr::List(items, _) => {
+            for item in items {
+                collect_local_bindings_from_expr(source, masked, item, out);
+            }
+        }
+        Expr::Grouped(inner, _) => collect_local_bindings_from_expr(source, masked, inner, out),
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_local_bindings_from_expr(source, masked, &arg.value, out);
+            }
+        }
+        Expr::FnCall(call) => {
+            for arg in &call.args {
+                collect_local_bindings_from_expr(source, masked, arg, out);
+            }
+        }
+        Expr::Comprehension { source: input, body, .. } => {
+            collect_local_bindings_from_expr(source, masked, input, out);
+            collect_local_bindings_from_expr(source, masked, body, out);
+        }
+        Expr::Index { source: input, index, .. } => {
+            collect_local_bindings_from_expr(source, masked, input, out);
+            collect_local_bindings_from_expr(source, masked, index, out);
+        }
+        Expr::FieldAccess { base, .. } => {
+            collect_local_bindings_from_expr(source, masked, base, out)
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_local_bindings_from_expr(source, masked, receiver, out);
+            for arg in args {
+                collect_local_bindings_from_expr(source, masked, arg, out);
+            }
+        }
+        Expr::StructuredPipe { input, stage, .. } => {
+            collect_local_bindings_from_expr(source, masked, input, out);
+            collect_local_bindings_from_expr(source, masked, stage, out);
+        }
+        Expr::String(value) => {
+            for part in &value.parts {
+                if let StringPart::Expr(expr) = part {
+                    collect_local_bindings_from_expr(source, masked, expr, out);
+                }
+            }
+        }
+        Expr::Object(items, _) => {
+            for item in items {
+                match item {
+                    SectionItem::Field(field) => {
+                        if let Some(FieldValue::Expr(value)) = &field.value {
+                            collect_local_bindings_from_expr(source, masked, value, out);
+                        }
+                    }
+                    SectionItem::Spread(spread) => {
+                        collect_local_bindings_from_expr(source, masked, &spread.expr, out)
+                    }
+                }
+            }
+        }
+        Expr::Shell(_)
+        | Expr::ExecShell(_)
+        | Expr::CommandSubstitution(_)
+        | Expr::Literal(_)
+        | Expr::NamespaceRef(_) => {}
+    }
+}
+
 fn collect_local_bindings_from_stmts(
     source: &str,
     masked: &str,
@@ -645,8 +860,10 @@ fn collect_local_bindings_from_stmts(
                         .unwrap_or((decl_start, source.len()));
                     out.push(LocalBinding { name: local.name.clone(), decl_start, decl_end, scope_start, scope_end });
                 }
+                collect_local_bindings_from_expr(source, masked, &local.value, out);
             }
             FuncStmt::If(if_stmt) => {
+                collect_local_bindings_from_expr(source, masked, &if_stmt.condition, out);
                 collect_local_bindings_from_stmts(source, masked, &if_stmt.then_stmts, out);
                 collect_local_bindings_from_stmts(source, masked, &if_stmt.else_stmts, out);
             }
@@ -672,6 +889,7 @@ fn collect_local_bindings_from_stmts(
                         }
                     }
                 }
+                collect_local_bindings_from_expr(source, masked, &statement.iterable, out);
                 collect_local_bindings_from_stmts(source, masked, &statement.body, out);
             }
             FuncStmt::Try(statement) => {
@@ -685,9 +903,20 @@ fn collect_local_bindings_from_stmts(
                 }
                 collect_local_bindings_from_stmts(source, masked, &statement.handler, out);
             }
-            FuncStmt::Assignment { .. }
-            | FuncStmt::Expression(_, _)
-            | FuncStmt::Return(_, _)
+            FuncStmt::Assignment { value, .. }
+            | FuncStmt::FieldAssignment { value, .. }
+            | FuncStmt::Expression(value, _) => {
+                collect_local_bindings_from_expr(source, masked, value, out);
+            }
+            FuncStmt::Return(spar::ast::ReturnValue::Expr(value), _) => {
+                collect_local_bindings_from_expr(source, masked, value, out);
+            }
+            FuncStmt::Return(spar::ast::ReturnValue::SectionBlock(fields), _) => {
+                for field in fields {
+                    collect_local_bindings_from_expr(source, masked, &field.value, out);
+                }
+            }
+            FuncStmt::Return(spar::ast::ReturnValue::Void, _)
             | FuncStmt::Break(_)
             | FuncStmt::Continue(_) => {}
         }
@@ -723,6 +952,16 @@ fn local_bindings(state: &DocumentState) -> Vec<LocalBinding> {
     let mut out = Vec::new();
     for item in &program.items {
         match item {
+            TopLevelItem::Var(var) => {
+                if let Some(value) = &var.value {
+                    collect_local_bindings_from_expr(&state.source, &masked, value, &mut out);
+                }
+            }
+            TopLevelItem::Dynamic(dynamic) => {
+                if let Some(value) = &dynamic.value {
+                    collect_local_bindings_from_expr(&state.source, &masked, value, &mut out);
+                }
+            }
             TopLevelItem::Function(function) => {
                 collect_function_local_bindings(&state.source, &masked, function, &mut out);
             }
@@ -731,7 +970,31 @@ fn local_bindings(state: &DocumentState) -> Vec<LocalBinding> {
                     collect_function_local_bindings(&state.source, &masked, function, &mut out);
                 }
             }
-            _ => {}
+            TopLevelItem::Impl(imp) => {
+                for method in &imp.methods {
+                    collect_function_local_bindings(
+                        &state.source,
+                        &masked,
+                        &method.function,
+                        &mut out,
+                    );
+                }
+            }
+            TopLevelItem::Statement(statement) => {
+                collect_local_bindings_from_stmts(
+                    &state.source,
+                    &masked,
+                    std::slice::from_ref(statement),
+                    &mut out,
+                );
+            }
+            TopLevelItem::Section(_)
+            | TopLevelItem::SchemaSection(_)
+            | TopLevelItem::Type(_)
+            | TopLevelItem::SchemaFrom(_)
+            | TopLevelItem::Enum(_)
+            | TopLevelItem::Import(_)
+            | TopLevelItem::Task(_) => {}
         }
     }
     out
@@ -828,6 +1091,19 @@ fn semantic_target_at(
 ) -> Option<SemanticTarget> {
     let name = word_at_position(&state.source, pos);
     if name.is_empty() { return None; }
+    if let Some(symbol) = method_symbol_at_position(uri, state, pos, index) {
+        let declaration = Location {
+            uri: symbol.uri.clone(),
+            range: symbol.selection_range,
+        };
+        return Some(SemanticTarget {
+            id: symbol.id.clone(),
+            name,
+            declaration: declaration.clone(),
+            definition_key: declaration,
+            local_decl_byte: None,
+        });
+    }
     let offset = lsp_pos_to_byte_offset(&state.source, pos);
     if let Some(binding) = local_binding_at_offset(state, &name, offset) {
         let range = Range {
@@ -873,16 +1149,25 @@ fn semantic_occurrences_in_document(
     uri: &Url,
     state: &DocumentState,
     target: &SemanticTarget,
+    index: &WorkspaceIndex,
 ) -> Vec<SemanticOccurrence> {
     let mut out = Vec::new();
+    let indexed_target = index.find_by_id(&target.id.0);
     for (offset, range) in semantic_identifier_occurrences(state, &target.name) {
-        let matches = if let Some(target_decl) = target.local_decl_byte {
+        let matches = if indexed_target.is_some_and(|symbol| symbol.kind == IndexedSymbolKind::Method) {
+            if uri == &target.declaration.uri && range.start == target.declaration.range.start {
+                true
+            } else {
+                method_symbol_at_position(uri, state, range.start, index)
+                    .is_some_and(|symbol| symbol.id == target.id)
+            }
+        } else if let Some(target_decl) = target.local_decl_byte {
             uri == &target.declaration.uri
                 && local_binding_at_offset(state, &target.name, offset)
                     .is_some_and(|binding| binding.decl_start == target_decl)
         } else {
             let pos = range.start;
-            definition_at(uri, state, pos)
+            indexed_definition_at(uri, state, pos, index)
                 .is_some_and(|location| same_location_key(&location, &target.definition_key))
         };
         if !matches { continue; }

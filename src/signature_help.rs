@@ -20,15 +20,118 @@ fn signature_from_resolved_entry(
         return_type: format_spar_type(&entry.ret),
         is_async: entry.is_async,
         origin,
+        argument_style: CallableArgumentStyle::Named,
     }
+}
+
+
+fn simple_receiver_chain(text: &str) -> Option<Chain> {
+    let mut parts = text.split('.');
+    let root = parts.next()?.trim();
+    if root.is_empty() || !root.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return None;
+    }
+    let mut steps = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() || !part.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            return None;
+        }
+        steps.push(ChainStep::Field(part.to_string()));
+    }
+    Some(Chain { root: root.to_string(), steps })
+}
+
+fn resolve_method_symbol<'a>(
+    state: &DocumentState,
+    index: &'a WorkspaceIndex,
+    uri: &Url,
+    source: &str,
+    offset: usize,
+    callee: &str,
+) -> Option<&'a IndexedSymbol> {
+    let (receiver_text, method_name) = callee.rsplit_once('.')?;
+    let symbols = state.effective_symbols()?;
+    let static_receiver = if !receiver_text.contains('.') {
+        let path = vec![receiver_text.to_string()];
+        symbols.sections.get(&path).is_some_and(|section| section.canonical)
+    } else {
+        false
+    };
+    let owner = if static_receiver {
+        receiver_text.to_string()
+    } else {
+        let chain = simple_receiver_chain(receiver_text)?;
+        let scope = local_names_at(source, offset);
+        let ty = type_of_chain(&chain, &scope, symbols, 0)?;
+        owner_name_for_type(&ty)?.to_string()
+    };
+    index
+        .visible_methods_for_owner(uri, &owner)
+        .into_iter()
+        .find(|symbol| {
+            symbol.name == method_name
+                && matches!(
+                    (static_receiver, symbol.method_receiver),
+                    (true, Some(IndexedMethodReceiver::Static))
+                        | (false, Some(IndexedMethodReceiver::Shared | IndexedMethodReceiver::Mutable))
+                )
+        })
+}
+
+fn resolve_method_signature(
+    state: &DocumentState,
+    index: &WorkspaceIndex,
+    uri: &Url,
+    source: &str,
+    offset: usize,
+    callee: &str,
+) -> Option<CallableSignature> {
+    resolve_method_symbol(state, index, uri, source, offset, callee)
+        .and_then(|symbol| symbol.signature.clone())
 }
 
 fn resolve_callable_named(
     state: &DocumentState,
     index: &WorkspaceIndex,
     uri: &Url,
+    source: &str,
+    offset: usize,
     callee: &str,
 ) -> Option<CallableSignature> {
+    if callee.contains('.') {
+        return resolve_method_signature(state, index, uri, source, offset, callee);
+    }
+
+    if !callee.contains("::") {
+        if let Some(symbols) = state.effective_symbols() {
+            let path = vec![callee.to_string()];
+            if symbols.sections.get(&path).is_some_and(|section| section.canonical) {
+                if let Some(signature) = index
+                    .visible_constructor_for_owner(uri, callee)
+                    .and_then(|symbol| symbol.signature.clone())
+                {
+                    return Some(signature);
+                }
+            }
+        }
+        let callable_in_scope = state
+            .effective_symbols()
+            .and_then(|symbols| symbols.globals.get(callee))
+            .is_some_and(|entry| matches!(
+                entry,
+                GlobalEntry::Var { ty: SparType::Function { .. }, .. }
+            ));
+        if callable_in_scope {
+            if let Some(signature) = index
+                .visible_callable_named(uri, callee)
+                .and_then(|symbol| symbol.signature.clone())
+            {
+                return Some(signature);
+            }
+        }
+    }
+
     let segments = callee.split("::").collect::<Vec<_>>();
 
     // Aliased import call: `module::function(...)`.
@@ -102,6 +205,7 @@ fn resolve_callable_named(
                 return_type: "task".to_string(),
                 is_async: false,
                 origin: None,
+                argument_style: CallableArgumentStyle::Named,
             });
         }
     }
@@ -118,7 +222,7 @@ fn signature_help_at(
     let EditorContext::CallArguments { callee, supplied, active_parameter, value_of } = editor_context(source, state.ast.as_ref(), offset) else {
         return None;
     };
-    let signature = resolve_callable_named(state, index, uri, &callee)?;
+    let signature = resolve_callable_named(state, index, uri, source, offset, &callee)?;
     let mut active = active_parameter as usize;
     if active >= signature.params.len() {
         active = signature.params.len().saturating_sub(1);
@@ -185,6 +289,7 @@ fn named_parameter_items(signature: &CallableSignature, supplied: &[String]) -> 
         .collect()
 }
 
+#[cfg(test)]
 fn value_items_for_type(names: &[ScopeName], expected: &str) -> Vec<CompletionItem> {
     let mut items = scope_completion_items(names);
     for item in &mut items {
@@ -207,7 +312,10 @@ fn named_argument_completion_items(
     else {
         return None;
     };
-    let signature = resolve_callable_named(state, index, uri, &callee)?;
+    let signature = resolve_callable_named(state, index, uri, source, offset, &callee)?;
+    if signature.argument_style != CallableArgumentStyle::Named {
+        return None;
+    }
     if value_of.is_some() {
         // Value position: general expression completion takes over (see `expected_value_type`).
         return None;
@@ -228,6 +336,9 @@ fn expected_value_type(
     else {
         return None;
     };
-    let signature = resolve_callable_named(state, index, uri, &callee)?;
+    let signature = resolve_callable_named(state, index, uri, source, offset, &callee)?;
+    if signature.argument_style != CallableArgumentStyle::Named {
+        return None;
+    }
     signature.params.into_iter().find(|param| param.name == param_name).map(|param| param.ty)
 }

@@ -5,7 +5,10 @@ fn is_valid_rename(symbol: Option<&IndexedSymbol>, new_name: &str) -> bool {
         return false;
     }
     if let Some(symbol) = symbol {
-        if matches!(symbol.kind, IndexedSymbolKind::Type | IndexedSymbolKind::Enum) {
+        if matches!(
+            symbol.kind,
+            IndexedSymbolKind::Struct | IndexedSymbolKind::Type | IndexedSymbolKind::Enum
+        ) {
             return spar::naming::is_pascal_case(new_name);
         }
     }
@@ -15,7 +18,7 @@ fn is_valid_rename(symbol: Option<&IndexedSymbol>, new_name: &str) -> bool {
 fn declaration_is_editable(target: &SemanticTarget, workspace_root: Option<&std::path::Path>) -> bool {
     let Ok(path) = target.declaration.uri.to_file_path() else { return false; };
     if spar::is_bundled_stdlib_path(&path) { return false; }
-    workspace_root.map_or(true, |root| path.starts_with(root))
+    workspace_root.is_none_or(|root| path.starts_with(root))
 }
 
 fn prepare_rename_at(

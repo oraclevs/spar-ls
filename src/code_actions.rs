@@ -85,7 +85,13 @@ fn auto_import_candidates(
         .find_by_name(unresolved_name)
         .into_iter()
         .filter(|symbol| symbol.exported && !symbol.private && symbol.uri != *current_uri)
-        .filter(|symbol| if type_context { symbol.kind.is_type() } else { !symbol.kind.is_type() })
+        .filter(|symbol| {
+            if type_context {
+                symbol.kind.is_type()
+            } else {
+                !symbol.kind.is_type() || symbol.kind == IndexedSymbolKind::Struct
+            }
+        })
         .filter_map(|symbol| {
             let module_path = symbol.uri.to_file_path().ok()?;
             let (import_path, package) = if let Some(std_name) = stdlib_import_name(&module_path) {
@@ -99,7 +105,7 @@ fn auto_import_candidates(
                 symbol_id: symbol.id.clone(),
                 import_path,
                 package,
-                type_only: symbol.kind.is_type(),
+                type_only: matches!(symbol.kind, IndexedSymbolKind::Type | IndexedSymbolKind::Enum),
                 name: symbol.name.clone(),
             })
         })

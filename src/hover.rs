@@ -9,8 +9,15 @@ fn expr_span(expr: &spar::ast::Expr) -> &Span {
         Expr::FnCall(f) => &f.span,
         Expr::BinaryOp(b) => &b.span,
         Expr::List(_, s) | Expr::Grouped(_, s) | Expr::Object(_, s) => s,
-        Expr::Call { span, .. } | Expr::Unary { span, .. } | Expr::Await { span, .. } | Expr::Comprehension { span, .. }
-        | Expr::Index { span, .. } | Expr::FieldAccess { span, .. } => span,
+        Expr::Call { span, .. }
+        | Expr::Closure { span, .. }
+        | Expr::Unary { span, .. }
+        | Expr::Await { span, .. }
+        | Expr::Comprehension { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::FieldAccess { span, .. }
+        | Expr::MethodCall { span, .. }
+        | Expr::StructuredPipe { span, .. } => span,
         Expr::Shell(shell) | Expr::ExecShell(shell) | Expr::CommandSubstitution(shell) => {
             &shell.span
         }
@@ -34,6 +41,15 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
             Expr::Comprehension { source, body, .. } => search(source, off).or_else(|| search(body, off)),
             Expr::Index { source, index, .. } => search(source, off).or_else(|| search(index, off)),
             Expr::FieldAccess { base, .. } => search(base, off),
+            Expr::Closure { body, .. } => match body {
+                spar::ast::ClosureBody::Expr(body) => search(body, off),
+                spar::ast::ClosureBody::Block(body) => stmts(&body.stmts, off),
+            },
+            Expr::MethodCall { receiver, args, .. } => search(receiver, off)
+                .or_else(|| args.iter().find_map(|arg| search(arg, off))),
+            Expr::StructuredPipe { input, stage, .. } => {
+                search(input, off).or_else(|| search(stage, off))
+            }
             Expr::String(s) => s.parts.iter().find_map(|p| if let StringPart::Expr(x)=p { search(x,off) } else { None }),
             Expr::Object(items, _) => items.iter().find_map(|i| match i { SectionItem::Field(f) => match &f.value { Some(FieldValue::Expr(x)) => search(x,off), _=>None }, SectionItem::Spread(s)=>search(&s.expr,off) }),
             Expr::Literal(_)
@@ -47,7 +63,8 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
     fn stmts(ss: &[FuncStmt], off: usize) -> Option<&Expr> {
         ss.iter().find_map(|s| match s {
             FuncStmt::LocalVar(v) => search(&v.value,off),
-            FuncStmt::Assignment { value, .. } => search(value, off),
+            FuncStmt::Assignment { value, .. }
+            | FuncStmt::FieldAssignment { value, .. } => search(value, off),
             FuncStmt::Expression(e, _) => search(e, off),
             FuncStmt::Break(_) | FuncStmt::Continue(_) => None,
             FuncStmt::Return(ReturnValue::Void, _) => None,
@@ -55,7 +72,8 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
             FuncStmt::Return(ReturnValue::SectionBlock(fs),_) => fs.iter().find_map(|f|search(&f.value,off)),
             FuncStmt::If(i) => search(&i.condition,off).or_else(||stmts(&i.then_stmts,off)).or_else(||stmts(&i.else_stmts,off)),
             FuncStmt::For(statement) => search(&statement.iterable,off).or_else(||stmts(&statement.body,off)),
-            FuncStmt::Try(_) => None,
+            FuncStmt::Try(statement) => stmts(&statement.body, off)
+                .or_else(|| stmts(&statement.handler, off)),
         })
     }
     program.items.iter().find_map(|item| match item {
@@ -63,6 +81,10 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
         TopLevelItem::Dynamic(v) => v.value.as_ref().and_then(|e|search(e,offset)),
         TopLevelItem::Section(s) => s.items.iter().find_map(|i| match i { SectionItem::Field(f)=>match &f.value {Some(FieldValue::Expr(e))=>search(e,offset), _=>None}, SectionItem::Spread(s)=>search(&s.expr,offset)}),
         TopLevelItem::Function(f) => stmts(&f.body.stmts,offset),
+        TopLevelItem::Impl(imp) => imp
+            .methods
+            .iter()
+            .find_map(|method| stmts(&method.function.body.stmts, offset)),
         TopLevelItem::FunctionGroup(g) => g.functions.iter().find_map(|f|stmts(&f.body.stmts,offset)),
         TopLevelItem::Statement(statement) => stmts(std::slice::from_ref(statement), offset),
         _ => None,
@@ -73,10 +95,29 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
 /// `IfStmt` whose span contains `offset` is found.
 pub fn find_if_at_offset(program: &Program, offset: usize) -> Option<bool> {
     for item in &program.items {
-        if let TopLevelItem::Function(fdecl) = item {
-            if let Some(has_else) = search_stmts_for_if(&fdecl.body.stmts, offset) {
-                return Some(has_else);
+        match item {
+            TopLevelItem::Function(fdecl) => {
+                if let Some(has_else) = search_stmts_for_if(&fdecl.body.stmts, offset) {
+                    return Some(has_else);
+                }
             }
+            TopLevelItem::Impl(imp) => {
+                for method in &imp.methods {
+                    if let Some(has_else) =
+                        search_stmts_for_if(&method.function.body.stmts, offset)
+                    {
+                        return Some(has_else);
+                    }
+                }
+            }
+            TopLevelItem::FunctionGroup(group) => {
+                for function in &group.functions {
+                    if let Some(has_else) = search_stmts_for_if(&function.body.stmts, offset) {
+                        return Some(has_else);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -175,6 +216,16 @@ pub fn find_index_elem_type_at_offset(
                 })
             }
             Expr::FieldAccess { base, .. } => expr_index_elem(base, symbols, offset),
+            Expr::Closure { body, .. } => match body {
+                spar::ast::ClosureBody::Expr(body) => expr_index_elem(body, symbols, offset),
+                spar::ast::ClosureBody::Block(body) => {
+                    stmts_index_elem(&body.stmts, symbols, offset)
+                }
+            },
+            Expr::MethodCall { receiver, args, .. } => expr_index_elem(receiver, symbols, offset)
+                .or_else(|| args.iter().find_map(|arg| expr_index_elem(arg, symbols, offset))),
+            Expr::StructuredPipe { input, stage, .. } => expr_index_elem(input, symbols, offset)
+                .or_else(|| expr_index_elem(stage, symbols, offset)),
             Expr::Literal(_)
             | Expr::NamespaceRef(_)
             | Expr::Shell(_)
@@ -230,13 +281,22 @@ pub fn find_index_elem_type_at_offset(
                         return Some(t);
                     }
                 }
-                FuncStmt::Assignment { value, .. } | FuncStmt::Expression(value, _) => {
+                FuncStmt::Assignment { value, .. }
+                | FuncStmt::FieldAssignment { value, .. }
+                | FuncStmt::Expression(value, _) => {
                     if let Some(t) = expr_index_elem(value, symbols, offset) {
                         return Some(t);
                     }
                 }
                 FuncStmt::Break(_) | FuncStmt::Continue(_) => {}
-                FuncStmt::Try(_) => {}
+                FuncStmt::Try(statement) => {
+                    if let Some(t) = stmts_index_elem(&statement.body, symbols, offset) {
+                        return Some(t);
+                    }
+                    if let Some(t) = stmts_index_elem(&statement.handler, symbols, offset) {
+                        return Some(t);
+                    }
+                }
             }
         }
         None
@@ -254,6 +314,22 @@ pub fn find_index_elem_type_at_offset(
             TopLevelItem::Function(fd) => {
                 if let Some(t) = stmts_index_elem(&fd.body.stmts, symbols, offset) {
                     return Some(t);
+                }
+            }
+            TopLevelItem::Impl(imp) => {
+                for method in &imp.methods {
+                    if let Some(t) =
+                        stmts_index_elem(&method.function.body.stmts, symbols, offset)
+                    {
+                        return Some(t);
+                    }
+                }
+            }
+            TopLevelItem::FunctionGroup(group) => {
+                for function in &group.functions {
+                    if let Some(t) = stmts_index_elem(&function.body.stmts, symbols, offset) {
+                        return Some(t);
+                    }
                 }
             }
             _ => {}
@@ -566,6 +642,64 @@ fn task_hover_at_offset(
         .iter()
         .find(|param| param.name == word)
         .map(format_hover_task_param)
+}
+
+
+fn format_hover_indexed_method(symbol: &IndexedSymbol) -> Option<String> {
+    let signature = symbol.signature.as_ref()?;
+    let receiver = match symbol.method_receiver {
+        Some(IndexedMethodReceiver::Shared) => "self",
+        Some(IndexedMethodReceiver::Mutable) => "mut self",
+        Some(IndexedMethodReceiver::Static) => "static",
+        None => "method",
+    };
+    let visibility = if symbol.private { "private " } else { "" };
+    let mut value = format!(
+        "```spar\n{visibility}method {}::{} [{}]\n{}\n```",
+        symbol.container_name.as_deref().unwrap_or("?"),
+        symbol.name,
+        receiver,
+        signature.label()
+    );
+    if let Some(documentation) = &symbol.documentation {
+        value.push_str("\n\n");
+        value.push_str(documentation);
+    }
+    Some(value)
+}
+
+fn indexed_method_hover_at(
+    uri: &Url,
+    state: &DocumentState,
+    pos: Position,
+    index: &WorkspaceIndex,
+) -> Option<String> {
+    let symbol = method_symbol_at_position(uri, state, pos, index)?;
+    format_hover_indexed_method(symbol)
+}
+
+fn local_binding_hover_at(state: &DocumentState, pos: Position) -> Option<String> {
+    let name = word_at_position(&state.source, pos);
+    if name.is_empty() {
+        return None;
+    }
+    let offset = lsp_pos_to_byte_offset(&state.source, pos);
+    let binding = local_binding_at_offset(state, &name, offset)?;
+    let mut ty = None;
+    let suffix = state.source.get(binding.decl_end..)?;
+    let trimmed = suffix.trim_start();
+    if let Some(after_colon) = trimmed.strip_prefix(':') {
+        let value = after_colon
+            .split([',', ')', '=', '{', ';'])
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        ty = value.map(ToString::to_string);
+    }
+    Some(match ty {
+        Some(ty) => format!("```spar\n(local binding) {name}: {ty}\n```"),
+        None => format!("```spar\n(local binding) {name}\n```"),
+    })
 }
 
 /// Hover text for the optional shell / OS words in `run [shell] [os] { }`.

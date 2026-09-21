@@ -209,6 +209,209 @@ fn collect_operator_between(source: &str, start: usize, end: usize, out: &mut Ve
     }
 }
 
+
+fn find_bounded_token(source: &str, start: usize, end: usize, needle: &str) -> Option<(usize, usize)> {
+    if start >= end || end > source.len() {
+        return None;
+    }
+    let slice = &source[start..end];
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut search = 0usize;
+    while search <= slice.len().saturating_sub(needle.len()) {
+        let relative = slice[search..].find(needle)? + search;
+        let before = relative
+            .checked_sub(1)
+            .and_then(|index| slice.as_bytes().get(index))
+            .is_none_or(|byte| !is_ident(*byte));
+        let after_index = relative + needle.len();
+        let after = slice
+            .as_bytes()
+            .get(after_index)
+            .is_none_or(|byte| !is_ident(*byte));
+        if before && after {
+            let absolute = start + relative;
+            return Some((absolute, absolute + needle.len()));
+        }
+        search = relative + needle.len().max(1);
+    }
+    None
+}
+
+fn collect_structured_separator(
+    source: &str,
+    start: usize,
+    end: usize,
+    out: &mut Vec<RawToken>,
+) {
+    if start >= end || end > source.len() {
+        return;
+    }
+    if let Some(relative) = source[start..end].rfind("|>") {
+        let byte = start + relative;
+        if let Some(token) = raw_token_from_bytes(
+            source,
+            byte,
+            byte + 2,
+            TT_STRUCTURED_PIPE,
+            MOD_NONE,
+        ) {
+            out.push(token);
+        }
+    }
+}
+
+fn collect_codec_stage(
+    stage: &spar::ast::ShellCodecStage,
+    bridge: &str,
+    source: &str,
+    out: &mut Vec<RawToken>,
+) {
+    if let Some((start, end)) = find_bounded_token(source, stage.span.start, stage.span.end, bridge) {
+        if let Some(token) = raw_token_from_bytes(source, start, end, TT_KEYWORD, MOD_NONE) {
+            out.push(token);
+        }
+    }
+    if let Some((start, end)) = find_bounded_token(
+        source,
+        stage.span.start,
+        stage.span.end,
+        &stage.format,
+    ) {
+        if let Some(token) = raw_token_from_bytes(source, start, end, TT_SHELL_ARGUMENT, MOD_NONE) {
+            out.push(token);
+        }
+    }
+}
+
+fn collect_decoder_stage(
+    stage: &spar::ast::ShellDecodeStage,
+    search_start: usize,
+    source: &str,
+    kinds: &SemanticKinds,
+    out: &mut Vec<RawToken>,
+) {
+    if let Some((start, end)) = find_bounded_token(
+        source,
+        search_start.min(stage.decoder.span.start),
+        stage.decoder.span.start,
+        "from",
+    ) {
+        if let Some(token) = raw_token_from_bytes(source, start, end, TT_KEYWORD, MOD_NONE) {
+            out.push(token);
+        }
+    }
+
+    if let Some(namespace) = stage.decoder.namespace {
+        let namespace_text = namespace.as_str();
+        if let Some((start, end)) = find_bounded_token(
+            source,
+            stage.span.start,
+            stage.decoder.span.start,
+            namespace_text,
+        ) {
+            if let Some(token) = raw_token_from_bytes(source, start, end, TT_NAMESPACE, MOD_DEFAULT_LIBRARY | MOD_RESOLVED) {
+                out.push(token);
+            }
+        }
+    }
+
+    let resolved = spar::StructuredInputRegistry::builtin()
+        .resolve(stage.decoder.namespace, &stage.decoder.name, &stage.decoder.span)
+        .is_ok();
+    if let Some(token) = raw_token_from_bytes(
+        source,
+        stage.decoder.span.start,
+        stage.decoder.span.end,
+        TT_SHELL_ARGUMENT,
+        if resolved { MOD_DEFAULT_LIBRARY | MOD_RESOLVED } else { MOD_UNRESOLVED },
+    ) {
+        out.push(token);
+    }
+
+    for arg in &stage.args {
+        if let Some((start, end)) = find_bounded_token(
+            source,
+            arg.span.start,
+            arg.span.end,
+            &arg.name,
+        ) {
+            if let Some(token) = raw_token_from_bytes(source, start, end, TT_PROPERTY, MOD_NONE) {
+                out.push(token);
+            }
+        }
+        collect_expr_tokens(&arg.value, source, kinds, out);
+    }
+}
+
+fn collect_mixed_pipeline_tokens(
+    mixed: &spar::ast::ShellMixedPipeline,
+    source: &str,
+    kinds: &SemanticKinds,
+    resolver: &CommandResolver,
+    out: &mut Vec<RawToken>,
+) {
+    let mut previous_end = None;
+    for command in &mixed.input {
+        let (start, end) = command_bounds(command);
+        if let Some(previous) = previous_end {
+            collect_operator_between(source, previous, start, out);
+        }
+        collect_shell_command_tokens(command, source, kinds, resolver, out);
+        previous_end = Some(end);
+    }
+
+    if let Some(previous) = previous_end {
+        collect_operator_between(source, previous, mixed.decoder.span.start, out);
+        collect_decoder_stage(&mixed.decoder, previous, source, kinds, out);
+    } else {
+        collect_decoder_stage(&mixed.decoder, mixed.span.start, source, kinds, out);
+    }
+
+    let mut structured_end = mixed.decoder.span.end;
+    for stage in &mixed.stages {
+        let span = expr_span(stage);
+        collect_structured_separator(source, structured_end, span.start, out);
+        collect_expr_tokens(stage, source, kinds, out);
+        structured_end = span.end;
+    }
+
+    if let Some(encoder) = &mixed.encoder {
+        collect_structured_separator(source, structured_end, encoder.span.start, out);
+        collect_codec_stage(encoder, "to", source, out);
+        structured_end = encoder.span.end;
+    }
+
+    if let Some(redirect) = &mixed.encoder_redirect {
+        if let Some((start, end)) = redirect_operator_range(source, redirect) {
+            if let Some(token) = raw_token_from_bytes(source, start, end, TT_SHELL_REDIRECT, MOD_NONE) {
+                out.push(token);
+            }
+        }
+        collect_shell_word_tokens(
+            &redirect.target,
+            source,
+            kinds,
+            TT_SHELL_ARGUMENT,
+            MOD_NONE,
+            out,
+        );
+    }
+
+    let mut previous = if mixed.encoder.is_some() {
+        Some(structured_end)
+    } else {
+        None
+    };
+    for command in &mixed.output {
+        let (start, end) = command_bounds(command);
+        if let Some(previous) = previous {
+            collect_operator_between(source, previous, start, out);
+        }
+        collect_shell_command_tokens(command, source, kinds, resolver, out);
+        previous = Some(end);
+    }
+}
+
 fn collect_shell_semantic_tokens_with_resolver(
     shell: &spar::ast::ShellExpr,
     source: &str,
@@ -217,20 +420,41 @@ fn collect_shell_semantic_tokens_with_resolver(
     out: &mut Vec<RawToken>,
 ) {
     collect_stmts_tokens(&shell.statements, source, kinds, out);
-    let mut previous_end = None;
+    let mut previous_step_end = None;
     for (_, step) in &shell.steps {
-        let commands: Vec<&spar::ast::ShellCommandExpr> = match step {
-            spar::ast::ShellStep::Command(command) => vec![command.as_ref()],
-            spar::ast::ShellStep::Pipeline(commands) => commands.iter().collect(),
-        };
-        for command in commands {
-            let (start, end) = command_bounds(command);
-            if let Some(previous) = previous_end {
-                collect_operator_between(source, previous, start, out);
+        let (step_start, step_end) = match step {
+            spar::ast::ShellStep::Command(command) => command_bounds(command),
+            spar::ast::ShellStep::Pipeline(commands) => {
+                let Some(first) = commands.first() else { continue };
+                let Some(last) = commands.last() else { continue };
+                (first.span.start, last.span.end)
             }
-            collect_shell_command_tokens(command, source, kinds, resolver, out);
-            previous_end = Some(end);
+            spar::ast::ShellStep::MixedPipeline(mixed) => (mixed.span.start, mixed.span.end),
+        };
+        if let Some(previous) = previous_step_end {
+            collect_operator_between(source, previous, step_start, out);
         }
+
+        match step {
+            spar::ast::ShellStep::Command(command) => {
+                collect_shell_command_tokens(command, source, kinds, resolver, out);
+            }
+            spar::ast::ShellStep::Pipeline(commands) => {
+                let mut previous_end = None;
+                for command in commands {
+                    let (start, end) = command_bounds(command);
+                    if let Some(previous) = previous_end {
+                        collect_operator_between(source, previous, start, out);
+                    }
+                    collect_shell_command_tokens(command, source, kinds, resolver, out);
+                    previous_end = Some(end);
+                }
+            }
+            spar::ast::ShellStep::MixedPipeline(mixed) => {
+                collect_mixed_pipeline_tokens(mixed, source, kinds, resolver, out);
+            }
+        }
+        previous_step_end = Some(step_end);
     }
 }
 

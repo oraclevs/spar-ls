@@ -103,6 +103,49 @@ fn document_symbols(state: &DocumentState) -> Vec<DocumentSymbol> {
                 Some("dynamic".to_string()),
                 Vec::new(),
             )),
+            TopLevelItem::Impl(imp) => {
+                let target = format_spar_type(&imp.target);
+                let children = imp
+                    .methods
+                    .iter()
+                    .map(|method| {
+                        let function = &method.function;
+                        let params = function
+                            .params
+                            .iter()
+                            .map(|param| {
+                                document_symbol(
+                                    &state.source,
+                                    param.name.clone(),
+                                    SymbolKind::VARIABLE,
+                                    &param.span,
+                                    None,
+                                    Some(format_spar_type(&param.ty)),
+                                    Vec::new(),
+                                )
+                            })
+                            .collect();
+                        document_symbol(
+                            &state.source,
+                            function.name.clone(),
+                            SymbolKind::METHOD,
+                            &function.span,
+                            Some(&function.name_span),
+                            Some(format!("-> {}", format_spar_type(&function.ret))),
+                            params,
+                        )
+                    })
+                    .collect();
+                out.push(document_symbol(
+                    &state.source,
+                    format!("impl {target}"),
+                    SymbolKind::NAMESPACE,
+                    &imp.span,
+                    None,
+                    Some("impl".to_string()),
+                    children,
+                ));
+            }
             TopLevelItem::Function(function) => {
                 let children = function.params.iter().map(|param| document_symbol(
                     &state.source,

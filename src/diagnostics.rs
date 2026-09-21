@@ -1,5 +1,5 @@
 use spar::{Span, SparError};
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
 pub fn error_span(error: &SparError) -> &Span {
     match error {
@@ -44,6 +44,9 @@ pub fn spar_error_to_diagnostic(error: &SparError) -> Diagnostic {
         line: start.line,
         character: start.character + (span.end.saturating_sub(span.start) as u32).max(1),
     };
+    let code = error_message(error)
+        .starts_with("structured pipe")
+        .then(|| NumberOrString::String("structured-pipe".to_string()));
     Diagnostic {
         range: Range { start, end },
         severity: Some(if matches!(error, SparError::EvalError { .. }) {
@@ -51,6 +54,7 @@ pub fn spar_error_to_diagnostic(error: &SparError) -> Diagnostic {
         } else {
             DiagnosticSeverity::ERROR
         }),
+        code,
         message,
         source: Some("spar".into()),
         ..Default::default()
