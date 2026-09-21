@@ -16,7 +16,10 @@ fn line_bounds(source: &str, offset: usize) -> Option<(usize, usize)> {
 }
 
 /// Attribute-name completions when the cursor is inside an unclosed `#[`.
-pub(crate) fn attribute_completion_items(source: &str, offset: usize) -> Option<Vec<CompletionItem>> {
+pub(crate) fn attribute_completion_items(
+    source: &str,
+    offset: usize,
+) -> Option<Vec<CompletionItem>> {
     let (start, _) = line_bounds(source, offset)?;
     let prefix = &source[start..offset.min(source.len())];
     let open = prefix.rfind("#[")?;
@@ -43,7 +46,8 @@ pub(crate) fn attribute_hover_at(source: &str, offset: usize) -> Option<String> 
     let column = offset.min(source.len()) - start;
     let open = line[..column.min(line.len())].rfind("#[").or_else(|| {
         // Cursor exactly on the `#` or `[`.
-        line.get(column.saturating_sub(1)..).and_then(|_| line.find("#["))
+        line.get(column.saturating_sub(1)..)
+            .and_then(|_| line.find("#["))
     })?;
     let name_start = open + 2;
     let close = line[name_start..].find(']')? + name_start;
