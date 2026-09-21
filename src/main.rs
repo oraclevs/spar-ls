@@ -1,5 +1,6 @@
 //! Spar Language Server — speaks LSP over stdio.
 
+mod attribute_intelligence;
 mod diagnostics;
 mod task_context;
 
@@ -980,6 +981,17 @@ impl LanguageServer for SparLanguageServer {
             None => return Ok(None),
         };
         let decoder_offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(value) =
+            attribute_intelligence::attribute_hover_at(&state.source, decoder_offset)
+        {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }));
+        }
         if let Some(value) = decoder_hover_at(&state.source, decoder_offset) {
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -1408,6 +1420,11 @@ impl LanguageServer for SparLanguageServer {
         }
 
         let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(items) =
+            attribute_intelligence::attribute_completion_items(&state.source, offset)
+        {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
         if let Some(items) = decoder_completion_items(&state.source, offset) {
             return Ok(Some(CompletionResponse::Array(items)));
         }
@@ -3945,8 +3962,24 @@ mod tests {
     }
 
     #[test]
+    fn semantic_tokens_classify_attribute_and_schema_keyword() {
+        let src = "#[emit]\nstruct A { x: int = 1; };\n";
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(
+            find_tok(&tokens, "emit", src).unwrap().token_type,
+            TT_DECLARATION_KEYWORD
+        );
+        let schema_src = "schema Server { host: str; };\n";
+        let schema_tokens = decode_semantic_tokens(schema_src);
+        assert_eq!(
+            find_tok(&schema_tokens, "schema", schema_src).unwrap().token_type,
+            TT_DECLARATION_KEYWORD
+        );
+    }
+
+    #[test]
     fn semantic_tokens_schema_section_name_classified_as_type() {
-        let src = "@SchemaFile\nSchema [Container]{ x?: str; };\n";
+        let src = "schema Container { x?: str; };\n";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Container", src).expect("Container not found");
         assert_eq!(tok.token_type, TT_TYPE);

@@ -1272,7 +1272,7 @@ fn collect_tokens_with_kinds(
 fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
     use spar::token::Token;
     // Soft keywords the lexer emits as plain identifiers.
-    const SOFT_KEYWORDS: &[&str] = &["pkg", "from", "task", "type", "Schema", "SchemaFrom", "functionGroup"];
+    const SOFT_KEYWORDS: &[&str] = &["pkg", "from", "task", "type", "schema", "functionGroup"];
     // Built-in generic/type identifiers (not keywords in the lexer).
     const BUILTIN_TYPE_IDENTS: &[&str] = &["List", "Map", "Promise"];
     // Scanning tokens (not raw text) means words inside strings, comments and
@@ -1280,8 +1280,17 @@ fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
     let Ok(tokens) = Lexer::new(source).tokenize() else {
         return;
     };
+    let mut after_hash_bracket = false;
     for spanned in &tokens {
         let (token_type, modifiers) = match &spanned.token {
+            Token::HashBracket => {
+                after_hash_bracket = true;
+                (TT_DECLARATION_KEYWORD, MOD_NONE)
+            }
+            Token::Ident(_) if after_hash_bracket => {
+                after_hash_bracket = false;
+                (TT_DECLARATION_KEYWORD, MOD_NONE)
+            }
             Token::Var | Token::KwMut | Token::Export | Token::Import | Token::As
             | Token::Dynamic | Token::Private | Token::KwAsync | Token::KwFunction
             | Token::KwStruct => (TT_DECLARATION_KEYWORD, MOD_NONE),
@@ -1372,7 +1381,7 @@ fn collect_type_fields_tokens(
     }
 }
 
-/// Same idea as `collect_type_fields_tokens`, for `Schema [Name]{ ... }`
+/// Same idea as `collect_type_fields_tokens`, for `schema Name { ... }`
 /// field bodies (`SchemaFieldShape` has no `Named` variant, so there's no
 /// type-reference token to emit — just property names, recursively).
 fn collect_schema_fields_tokens(

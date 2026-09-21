@@ -119,7 +119,7 @@ fn insertion_header_offset(source: &str) -> usize {
     let mut offset = 0usize;
     for line in source.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("#!") || trimmed.starts_with("@SchemaFile") || trimmed.starts_with("@LoadEnv") || trimmed.is_empty() {
+        if trimmed.starts_with("#!") || trimmed.starts_with("@LoadEnv") || trimmed.is_empty() {
             offset += line.len();
         } else {
             break;
