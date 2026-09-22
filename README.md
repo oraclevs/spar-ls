@@ -1,10 +1,8 @@
 # spar-ls
 
-**Portable Language Server Protocol implementation for Spar.**
+The editor-neutral intelligence layer for [Spar](https://github.com/oraclevs/spar): hover, completion, diagnostics, rename, and formatting, all speaking standard LSP over stdio. It links directly against the `spar` compiler, parser, and resolver instead of maintaining a second implementation of the language that could drift from the real one.
 
-`spar-ls` is the editor-neutral intelligence layer for the Spar language. It speaks standard LSP over stdio and links directly against the `spar` compiler/parser/resolver rather than maintaining a second language implementation.
-
-The server is deliberately not tied to VS Code. Thin clients can use the same binary from VS Code, Neovim, Zed, Helix, JetBrains IDEs with an LSP client, or any other editor that implements the relevant Language Server Protocol methods.
+Nothing here is tied to VS Code. The same binary works from Neovim, Zed, Helix, JetBrains with an LSP client, or any other editor that speaks the protocol.
 
 ## Launch contract
 
@@ -18,7 +16,7 @@ Verify the installed build with:
 
 ```bash
 spar-ls --version
-# spar-ls 0.5.0 (intelligence-core-v2)
+# spar-ls 0.6.0
 ```
 
 ## Portable feature matrix
