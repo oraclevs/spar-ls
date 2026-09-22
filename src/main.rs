@@ -4424,8 +4424,12 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
             .collect::<Vec<_>>();
         assert!(labels.contains(&"ping"), "{labels:?}");
         assert!(labels.contains(&"ping-s"), "{labels:?}");
+        // `csv`/`toml`/`yaml` are no longer safe guards here: SCOC's JC-parity
+        // catalog now registers its own parsers under those names too, distinct
+        // from the native codecs. `jsonl` has no SCOC counterpart, so it still
+        // proves codec-kind entries don't leak into the `scoc::` list.
         assert!(
-            !labels.contains(&"csv"),
+            !labels.contains(&"jsonl"),
             "native codecs do not belong in scoc::: {labels:?}"
         );
     }
