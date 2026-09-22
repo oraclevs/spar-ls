@@ -216,25 +216,35 @@ fn decoder_descriptor_for_context(
         spar::DecoderNamespace::Custom => spar::DecoderKind::Custom,
     });
 
+    // A synthesized compatibility-alias descriptor (`ping-s`, `compatibility_alias_for:
+    // Some("ping")`) and its parent's plain descriptor (`ping`, which may also list
+    // `ping-s` in its own `.aliases`) can both answer to the same name. An exact
+    // `.name` match always identifies the specific thing being asked about, so it
+    // must win over an indirect `.aliases` hit on some other descriptor - otherwise
+    // vec order silently picks the wrong one.
+    let exact_name_match = |kind: spar::DecoderKind| {
+        descriptors
+            .iter()
+            .find(|descriptor| descriptor.kind == kind && descriptor.name == name)
+            .cloned()
+    };
+    let alias_match = |kind: spar::DecoderKind| {
+        descriptors
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == kind && descriptor.aliases.iter().any(|alias| alias == name)
+            })
+            .cloned()
+    };
+
     if let Some(kind) = wanted_kind {
-        return descriptors.into_iter().find_map(|descriptor| {
-            if descriptor.kind != kind {
-                return None;
-            }
-            if descriptor.name == name || descriptor.aliases.iter().any(|alias| alias == name) {
-                return Some(descriptor);
-            }
-            None
-        });
+        return exact_name_match(kind).or_else(|| alias_match(kind));
     }
 
     // Preserve runtime precedence for unqualified names: codec -> SCOC -> custom.
     for kind in [spar::DecoderKind::Codec, spar::DecoderKind::Scoc, spar::DecoderKind::Custom] {
-        if let Some(descriptor) = descriptors.iter().find(|descriptor| {
-            descriptor.kind == kind
-                && (descriptor.name == name || descriptor.aliases.iter().any(|alias| alias == name))
-        }) {
-            return Some(descriptor.clone());
+        if let Some(descriptor) = exact_name_match(kind).or_else(|| alias_match(kind)) {
+            return Some(descriptor);
         }
     }
     None
