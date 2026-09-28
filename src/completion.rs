@@ -517,7 +517,7 @@ fn structured_pipe_completion_items(
         .iter()
         .chain(symbols.imported_functions.iter())
     {
-        if !name.starts_with(stage_prefix) || seen.contains(name) {
+        if !name.starts_with(stage_prefix) || seen.contains(name) || is_internal_dependency_name(name) {
             continue;
         }
         let Some((remaining, output)) = pipeline_function_result(entry, &input_type) else {
@@ -551,7 +551,7 @@ fn structured_pipe_completion_items(
     }
 
     for (name, entry) in &symbols.globals {
-        if !name.starts_with(stage_prefix) || seen.contains(name) {
+        if !name.starts_with(stage_prefix) || seen.contains(name) || is_internal_dependency_name(name) {
             continue;
         }
         let GlobalEntry::Var { ty, .. } = entry else {
@@ -1062,7 +1062,7 @@ fn constructor_completion_items(
             continue;
         }
         let owner = &path[0];
-        if !seen.insert(owner.clone()) {
+        if is_internal_dependency_name(owner) || !seen.insert(owner.clone()) {
             continue;
         }
         let Some(constructor) = index.visible_constructor_for_owner(uri, owner) else {
@@ -1121,6 +1121,7 @@ fn builtin_items() -> Vec<CompletionItem> {
 fn function_completion_items(functions: &HashMap<String, FunctionEntry>, snippets: bool) -> Vec<CompletionItem> {
     functions
         .iter()
+        .filter(|(name, _)| !is_internal_dependency_name(name))
         .map(|(name, entry)| {
             let param_list = entry
                 .params

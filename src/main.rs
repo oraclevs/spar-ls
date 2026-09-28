@@ -106,6 +106,23 @@ fn format_spar_type(ty: &SparType) -> String {
     spar::typechecker::display_type(ty)
 }
 
+/// True for a name the compiler generated itself, never one the user could
+/// have typed. `loader_scope::isolate` mangles every declaration a selective
+/// import (`import pkg { a, b } from "...";`) doesn't explicitly name to
+/// `sparModule<hash>Name` (or `SparModule<hash>Name` for an uppercase-led
+/// name) before splicing it into the importing file's own program — but a
+/// *private helper the requested item's body calls* still has to travel
+/// along with it for typechecking/evaluation to work, so it lands as a real
+/// entry in `SymbolTable.functions`/`.structs`/`.enums` for that file, under
+/// its mangled name, even though it never appears anywhere in the user's own
+/// source. Any hover/completion/go-to-definition surface that enumerates
+/// those maps (rather than looking up one already-known name) must skip
+/// these — otherwise the compiler's internal plumbing leaks into the editor
+/// as a stray, hex-suffixed suggestion the user never wrote and can't use.
+fn is_internal_dependency_name(name: &str) -> bool {
+    name.starts_with("sparModule") || name.starts_with("SparModule")
+}
+
 // ── Inferred-type resolution ────────────────────────────────────────────────
 /// Resolve nested fields through the same substituted struct metadata as constructors.
 fn resolve_shape_for_path(symbols: &SymbolTable, path: &[String]) -> Option<Vec<spar::ast::TypeField>> {
@@ -1006,7 +1023,7 @@ impl LanguageServer for SparLanguageServer {
                         // hovering on struct name: base::[Minor]
                         let sec_path = vec![word.clone()];
                         if let Some(struct_entry) = imported_sym.structs.get(&sec_path) {
-                            let value = format_hover_struct(imported_sym, &sec_path, struct_entry);
+                            let value = format_hover_struct(imported_sym, &sec_path, struct_entry, None);
                             return Ok(Some(Hover {
                                 contents: HoverContents::Markup(MarkupContent {
                                     kind: MarkupKind::Markdown,
@@ -1129,7 +1146,7 @@ impl LanguageServer for SparLanguageServer {
         if !word.is_empty() {
             let top_key = vec![word.clone()];
             if let Some(struct_entry) = symbols.structs.get(&top_key) {
-                let value = format_hover_struct(symbols, &top_key, struct_entry);
+                let value = format_hover_struct(symbols, &top_key, struct_entry, Some(&state.source));
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1143,8 +1160,11 @@ impl LanguageServer for SparLanguageServer {
         // Case 3: nested struct — word matches a non-first segment of any path
         if !word.is_empty() {
             for (path, struct_entry) in &symbols.structs {
-                if path.len() > 1 && path.last().map(|s| s.as_str()) == Some(word.as_str()) {
-                    let value = format_hover_struct(symbols, path, struct_entry);
+                if path.len() > 1
+                    && path.last().map(|s| s.as_str()) == Some(word.as_str())
+                    && !is_internal_dependency_name(&path[0])
+                {
+                    let value = format_hover_struct(symbols, path, struct_entry, Some(&state.source));
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -1216,7 +1236,7 @@ impl LanguageServer for SparLanguageServer {
         // Case 5: user-defined function
         if !word.is_empty() {
             if let Some(entry) = symbols.functions.get(&word) {
-                let value = format_hover_function(&word, entry);
+                let value = format_hover_function(&word, entry, Some(&state.source));
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1572,6 +1592,9 @@ impl LanguageServer for SparLanguageServer {
                 }),
         );
         for (name, entry) in &symbols.globals {
+            if is_internal_dependency_name(name) {
+                continue;
+            }
             let detail = match entry {
                 spar::resolver::GlobalEntry::Var { ty, .. } => Some(format_spar_type(ty)),
                 spar::resolver::GlobalEntry::Dynamic { .. } => Some("dynamic".to_string()),
@@ -2521,6 +2544,65 @@ mod tests {
         let symbols = resolve_src(src);
         let pos = word_pos(src, "x", 0);
         assert!(hover_type_enum_group(&symbols, src, pos, "x").is_none());
+    }
+
+    #[test]
+    fn hover_type_enum_group_includes_doc_comment_on_type_and_enum() {
+        let src = concat!(
+            "/// A border's stroke width.\n",
+            "struct Border{ width: int; };\n",
+            "/// Traffic light colors.\n",
+            "enum Color { Red, Green, Blue };\n",
+        );
+        let symbols = resolve_src(src);
+        let border_pos = word_pos(src, "Border", 0);
+        let border = hover_type_enum_group(&symbols, src, border_pos, "Border").expect("type hover");
+        assert!(border.contains("A border's stroke width."), "{border}");
+
+        let color_pos = word_pos(src, "Color", 0);
+        let color = hover_type_enum_group(&symbols, src, color_pos, "Color").expect("enum hover");
+        assert!(color.contains("Traffic light colors."), "{color}");
+    }
+
+    #[test]
+    fn format_hover_struct_includes_doc_comment() {
+        let src = concat!(
+            "/// A bible verser struct\n",
+            "struct BibleVerses { text: str; };\n",
+        );
+        let symbols = resolve_src(src);
+        let path = vec!["BibleVerses".to_string()];
+        let struct_entry = symbols.structs.get(&path).expect("struct entry");
+        let value = format_hover_struct(&symbols, &path, struct_entry, Some(src));
+        assert!(value.contains("struct BibleVerses"), "{value}");
+        assert!(value.contains("A bible verser struct"), "{value}");
+    }
+
+    #[test]
+    fn format_hover_struct_omits_doc_comment_when_source_unknown() {
+        let src = concat!(
+            "/// A bible verser struct\n",
+            "struct BibleVerses { text: str; };\n",
+        );
+        let symbols = resolve_src(src);
+        let path = vec!["BibleVerses".to_string()];
+        let struct_entry = symbols.structs.get(&path).expect("struct entry");
+        let value = format_hover_struct(&symbols, &path, struct_entry, None);
+        assert!(value.contains("struct BibleVerses"), "{value}");
+        assert!(!value.contains("A bible verser struct"), "{value}");
+    }
+
+    #[test]
+    fn format_hover_function_includes_doc_comment() {
+        let src = concat!(
+            "/// Adds two numbers.\n",
+            "fn add(a: int, b: int) -> int { return a + b; };\n",
+        );
+        let symbols = resolve_src(src);
+        let entry = symbols.functions.get("add").expect("function entry");
+        let value = format_hover_function("add", entry, Some(src));
+        assert!(value.contains("fn add(a: int, b: int) -> int"), "{value}");
+        assert!(value.contains("Adds two numbers."), "{value}");
     }
 
     #[test]
@@ -3908,6 +3990,55 @@ mod tests {
         let tokens = Lexer::new(src).tokenize().expect("lex");
         let prog = Parser::new(tokens).parse().expect("parse");
         Resolver::new().resolve(&prog, &[]).expect("resolve")
+    }
+
+    /// Regression, modeled on a real-world repro (`base.spar` selectively
+    /// importing `get` from `std/http`, whose body calls the module-private
+    /// `request` helper): a selective import's requested function can call a
+    /// private helper in its own module. That helper travels with it into
+    /// the importing file's own compiled `SymbolTable` under its
+    /// `loader_scope::isolate` mangled name (`sparModule<hash>Helper`) since
+    /// it was never itself requested — see `splice_selective`'s "Functions
+    /// the spliced body calls travel with it" step. That mangled name must
+    /// never reach a user-facing completion list — see
+    /// `is_internal_dependency_name`.
+    #[test]
+    fn function_completion_items_excludes_leaked_import_dependency_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("net.spar"),
+            concat!(
+                "fn helper(x: int) -> int { return x + 1; };\n",
+                "fn publicFn(x: int) -> int { return helper(x: x); };\n",
+            ),
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.spar");
+        let source = "import { publicFn } from \"net.spar\";\n";
+        let state = SparLanguageServer::analyze_path(source, &main_path);
+        assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
+        let symbols = state.effective_symbols().expect("symbols");
+        assert!(
+            symbols.functions.keys().any(|name| is_internal_dependency_name(name)),
+            "expected this fixture to still exercise a leaked dependency name; \
+             functions: {:?}",
+            symbols.functions.keys().collect::<Vec<_>>()
+        );
+        let items = function_completion_items(&symbols.functions, false);
+        assert!(
+            items.iter().all(|item| !is_internal_dependency_name(&item.label)),
+            "{:?}",
+            items.iter().map(|item| &item.label).collect::<Vec<_>>()
+        );
+        assert!(items.iter().any(|item| item.label == "publicFn"), "{:?}", items);
+    }
+
+    #[test]
+    fn is_internal_dependency_name_matches_isolate_prefixes() {
+        assert!(is_internal_dependency_name("sparModulee235b8b90a693d83Request"));
+        assert!(is_internal_dependency_name("SparModulee235b8b90a693d83HttpClient"));
+        assert!(!is_internal_dependency_name("get"));
+        assert!(!is_internal_dependency_name("HttpResponse"));
     }
 
     #[test]

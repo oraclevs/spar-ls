@@ -298,7 +298,11 @@ fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Loca
     }
     let symbols = state.effective_symbols()?;
     let span = symbol_span(symbols, &prefix, &word).or_else(|| {
-        symbols.structs.values().find_map(|s| s.fields.get(&word).map(|f| f.span.clone()))
+        symbols
+            .structs
+            .iter()
+            .filter(|(path, _)| !path.first().is_some_and(|owner| is_internal_dependency_name(owner)))
+            .find_map(|(_, s)| s.fields.get(&word).map(|f| f.span.clone()))
     })?;
     // Declaration spans often start at a keyword (`var`, `type`); point at the name.
     let span = ident_span_in(&state.source, &span, &word).unwrap_or(span);

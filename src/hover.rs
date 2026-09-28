@@ -343,7 +343,22 @@ fn format_hover_global(name: &str, entry: &GlobalEntry) -> String {
     format!("```spar\n(var) {}: {}\n```", name, ty_str)
 }
 
-fn format_hover_struct(symbols: &SymbolTable, path: &[String], struct_entry: &StructEntry) -> String {
+/// A declaration's own file, when known — hover on a symbol imported from
+/// another file has no source text on hand to re-lex for `///` comments, so
+/// callers pass `None` there rather than risk re-lexing the wrong file.
+fn doc_suffix(source: Option<&str>, declaration_start: usize) -> String {
+    source
+        .and_then(|src| leading_documentation(src, declaration_start))
+        .map(|doc| format!("\n\n{}", doc))
+        .unwrap_or_default()
+}
+
+fn format_hover_struct(
+    symbols: &SymbolTable,
+    path: &[String],
+    struct_entry: &StructEntry,
+    source: Option<&str>,
+) -> String {
     let struct_label = path.join(".");
     let field_list: String = struct_entry
         .fields
@@ -362,10 +377,15 @@ fn format_hover_struct(symbols: &SymbolTable, path: &[String], struct_entry: &St
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("```spar\nstruct {} {{\n{}\n}}\n```", struct_label, field_list)
+    format!(
+        "```spar\nstruct {} {{\n{}\n}}\n```{}",
+        struct_label,
+        field_list,
+        doc_suffix(source, struct_entry.span.start)
+    )
 }
 
-fn format_hover_function(name: &str, entry: &FunctionEntry) -> String {
+fn format_hover_function(name: &str, entry: &FunctionEntry, source: Option<&str>) -> String {
     let params_str = entry
         .params
         .iter()
@@ -373,14 +393,15 @@ fn format_hover_function(name: &str, entry: &FunctionEntry) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "```spar\nfn {}({}) -> {}\n```",
+        "```spar\nfn {}({}) -> {}\n```{}",
         name,
         params_str,
-        format_spar_type(&entry.ret)
+        format_spar_type(&entry.ret),
+        doc_suffix(source, entry.span.start)
     )
 }
 
-fn format_hover_type(name: &str, entry: &TypeEntry) -> String {
+fn format_hover_type(name: &str, entry: &TypeEntry, source: &str) -> String {
     let field_list: String = entry
         .fields
         .iter()
@@ -392,13 +413,17 @@ fn format_hover_type(name: &str, entry: &TypeEntry) -> String {
     let parameters = if entry.type_parameters.is_empty() { String::new() } else {
         format!("<{}>", entry.type_parameters.iter().map(|parameter| parameter.name.as_str()).collect::<Vec<_>>().join(", "))
     };
-    format!("```spar\nstruct {name}{parameters} {{\n{field_list}\n}};\n```")
+    format!(
+        "```spar\nstruct {name}{parameters} {{\n{field_list}\n}};\n```{}",
+        doc_suffix(Some(source), entry.span.start)
+    )
 }
 
-fn format_hover_enum(name: &str, entry: &EnumEntry) -> String {
+fn format_hover_enum(name: &str, entry: &EnumEntry, source: &str) -> String {
     format!(
-        "```spar\nenum {name} {{ {} }}\n```",
-        entry.variants.join(", ")
+        "```spar\nenum {name} {{ {} }}\n```{}",
+        entry.variants.join(", "),
+        doc_suffix(Some(source), entry.span.start)
     )
 }
 
@@ -417,10 +442,10 @@ fn hover_type_enum_group(
     word: &str,
 ) -> Option<String> {
     if let Some(entry) = symbols.types.get(word) {
-        return Some(format_hover_type(word, entry));
+        return Some(format_hover_type(word, entry, source));
     }
     if let Some(entry) = symbols.enums.get(word) {
-        return Some(format_hover_enum(word, entry));
+        return Some(format_hover_enum(word, entry, source));
     }
     if let Some(entry) = symbols.function_groups.get(word) {
         return Some(format_hover_function_group(word, entry));
@@ -436,7 +461,7 @@ fn hover_type_enum_group(
     }
     if let Some(entry) = symbols.function_groups.get(&prefix[0]) {
         if let Some(member) = entry.functions.get(word) {
-            return Some(format_hover_function(word, member));
+            return Some(format_hover_function(word, member, Some(source)));
         }
     }
     None
