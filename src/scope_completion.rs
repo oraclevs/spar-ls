@@ -216,7 +216,12 @@ fn local_names_at(source: &str, offset: usize) -> Vec<ScopeName> {
                                 }
                             }
                             Token::Ident(name)
-                                if depth == 1 && position == cursor + 1 && name == "self" =>
+                                if depth == 1
+                                    && name == "self"
+                                    && (position == cursor + 1
+                                        || (position == cursor + 2
+                                            && tokens.get(cursor + 1).copied()
+                                                == Some(&Token::KwMut))) =>
                             {
                                 if let Some(Some(owner)) = owner_stack.last() {
                                     let mut param = ScopeName::new(

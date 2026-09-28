@@ -1990,6 +1990,41 @@ fn member_completion_after_self_inside_an_impl_method_offers_receiver_fields() {
     );
 }
 
+const HUMAN_MUT_IMPL_SOURCE: &str = concat!(
+    "struct Human {\n",
+    "    name: str = \"Unknown\";\n",
+    "    age: int = 0;\n",
+    "};\n",
+    "impl Human {\n",
+    "    function rename(mut self, next: str) -> void {\n",
+    "        self.name = next;\n",
+    "    };\n",
+    "};\n",
+);
+
+#[test]
+fn member_completion_after_mut_self_inside_an_impl_method_offers_receiver_fields() {
+    // Same gap as plain `self` above, but for a mutable receiver: `mut self`
+    // puts `mut` as the first token after `(`, not `self` itself, so the
+    // "self is the very first param token" check needs to look one token
+    // further when `mut` precedes it.
+    let state =
+        SparLanguageServer::analyze(HUMAN_MUT_IMPL_SOURCE, std::path::Path::new("/workspace"));
+    let symbols = state.effective_symbols().expect("symbols").clone();
+    let (source, offset) = marked(&HUMAN_MUT_IMPL_SOURCE.replace("self.name = next", "self.|"));
+    let labels = typed_member_items(&source, offset, &symbols)
+        .map(|items| items.into_iter().map(|item| item.label).collect::<Vec<_>>());
+    assert_eq!(
+        labels,
+        Some(vec![
+            "name".to_string(),
+            "age".to_string(),
+            "toString".to_string(),
+            "typeName".to_string()
+        ])
+    );
+}
+
 #[test]
 fn member_completion_on_a_list_offers_no_fields() {
     let source = HUMAN_SOURCE.replace("return 0;\n};", "var x: int = people.|;\n    return 0;\n};");
