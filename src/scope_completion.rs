@@ -176,10 +176,23 @@ fn local_names_at(source: &str, offset: usize) -> Vec<ScopeName> {
     let tokens: Vec<&Token> = lexed.iter().map(|spanned| &spanned.token).collect();
 
     let mut stack: Vec<Vec<ScopeName>> = Vec::new();
+    // Tracks the receiver type name for a `self` parameter: pushed/popped in
+    // lockstep with `stack` at each brace, so it's `Some(owner)` exactly
+    // while scanning inside `impl Owner { ... }`. `self` has no `: Type`
+    // annotation in source (its type is implicit), so it can't be captured
+    // by the generic `Ident ':' Type` parameter parsing below — it needs
+    // this separate, explicit case.
+    let mut owner_stack: Vec<Option<String>> = Vec::new();
+    let mut pending_owner: Option<String> = None;
     let mut pending: Vec<ScopeName> = Vec::new();
     let mut index = 0usize;
     while index < tokens.len() {
         match tokens[index] {
+            Token::KwImpl => {
+                if let Some(Token::Ident(name)) = tokens.get(index + 1).copied() {
+                    pending_owner = Some(name.clone());
+                }
+            }
             Token::KwFunction | Token::KwFn => {
                 // function name<T>(params) -> ret {
                 let mut cursor = index + 1;
@@ -200,6 +213,19 @@ fn local_names_at(source: &str, offset: usize) -> Vec<ScopeName> {
                                 depth -= 1;
                                 if depth == 0 {
                                     break;
+                                }
+                            }
+                            Token::Ident(name)
+                                if depth == 1 && position == cursor + 1 && name == "self" =>
+                            {
+                                if let Some(Some(owner)) = owner_stack.last() {
+                                    let mut param = ScopeName::new(
+                                        name,
+                                        ScopeNameKind::Parameter,
+                                        Some(owner.clone()),
+                                    );
+                                    param.declared = Some(SparType::Named(owner.clone()));
+                                    params.push(param);
                                 }
                             }
                             Token::Ident(name)
@@ -275,9 +301,16 @@ fn local_names_at(source: &str, offset: usize) -> Vec<ScopeName> {
                     pending.push(ScopeName::new(name, ScopeNameKind::Variable, Some("error".into())));
                 }
             }
-            Token::LBrace => stack.push(std::mem::take(&mut pending)),
+            Token::LBrace => {
+                stack.push(std::mem::take(&mut pending));
+                // Only the impl block's own opening brace consumes
+                // `pending_owner` — a nested brace (a method body, an `if`,
+                // ...) inherits whatever owner is already active.
+                owner_stack.push(pending_owner.take().or_else(|| owner_stack.last().cloned().flatten()));
+            }
             Token::RBrace => {
                 stack.pop();
+                owner_stack.pop();
             }
             _ => {}
         }

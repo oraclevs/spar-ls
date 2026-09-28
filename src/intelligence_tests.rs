@@ -1956,6 +1956,40 @@ fn member_completion_through_parameters_locals_and_index_chains() {
     );
 }
 
+const HUMAN_IMPL_SOURCE: &str = concat!(
+    "struct Human {\n",
+    "    name: str = \"Unknown\";\n",
+    "    age: int = 0;\n",
+    "};\n",
+    "impl Human {\n",
+    "    function greet(self) -> str {\n",
+    "        return self.name;\n",
+    "    };\n",
+    "};\n",
+);
+
+#[test]
+fn member_completion_after_self_inside_an_impl_method_offers_receiver_fields() {
+    // `self` has no `: Type` annotation in source (its type is the impl's
+    // own receiver type), so it needs its own recognition in
+    // `local_names_at` (scope_completion.rs) distinct from ordinary
+    // `name: Type` parameter parsing.
+    let state = SparLanguageServer::analyze(HUMAN_IMPL_SOURCE, std::path::Path::new("/workspace"));
+    let symbols = state.effective_symbols().expect("symbols").clone();
+    let (source, offset) = marked(&HUMAN_IMPL_SOURCE.replace("self.name", "self.|"));
+    let labels = typed_member_items(&source, offset, &symbols)
+        .map(|items| items.into_iter().map(|item| item.label).collect::<Vec<_>>());
+    assert_eq!(
+        labels,
+        Some(vec![
+            "name".to_string(),
+            "age".to_string(),
+            "toString".to_string(),
+            "typeName".to_string()
+        ])
+    );
+}
+
 #[test]
 fn member_completion_on_a_list_offers_no_fields() {
     let source = HUMAN_SOURCE.replace("return 0;\n};", "var x: int = people.|;\n    return 0;\n};");
@@ -2720,4 +2754,6 @@ struct User { name: str = "Obi"; age: int = 24; };
         "{table:?}"
     );
 }
+
+
 
