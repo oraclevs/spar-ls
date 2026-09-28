@@ -72,7 +72,7 @@ fn parse_type_tokens(tokens: &[&spar::token::Token], index: &mut usize) -> Optio
         Token::TypeBool => SparType::Bool,
         Token::TypeShell => SparType::Shell,
         Token::TypeVoid => SparType::Void,
-        Token::TypeSection => SparType::Section,
+        Token::TypeSection => return None,
         Token::Ident(name) => {
             *index += 1;
             if tokens.get(*index).copied() == Some(&Token::Lt) {
@@ -180,7 +180,7 @@ fn local_names_at(source: &str, offset: usize) -> Vec<ScopeName> {
     let mut index = 0usize;
     while index < tokens.len() {
         match tokens[index] {
-            Token::KwFunction => {
+            Token::KwFunction | Token::KwFn => {
                 // function name<T>(params) -> ret {
                 let mut cursor = index + 1;
                 while cursor < tokens.len()
@@ -316,4 +316,17 @@ fn scope_completion_items(names: &[ScopeName]) -> Vec<CompletionItem> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod removed_section_tests {
+    use super::*;
+
+    #[test]
+    fn removed_section_keyword_is_not_a_scope_type() {
+        let token = spar::token::Token::TypeSection;
+        let tokens = vec![&token];
+        let mut index = 0usize;
+        assert_eq!(parse_type_tokens(&tokens, &mut index), None);
+    }
 }

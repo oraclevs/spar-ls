@@ -9,7 +9,7 @@
 // defined in.
 //
 // Precision limits, deliberate (same latitude given to `definition_at`'s
-// own section-field fallback): a `.field` access matches by field name
+// own struct-field fallback): a `.field` access matches by field name
 // alone, not by base-expression type, so an unrelated object with a field
 // of the same name is not ruled out. A `Selective`/`TypeSelective` import only searches
 // a file bare when its import statement actually requested that specific
@@ -17,7 +17,7 @@
 // (`import { foo as bar }`) is still matched against the *original* name
 // `foo`, even though occurrences in that file were renamed to `bar` at
 // splice time, so a locally-aliased selective import's usages are a known
-// gap (a false miss, not a false match). Type references (a `type [Foo]`
+// gap (a false miss, not a false match). Type references (a `type Foo`
 // used as a field's type elsewhere) are not walked — this covers the same
 // value/task symbol kinds `definition_at` resolves, not structural type
 // usages.
@@ -184,15 +184,15 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
             }
         }
         Expr::Object(items, _) => {
-            use spar::ast::SectionItem;
+            use spar::ast::ObjectItem;
             for item in items {
                 match item {
-                    SectionItem::Field(f) => {
+                    ObjectItem::Field(f) => {
                         if let Some(spar::ast::FieldValue::Expr(e)) = &f.value {
                             collect_expr_refs(e, target, out);
                         }
                     }
-                    SectionItem::Spread(sp) => collect_expr_refs(&sp.expr, target, out),
+                    ObjectItem::Spread(sp) => collect_expr_refs(&sp.expr, target, out),
                 }
             }
         }
@@ -226,16 +226,16 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
     }
 }
 
-fn collect_section_item_refs(items: &[spar::ast::SectionItem], target: RefTarget, out: &mut Vec<Span>) {
-    use spar::ast::{FieldValue, SectionItem};
+fn collect_struct_item_refs(items: &[spar::ast::ObjectItem], target: RefTarget, out: &mut Vec<Span>) {
+    use spar::ast::{FieldValue, ObjectItem};
     for item in items {
         match item {
-            SectionItem::Field(fd) => match &fd.value {
+            ObjectItem::Field(fd) => match &fd.value {
                 Some(FieldValue::Expr(e)) => collect_expr_refs(e, target, out),
-                Some(FieldValue::Nested(nested)) => collect_section_item_refs(nested, target, out),
+                Some(FieldValue::Object(nested)) => collect_struct_item_refs(nested, target, out),
                 None => {}
             },
-            SectionItem::Spread(ss) => collect_expr_refs(&ss.expr, target, out),
+            ObjectItem::Spread(ss) => collect_expr_refs(&ss.expr, target, out),
         }
     }
 }
@@ -253,11 +253,6 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
             FuncStmt::Break(_) | FuncStmt::Continue(_) => {}
             FuncStmt::Return(ReturnValue::Void, _) => {}
             FuncStmt::Return(ReturnValue::Expr(e), _) => collect_expr_refs(e, target, out),
-            FuncStmt::Return(ReturnValue::SectionBlock(fields), _) => {
-                for f in fields {
-                    collect_expr_refs(&f.value, target, out);
-                }
-            }
             FuncStmt::If(i) => {
                 collect_expr_refs(&i.condition, target, out);
                 collect_stmts_refs(&i.then_stmts, target, out);
@@ -289,7 +284,7 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
                     collect_expr_refs(e, target, out);
                 }
             }
-            TL::Section(sd) => collect_section_item_refs(&sd.items, target, out),
+            TL::Struct(sd) => collect_struct_item_refs(&sd.items, target, out),
             TL::Function(fd) => collect_stmts_refs(&fd.body.stmts, target, out),
             TL::Impl(imp) => {
                 for method in &imp.methods {
@@ -351,7 +346,7 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
                     }
                 }
             }
-            TL::Enum(_) | TL::Type(_) | TL::SchemaSection(_) | TL::SchemaFrom(_) | TL::Import(_) => {}
+            TL::Enum(_) | TL::Type(_) | TL::Schema(_) | TL::SchemaFrom(_) | TL::Import(_) => {}
         }
     }
 }
@@ -739,7 +734,7 @@ fn collect_local_bindings_from_expr(
     expr: &spar::ast::Expr,
     out: &mut Vec<LocalBinding>,
 ) {
-    use spar::ast::{ClosureBody, Expr, FieldValue, SectionItem, StringPart};
+    use spar::ast::{ClosureBody, Expr, FieldValue, ObjectItem, StringPart};
     match expr {
         Expr::Closure { params, body, span, .. } => {
             let scope_start = params
@@ -827,12 +822,12 @@ fn collect_local_bindings_from_expr(
         Expr::Object(items, _) => {
             for item in items {
                 match item {
-                    SectionItem::Field(field) => {
+                    ObjectItem::Field(field) => {
                         if let Some(FieldValue::Expr(value)) = &field.value {
                             collect_local_bindings_from_expr(source, masked, value, out);
                         }
                     }
-                    SectionItem::Spread(spread) => {
+                    ObjectItem::Spread(spread) => {
                         collect_local_bindings_from_expr(source, masked, &spread.expr, out)
                     }
                 }
@@ -911,11 +906,6 @@ fn collect_local_bindings_from_stmts(
             FuncStmt::Return(spar::ast::ReturnValue::Expr(value), _) => {
                 collect_local_bindings_from_expr(source, masked, value, out);
             }
-            FuncStmt::Return(spar::ast::ReturnValue::SectionBlock(fields), _) => {
-                for field in fields {
-                    collect_local_bindings_from_expr(source, masked, &field.value, out);
-                }
-            }
             FuncStmt::Return(spar::ast::ReturnValue::Void, _)
             | FuncStmt::Break(_)
             | FuncStmt::Continue(_) => {}
@@ -988,8 +978,8 @@ fn local_bindings(state: &DocumentState) -> Vec<LocalBinding> {
                     &mut out,
                 );
             }
-            TopLevelItem::Section(_)
-            | TopLevelItem::SchemaSection(_)
+            TopLevelItem::Struct(_)
+            | TopLevelItem::Schema(_)
             | TopLevelItem::Type(_)
             | TopLevelItem::SchemaFrom(_)
             | TopLevelItem::Enum(_)

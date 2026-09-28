@@ -17,7 +17,7 @@ fn symbol_span(symbols: &SymbolTable, path: &[String], word: &str) -> Option<Spa
         if let Some(entry) = symbols.types.get(word) { return Some(entry.span.clone()); }
         if let Some(entry) = symbols.enums.get(word) { return Some(entry.span.clone()); }
         if let Some(entry) = symbols.function_groups.get(word) { return Some(entry.span.clone()); }
-        if let Some(entry) = symbols.sections.get(&vec![word.to_string()]) { return Some(entry.span.clone()); }
+        if let Some(entry) = symbols.structs.get(&vec![word.to_string()]) { return Some(entry.span.clone()); }
     }
     // `Group::member` — jumps to the member function's own span (exact).
     // `EnumName::Variant` — no per-variant span exists in the AST, so this
@@ -30,13 +30,13 @@ fn symbol_span(symbols: &SymbolTable, path: &[String], word: &str) -> Option<Spa
             if entry.variants.iter().any(|v| v == word) { return Some(entry.span.clone()); }
         }
     }
-    let section_path = if path.is_empty() { vec![] } else { path.to_vec() };
-    if let Some(entry) = symbols.sections.get(&section_path) {
+    let struct_path = if path.is_empty() { vec![] } else { path.to_vec() };
+    if let Some(entry) = symbols.structs.get(&struct_path) {
         if let Some(field) = entry.fields.get(word) { return Some(field.span.clone()); }
     }
-    let mut complete = section_path;
+    let mut complete = struct_path;
     complete.push(word.to_string());
-    symbols.sections.get(&complete).map(|e| e.span.clone())
+    symbols.structs.get(&complete).map(|e| e.span.clone())
 }
 
 fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -> Option<Span> {
@@ -114,7 +114,7 @@ fn ident_span_in(source: &str, span: &Span, name: &str) -> Option<Span> {
 }
 
 /// Tasks aren't resolved into `SymbolTable` (unlike globals/functions/
-/// types/enums/sections), so this scans the AST directly — same reason
+/// types/enums/structs), so this scans the AST directly — same reason
 /// `local_decl_span` doesn't go through `SymbolTable` either.
 fn task_decl_span(program: &Program, word: &str) -> Option<Span> {
     program.items.iter().find_map(|item| {
@@ -137,7 +137,7 @@ fn task_decl_span(program: &Program, word: &str) -> Option<Span> {
 /// is only reached for the word actually under the cursor, so hovering the
 /// local alias `bar` elsewhere in the importing file still resolves through
 /// it correctly; what's NOT attempted is fixing up spans nested inside a
-/// spliced item (e.g. an individual field of a spliced `[Section]`) — those
+/// spliced item (e.g. an individual field of a spliced struct) — those
 /// still carry whatever span the retag/splice step left them with.
 fn spliced_definition(state: &DocumentState, _current: &Url, word: &str) -> Option<Location> {
     use spar::ast::ImportKind;
@@ -298,7 +298,7 @@ fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Loca
     }
     let symbols = state.effective_symbols()?;
     let span = symbol_span(symbols, &prefix, &word).or_else(|| {
-        symbols.sections.values().find_map(|s| s.fields.get(&word).map(|f| f.span.clone()))
+        symbols.structs.values().find_map(|s| s.fields.get(&word).map(|f| f.span.clone()))
     })?;
     // Declaration spans often start at a keyword (`var`, `type`); point at the name.
     let span = ident_span_in(&state.source, &span, &word).unwrap_or(span);

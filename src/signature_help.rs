@@ -24,6 +24,29 @@ fn signature_from_resolved_entry(
     }
 }
 
+fn signature_from_semantic_callable(
+    callable: spar::SemanticCallable,
+    origin: Option<String>,
+) -> CallableSignature {
+    CallableSignature {
+        name: callable.name,
+        params: callable
+            .parameters
+            .into_iter()
+            .map(|param| CallableParam {
+                name: param.name,
+                ty: format_spar_type(&param.ty),
+                has_default: param.has_default,
+                default_repr: None,
+            })
+            .collect(),
+        return_type: format_spar_type(&callable.return_type),
+        is_async: callable.is_async,
+        origin,
+        argument_style: CallableArgumentStyle::Named,
+    }
+}
+
 
 fn simple_receiver_chain(text: &str) -> Option<Chain> {
     let mut parts = text.split('.');
@@ -54,7 +77,7 @@ fn resolve_method_symbol<'a>(
     let symbols = state.effective_symbols()?;
     let static_receiver = if !receiver_text.contains('.') {
         let path = vec![receiver_text.to_string()];
-        symbols.sections.get(&path).is_some_and(|section| section.canonical)
+        symbols.structs.get(&path).is_some()
     } else {
         false
     };
@@ -87,8 +110,29 @@ fn resolve_method_signature(
     offset: usize,
     callee: &str,
 ) -> Option<CallableSignature> {
-    resolve_method_symbol(state, index, uri, source, offset, callee)
+    if let Some(signature) = resolve_method_symbol(state, index, uri, source, offset, callee)
         .and_then(|symbol| symbol.signature.clone())
+    {
+        return Some(signature);
+    }
+
+    let (receiver_text, method_name) = callee.rsplit_once('.')?;
+    let symbols = state.effective_symbols()?;
+    let semantic = state.semantic_snapshot()?;
+    let static_receiver = !receiver_text.contains('.')
+        && symbols.structs.contains_key(&vec![receiver_text.to_string()]);
+    let receiver_ty = if static_receiver {
+        SparType::Named(receiver_text.to_string())
+    } else {
+        let chain = simple_receiver_chain(receiver_text)?;
+        let scope = local_names_at(source, offset);
+        type_of_chain(&chain, &scope, symbols, 0)?
+    };
+    semantic
+        .methods_for_type(&receiver_ty)
+        .into_iter()
+        .find(|method| method.callable.name == method_name && method.is_static == static_receiver)
+        .map(|method| signature_from_semantic_callable(method.callable, None))
 }
 
 fn resolve_callable_named(
@@ -99,6 +143,14 @@ fn resolve_callable_named(
     offset: usize,
     callee: &str,
 ) -> Option<CallableSignature> {
+    if callee.contains('<') && !callee.contains("::") {
+        let source = format!("var sparSignature: {callee};");
+        let tokens = spar::Lexer::new(&source).tokenize().ok()?;
+        let program = spar::Parser::new(tokens).parse().ok()?;
+        let spar::ast::TopLevelItem::Var(decl) = program.items.first()? else { return None; };
+        let callable = state.semantic_snapshot()?.constructor(&decl.ty)?;
+        return Some(signature_from_semantic_callable(callable, None));
+    }
     if callee.contains('.') {
         return resolve_method_signature(state, index, uri, source, offset, callee);
     }
@@ -106,7 +158,7 @@ fn resolve_callable_named(
     if !callee.contains("::") {
         if let Some(symbols) = state.effective_symbols() {
             let path = vec![callee.to_string()];
-            if symbols.sections.get(&path).is_some_and(|section| section.canonical) {
+            if symbols.structs.get(&path).is_some() {
                 if let Some(signature) = index
                     .visible_constructor_for_owner(uri, callee)
                     .and_then(|symbol| symbol.signature.clone())
@@ -115,20 +167,17 @@ fn resolve_callable_named(
                 }
             }
         }
-        let callable_in_scope = state
-            .effective_symbols()
-            .and_then(|symbols| symbols.globals.get(callee))
-            .is_some_and(|entry| matches!(
-                entry,
-                GlobalEntry::Var { ty: SparType::Function { .. }, .. }
-            ));
-        if callable_in_scope {
-            if let Some(signature) = index
-                .visible_callable_named(uri, callee)
-                .and_then(|symbol| symbol.signature.clone())
-            {
-                return Some(signature);
-            }
+        if let Some(signature) = index
+            .visible_callable_named(uri, callee)
+            .and_then(|symbol| symbol.signature.clone())
+        {
+            return Some(signature);
+        }
+        if let Some(callable) = state
+            .semantic_snapshot()
+            .and_then(|semantic| semantic.callable(callee))
+        {
+            return Some(signature_from_semantic_callable(callable, None));
         }
     }
 

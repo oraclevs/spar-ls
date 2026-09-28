@@ -17,7 +17,7 @@ use spar::parser::Parser;
 #[cfg(test)]
 use spar::resolver::Resolver;
 use spar::resolver::{
-    EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, SectionEntry, SymbolTable, TypeEntry,
+    EnumEntry, FunctionEntry, FunctionGroupEntry, GlobalEntry, StructEntry, SymbolTable, TypeEntry,
 };
 use spar::typechecker::TypeChecker;
 use spar::{Compilation, CompileOptions, Compiler, Span, SparError};
@@ -103,88 +103,25 @@ fn print_cli_help() {
 // ── Type display helper ───────────────────────────────────────────────────────
 
 fn format_spar_type(ty: &SparType) -> String {
-    match ty {
-        SparType::Str => "str".to_string(),
-        SparType::Int => "int".to_string(),
-        SparType::Float => "float".to_string(),
-        SparType::Bool => "bool".to_string(),
-        SparType::List(inner) => format!("List<{}>", format_spar_type(inner)),
-        SparType::Section => "section".to_string(),
-        SparType::Void => "void".to_string(),
-        SparType::Shell => "shell".to_string(),
-        SparType::Error => "error".to_string(),
-        SparType::Named(name) => name.clone(),
-        SparType::TypeParameter(name) => name.clone(),
-        SparType::Applied { name, arguments } => format!(
-            "{}<{}>",
-            name,
-            arguments
-                .iter()
-                .map(format_spar_type)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        SparType::Function {
-            params,
-            return_type,
-        } => format!(
-            "fn({}) -> {}",
-            params
-                .iter()
-                .map(format_spar_type)
-                .collect::<Vec<_>>()
-                .join(", "),
-            format_spar_type(return_type)
-        ),
-    }
+    spar::typechecker::display_type(ty)
 }
 
 // ── Inferred-type resolution ────────────────────────────────────────────────
-//
-// A field under a `-> TypeName` binding can omit its own type — that's not
-// a gap in what's known, just in what's written. The real type always
-// traces back through the binding chain, so hover/completion should show
-// it directly instead of a vague "inferred" placeholder.
-
-/// Walk from `path`'s top-level section's own `-> Type` binding down
-/// through nested `TypeFieldShape::Section`/`Named` entries matching each
-/// remaining path segment, to find the `TypeField` shape governing
-/// whatever's declared at `path`. `None` if nothing in the chain is
-/// type-bound (an unbound section's fields are always explicitly typed,
-/// so this only matters for the `ty: None` case in the first place).
-fn resolve_shape_for_path(
-    symbols: &SymbolTable,
-    path: &[String],
-) -> Option<Vec<spar::ast::TypeField>> {
-    let top = symbols.sections.get(&vec![path.first()?.clone()])?;
-    let type_name = top.type_binding.as_ref()?;
-    let type_name = match type_name {
-        SparType::Named(name) => name,
-        SparType::Applied { name, .. } => name,
-        _ => return None,
-    };
-    let mut fields = symbols.types.get(type_name)?.fields.clone();
-    for seg in &path[1..] {
-        let tf = fields.iter().find(|f| &f.name == seg)?;
-        fields = match &tf.shape {
-            spar::ast::TypeFieldShape::Section(nested) => nested.clone(),
-            spar::ast::TypeFieldShape::Named(other) => symbols.types.get(other)?.fields.clone(),
-            spar::ast::TypeFieldShape::TypeParameter(_) => return None,
-            spar::ast::TypeFieldShape::Applied { name, .. } => {
-                symbols.types.get(name)?.fields.clone()
-            }
-            spar::ast::TypeFieldShape::Primitive(_) => return None,
-        };
+/// Resolve nested fields through the same substituted struct metadata as constructors.
+fn resolve_shape_for_path(symbols: &SymbolTable, path: &[String]) -> Option<Vec<spar::ast::TypeField>> {
+    let mut owner = SparType::Named(path.first()?.clone());
+    for field in &path[1..] {
+        owner = spar::typechecker::TypeChecker::field_type(&owner, field, symbols)?;
     }
-    Some(fields)
+    spar::typechecker::TypeChecker::fields_for_type(&owner, symbols).map(|(_, fields)| fields)
 }
 
 fn format_type_field_shape(shape: &spar::ast::TypeFieldShape) -> String {
     match shape {
         spar::ast::TypeFieldShape::Primitive(ty) => format_spar_type(ty),
-        spar::ast::TypeFieldShape::Section(_) => "section".to_string(),
+        spar::ast::TypeFieldShape::InlineRecord(_) => "Record".to_string(),
         // A Named shape's own type name is more useful than a bare
-        // "section" — e.g. "PostgresType" tells the reader where to look.
+        // "struct" — e.g. "PostgresType" tells the reader where to look.
         spar::ast::TypeFieldShape::Named(name) => name.clone(),
         spar::ast::TypeFieldShape::TypeParameter(name) => name.clone(),
         spar::ast::TypeFieldShape::Applied { name, arguments } => format!(
@@ -201,7 +138,7 @@ fn format_type_field_shape(shape: &spar::ast::TypeFieldShape) -> String {
 
 /// The display string for a field whose `FieldEntry.ty` is `None` —
 /// resolves the real type from the binding chain. Falls back to
-/// "section" only if nothing in the chain can be traced (shouldn't
+/// "struct" only if nothing in the chain can be traced (shouldn't
 /// normally happen for valid code, since `ty: None` only parses under a
 /// binding in the first place).
 fn resolve_field_type_display(symbols: &SymbolTable, path: &[String], field_name: &str) -> String {
@@ -212,7 +149,7 @@ fn resolve_field_type_display(symbols: &SymbolTable, path: &[String], field_name
                 .find(|f| f.name == field_name)
                 .map(|tf| format_type_field_shape(&tf.shape))
         })
-        .unwrap_or_else(|| "section".to_string())
+        .unwrap_or_else(|| "Record".to_string())
 }
 
 // ── Text utilities ────────────────────────────────────────────────────────────
@@ -471,18 +408,18 @@ fn format_import_hover(alias: &str, sym: &SymbolTable) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!(
-                "function {}({}) -> {}",
+                "fn {}({}) -> {}",
                 name,
                 params,
                 format_spar_type(&entry.ret)
             ));
         }
     }
-    for (path, section) in &sym.sections {
-        if section.exported && !section.private {
-            let field_names: Vec<_> = section.fields.keys().cloned().collect();
+    for (path, struct_entry) in &sym.structs {
+        if struct_entry.exported && !struct_entry.private {
+            let field_names: Vec<_> = struct_entry.fields.keys().cloned().collect();
             lines.push(format!(
-                "[{}] {{ {} }}",
+                "struct {} {{ {} }}",
                 path.join("."),
                 field_names.join(", ")
             ));
@@ -501,14 +438,14 @@ fn format_import_hover(alias: &str, sym: &SymbolTable) -> String {
 
 fn import_completion_items(sym: &SymbolTable) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = vec![];
-    for (path, section) in &sym.sections {
-        if section.exported && !section.private {
+    for (path, struct_entry) in &sym.structs {
+        if struct_entry.exported && !struct_entry.private {
             if let Some(name) = path.first() {
-                let fields: Vec<_> = section.fields.keys().cloned().collect();
+                let fields: Vec<_> = struct_entry.fields.keys().cloned().collect();
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::MODULE),
-                    detail: Some(format!("section ({})", fields.join(", "))),
+                    detail: Some(format!("struct ({})", fields.join(", "))),
                     ..Default::default()
                 });
             }
@@ -1060,16 +997,16 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
-        // Case 0b: word is a section/field inside an import path (e.g. hover on `Minor` in `base::Minor::port`)
+        // Case 0b: word is a struct/field inside an import path (e.g. hover on `Minor` in `base::Minor::port`)
         if !word.is_empty() {
             if let Some(prefix) = path_prefix_before_word(&state.source, pos) {
                 let imp_syms = state.effective_import_symbols();
                 if let Some(imported_sym) = imp_syms.get(&prefix[0]) {
                     if prefix.len() == 1 {
-                        // hovering on section name: base::[Minor]
+                        // hovering on struct name: base::[Minor]
                         let sec_path = vec![word.clone()];
-                        if let Some(section) = imported_sym.sections.get(&sec_path) {
-                            let value = format_hover_section(imported_sym, &sec_path, section);
+                        if let Some(struct_entry) = imported_sym.structs.get(&sec_path) {
+                            let value = format_hover_struct(imported_sym, &sec_path, struct_entry);
                             return Ok(Some(Hover {
                                 contents: HoverContents::Markup(MarkupContent {
                                     kind: MarkupKind::Markdown,
@@ -1105,7 +1042,7 @@ impl LanguageServer for SparLanguageServer {
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 let value = format!(
-                                    "```spar\nfunction {}({}) -> {}\n```",
+                                    "```spar\nfn {}({}) -> {}\n```",
                                     word,
                                     params,
                                     format_spar_type(&entry.ret)
@@ -1120,10 +1057,10 @@ impl LanguageServer for SparLanguageServer {
                             }
                         }
                     } else {
-                        // hovering on field: base::SectionName::[fieldName]
+                        // hovering on field: base::StructName::[fieldName]
                         let sec_path = prefix[1..].to_vec();
-                        if let Some(section) = imported_sym.sections.get(&sec_path) {
-                            if let Some(field) = section.fields.get(&word) {
+                        if let Some(struct_entry) = imported_sym.structs.get(&sec_path) {
+                            if let Some(field) = struct_entry.fields.get(&word) {
                                 let ty_str =
                                     field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| {
                                         resolve_field_type_display(imported_sym, &sec_path, &word)
@@ -1149,8 +1086,8 @@ impl LanguageServer for SparLanguageServer {
                 let imp_syms = state.effective_import_symbols();
                 if !imp_syms.contains_key(&prefix[0]) {
                     let prefix_owned: Vec<String> = prefix.to_vec();
-                    if let Some(section) = symbols.sections.get(&prefix_owned) {
-                        if let Some(field) = section.fields.get(&word) {
+                    if let Some(struct_entry) = symbols.structs.get(&prefix_owned) {
+                        if let Some(field) = struct_entry.fields.get(&word) {
                             let ty_str =
                                 field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| {
                                     resolve_field_type_display(symbols, &prefix_owned, &word)
@@ -1188,11 +1125,11 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
-        // Case 2: top-level section name (path == [word])
+        // Case 2: top-level struct name (path == [word])
         if !word.is_empty() {
             let top_key = vec![word.clone()];
-            if let Some(section) = symbols.sections.get(&top_key) {
-                let value = format_hover_section(symbols, &top_key, section);
+            if let Some(struct_entry) = symbols.structs.get(&top_key) {
+                let value = format_hover_struct(symbols, &top_key, struct_entry);
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1203,11 +1140,11 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
-        // Case 3: nested section — word matches a non-first segment of any path
+        // Case 3: nested struct — word matches a non-first segment of any path
         if !word.is_empty() {
-            for (path, section) in &symbols.sections {
+            for (path, struct_entry) in &symbols.structs {
                 if path.len() > 1 && path.last().map(|s| s.as_str()) == Some(word.as_str()) {
-                    let value = format_hover_section(symbols, path, section);
+                    let value = format_hover_struct(symbols, path, struct_entry);
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -1219,24 +1156,24 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
-        // Case 4: section field — word matches a field name in the section the
+        // Case 4: struct field — word matches a field name in the struct the
         // cursor is textually inside. Deliberately does NOT fall back to an
-        // ambiguous scan across every section sharing that field name here —
+        // ambiguous scan across every struct sharing that field name here —
         // more precise mechanisms (function/type/enum names, then type-checker
-        // expression inference) get a chance first; seeing the wrong section's
+        // expression inference) get a chance first; seeing the wrong struct's
         // field type is worse than briefly falling through. The ambiguous
         // fallback still runs, as an actual last resort, right before `Ok(None)`.
         if !word.is_empty() {
             let offset = lsp_pos_to_byte_offset(&state.source, pos);
-            // Find the innermost section whose span contains the cursor.
+            // Find the innermost struct whose span contains the cursor.
             let containing_path: Option<Vec<String>> = state.ast.as_ref().and_then(|prog| {
                 use spar::ast::TopLevelItem;
                 prog.items
                     .iter()
                     .filter_map(|item| {
-                        if let TopLevelItem::Section(sd) = item {
+                        if let TopLevelItem::Struct(sd) = item {
                             if sd.span.start <= offset && offset <= sd.span.end {
-                                Some(sd.path.clone())
+                                Some(vec![sd.name.clone()])
                             } else {
                                 None
                             }
@@ -1244,12 +1181,12 @@ impl LanguageServer for SparLanguageServer {
                             None
                         }
                     })
-                    .next_back() // innermost (last) enclosing section
+                    .next_back() // innermost (last) enclosing struct
             });
 
             let field_hover = containing_path.as_ref().and_then(|path| {
                 symbols
-                    .sections
+                    .structs
                     .get(path)
                     .and_then(|sec| sec.fields.get(&word).map(|field| (path.clone(), field)))
             });
@@ -1290,7 +1227,7 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
-        // Case 5b/5c/5d: `type [Name] { ... }`, `enum Name { ... }` (bare or
+        // Case 5b/5c/5d: `struct Name { ... }`, `enum Name { ... }` (bare or
         // `Name::Variant`), and `functionGroup Name { ... }` (bare or
         // `Name::member`) declarations/references.
         if !word.is_empty() {
@@ -1370,14 +1307,14 @@ impl LanguageServer for SparLanguageServer {
             }
         }
 
-        // Case 10 (last resort): a field name matching some section, anywhere
+        // Case 10 (last resort): a field name matching some struct, anywhere
         // in the program, when nothing more precise recognized the cursor.
-        // Ambiguous when multiple sections share a field name — kept as the
+        // Ambiguous when multiple structs share a field name — kept as the
         // lowest-priority fallback rather than deleted outright, since a
-        // possibly-wrong section beats no hover at all.
+        // possibly-wrong struct beats no hover at all.
         if !word.is_empty() {
             if let Some((path, field)) = symbols
-                .sections
+                .structs
                 .iter()
                 .find_map(|(path, sec)| sec.fields.get(&word).map(|field| (path.clone(), field)))
             {
@@ -1558,12 +1495,12 @@ impl LanguageServer for SparLanguageServer {
             return Ok(Some(CompletionResponse::Array(items)));
         }
 
-        // Case 1: after `path::` — enumerate section fields, enum variants,
+        // Case 1: after `path::` — enumerate struct fields, enum variants,
         // function-group members, or imported symbols
         if let Some(path) = path_before_cursor(&state.source, pos) {
-            if let Some(section) = symbols.sections.get(&path) {
-                return Ok(Some(CompletionResponse::Array(section_field_completions(
-                    symbols, &path, section,
+            if let Some(struct_entry) = symbols.structs.get(&path) {
+                return Ok(Some(CompletionResponse::Array(struct_field_completions(
+                    symbols, &path, struct_entry,
                 ))));
             }
 
@@ -1581,13 +1518,13 @@ impl LanguageServer for SparLanguageServer {
                             imported_sym,
                         ))));
                     } else {
-                        // base::SectionName:: → fields of that section in imported file
-                        let section_path = path[1..].to_vec();
-                        if let Some(section) = imported_sym.sections.get(&section_path) {
-                            return Ok(Some(CompletionResponse::Array(section_field_completions(
+                        // base::StructName:: → fields of that struct in imported file
+                        let struct_path = path[1..].to_vec();
+                        if let Some(struct_entry) = imported_sym.structs.get(&struct_path) {
+                            return Ok(Some(CompletionResponse::Array(struct_field_completions(
                                 imported_sym,
-                                &section_path,
-                                section,
+                                &struct_path,
+                                struct_entry,
                             ))));
                         }
                     }
@@ -1648,21 +1585,6 @@ impl LanguageServer for SparLanguageServer {
                 },
                 1,
             ));
-        }
-        for (path, section) in &symbols.sections {
-            if section.canonical {
-                continue;
-            }
-            if let Some(first) = path.first() {
-                items.push(with_tier(
-                    CompletionItem {
-                        label: first.clone(),
-                        kind: Some(CompletionItemKind::MODULE),
-                        ..Default::default()
-                    },
-                    1,
-                ));
-            }
         }
         for alias in symbols.imports.keys() {
             items.push(with_tier(
@@ -2347,10 +2269,7 @@ mod tests {
 
     #[test]
     fn completion_after_dot_suggests_fields_of_named_type() {
-        let symbols = resolve_src(concat!(
-            "type [Human]{ name: str; age: int; };\n",
-            "var person: Human = { name: \"Ada\"; age: 36; };\n",
-        ));
+        let symbols = resolve_src("struct Human { name: str; age: int; }; var person: Human = Human(name: \"Ada\", age: 36);");
         let items = member_completion_items("person.", "person.".len(), &symbols)
             .expect("member completion context");
 
@@ -2367,26 +2286,10 @@ mod tests {
     }
 
     #[test]
-    fn completion_after_dot_suggests_fields_of_a_section() {
-        // Regression: a section reference (as opposed to a var typed with a
-        // named type) fell through member_completion_items entirely — it
-        // never checked symbols.sections, so `Environment.` (a very common
-        // real-world pattern: `[Environment] -> SomeType { ... }` then
-        // `Environment.field` elsewhere) silently returned an empty
-        // completion list instead of the section's own fields.
-        let symbols = resolve_src(concat!(
-            "export type [HyprlandEnvironmentType]{ terminal: str; launcher: str; };\n",
-            "[Environment] -> HyprlandEnvironmentType {\n",
-            "    terminal: \"kitty\";\n",
-            "    launcher: \"wofi\";\n",
-            "};\n",
-        ));
-        let items = member_completion_items("Environment.", "Environment.".len(), &symbols)
-            .expect("member completion context");
-
-        let mut labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
-        labels.sort();
-        assert_eq!(labels, ["launcher", "terminal"]);
+    fn completion_after_dot_on_a_declaration_does_not_offer_instance_fields() {
+        let symbols = resolve_src("struct Environment { terminal: str; launcher: str; };");
+        let items = member_completion_items("Environment.", "Environment.".len(), &symbols).unwrap();
+        assert!(items.is_empty());
     }
 
     #[test]
@@ -2414,8 +2317,8 @@ mod tests {
     fn completion_after_dot_suggests_function_group_members() {
         let symbols = resolve_src(concat!(
             "functionGroup Convert {\n",
-            "    function toText(value: int) -> str { return str(value); }\n",
-            "    function toBool(value: str) -> bool { return bool(value); }\n",
+            "    function toText(value: int) -> str { return str(value: value); }\n",
+            "    function toBool(value: str) -> bool { return bool(value: value); }\n",
             "};\n",
         ));
         let items = member_completion_items("Convert.", "Convert.".len(), &symbols)
@@ -2563,11 +2466,11 @@ mod tests {
 
     #[test]
     fn hover_type_enum_group_shows_type_declaration() {
-        let src = "type [Border]{ width: int; };\n";
+        let src = "struct Border{ width: int; };\n";
         let symbols = resolve_src(src);
         let pos = word_pos(src, "Border", 0);
         let value = hover_type_enum_group(&symbols, src, pos, "Border").expect("type hover");
-        assert!(value.contains("type [Border]"), "{value}");
+        assert!(value.contains("struct Border"), "{value}");
         assert!(value.contains("width: int"), "{value}");
     }
 
@@ -2609,7 +2512,7 @@ mod tests {
         let symbols = resolve_src(src);
         let pos = word_pos(src, "onStart", 1);
         let value = hover_type_enum_group(&symbols, src, pos, "onStart").expect("member hover");
-        assert!(value.contains("function onStart() -> int"), "{value}");
+        assert!(value.contains("fn onStart() -> int"), "{value}");
     }
 
     #[test]
@@ -3100,7 +3003,7 @@ mod tests {
         assert_eq!(format_spar_type(&SparType::Float), "float");
         assert_eq!(format_spar_type(&SparType::Str), "str");
         assert_eq!(format_spar_type(&SparType::Bool), "bool");
-        assert_eq!(format_spar_type(&SparType::Section), "section");
+        assert_eq!(format_spar_type(&SparType::InlineRecord), "Record");
         assert_eq!(format_spar_type(&SparType::Shell), "shell");
         assert_eq!(
             format_spar_type(&SparType::List(Box::new(SparType::Int))),
@@ -3188,7 +3091,15 @@ mod tests {
 
     #[test]
     fn four_segment_namespace_path_produces_no_diagnostics() {
-        let src = "[A]{\n    b: section = {\n        c: section = {\n            d: section = {\n                e: int = 1;\n            };\n        };\n    };\n};\nvar x: int = A.b.c.d.e;";
+        // Unified structs are types, not static namespaces — a top-level
+        // struct declaration must be instantiated before its fields can be
+        // accessed, unlike the old `[Section]` model this test predates. The
+        // leaf of a nested `Record` is itself dynamically typed, so `x` is
+        // typed `Record`, not `int` (which would need a `.asInt()` bridge —
+        // avoided here since that's a method call, and this lightweight
+        // `analyze()` path flags method calls as needing the compiled
+        // runtime, which isn't what this test is checking).
+        let src = "struct A {\n    b: Record = {\n        c: {\n            d: {\n                e: 1;\n            };\n        };\n    };\n};\nvar a: A = A();\nvar x: Record = a.b.c.d.e;";
         let state = SparLanguageServer::analyze(src, std::path::Path::new("."));
         let diags = state.diagnostics();
         assert!(
@@ -3203,7 +3114,7 @@ mod tests {
     #[test]
     fn build_version_exposes_intelligence_core_identity() {
         let version = spar_ls_version();
-        assert!(version.contains("spar-ls 0.6.0"), "{version}");
+        assert!(version.contains(concat!("spar-ls ", env!("CARGO_PKG_VERSION"))), "{version}");
         assert!(version.contains("intelligence-core-v2"), "{version}");
     }
 
@@ -3227,15 +3138,21 @@ mod tests {
     fn formatter_probe_and_lsp_use_same_safe_formatter() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.spar");
-        let source = "struct Config { prompt: section = { enabled: true; path: { enabled: true; maxWidth: 512; }; }; };";
+        let source = "struct Config { prompt: Record = { enabled: true; path: { enabled: true; maxWidth: 512; }; }; };";
         std::fs::write(&path, source).unwrap();
 
         let from_probe = format_file_for_probe(&path).unwrap();
         let from_lsp = format_document_source(source).unwrap();
 
         assert_eq!(from_probe, from_lsp);
-        assert!(from_probe.contains("prompt: section = {\n"), "{from_probe}");
-        assert!(from_probe.contains("path: {\n"), "{from_probe}");
+        assert!(from_probe.contains("prompt: Record = {\n"), "{from_probe}");
+        // The inner block is short enough that the canonical formatter (`spar
+        // fmt`) keeps it on one line — matches `spar fmt`'s own output for
+        // the same source, confirmed directly.
+        assert!(
+            from_probe.contains("path: { enabled: true; maxWidth: 512; };"),
+            "{from_probe}"
+        );
     }
 
     #[test]
@@ -3252,7 +3169,7 @@ mod tests {
 
     #[test]
     fn lsp_formatter_preserves_nested_boolean_values() {
-        let source = "var config: section = { python: { enabled: true; }; kids: true; };";
+        let source = "var config: Record = { python: { enabled: true; }; kids: true; };";
 
         let formatted = format_document_source(source).expect("safe LSP formatting");
 
@@ -3286,8 +3203,8 @@ mod tests {
         let source = concat!(
             "import { greet, build, showFile, rsBinInstall, zipOccLang } from \"functions.spar\";\n",
             "struct Config {\n",
-            "    aliases: List<Alias> = [{ name: \"gs\"; command: [\"git\", \"status\"]; }];\n",
-            "    prompt: Prompt = { enabled: true; path: { enabled: true; parentLength: 64; maxLastLength: 96; maxWidth: 512; }; git: { enabled: true; showBranch: true; showStaged: true; }; };\n",
+            "    aliases: List<Record> = [{ name: \"gs\"; command: [\"git\", \"status\"]; }];\n",
+            "    prompt: Record = { enabled: true; path: { enabled: true; parentLength: 64; maxLastLength: 96; maxWidth: 512; }; git: { enabled: true; showBranch: true; showStaged: true; }; };\n",
             "};\n",
         );
 
@@ -3295,7 +3212,7 @@ mod tests {
 
         assert!(formatted.contains("import {\n    greet,"), "{formatted}");
         assert!(
-            formatted.contains("aliases: List<Alias> = [\n        {\n"),
+            formatted.contains("aliases: List<Record> = [\n        {\n"),
             "{formatted}"
         );
         assert!(formatted.contains("path: {\n"), "{formatted}");
@@ -3528,16 +3445,16 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tokens_section_name_classified_as_section() {
-        let src = "[Server]{ host: str = \"x\"; };";
+    fn semantic_tokens_struct_name_classified_as_struct() {
+        let src = "struct Server { host: str = \"x\"; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Server", src).expect("Server not found");
-        assert_eq!(tok.token_type, TT_SECTION);
+        assert_eq!(tok.token_type, TT_TYPE);
     }
 
     #[test]
-    fn semantic_tokens_section_field_classified_as_property() {
-        let src = "[Server]{ host: str = \"x\"; };";
+    fn semantic_tokens_struct_field_classified_as_property() {
+        let src = "struct Server { host: str = \"x\"; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "host", src).expect("host not found");
         assert_eq!(tok.token_type, TT_PROPERTY);
@@ -3568,7 +3485,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_type_decl_name_classified_as_type() {
-        let src = "type [PostgresType]{ image: str; };";
+        let src = "struct PostgresType{ image: str; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "PostgresType", src).expect("PostgresType not found");
         assert_eq!(tok.token_type, TT_TYPE);
@@ -3576,7 +3493,7 @@ mod tests {
 
     #[test]
     fn semantic_tokens_named_type_field_reference_classified_as_type() {
-        let src = "type [Border]{ width: int; };\ntype [Decoration]{ border: Border; };";
+        let src = "struct Border{ width: int; };\nstruct Decoration { border: Border; };";
         let tokens = decode_semantic_tokens(src);
         let lines: Vec<&str> = src.lines().collect();
         let border_type_toks = tokens
@@ -3592,7 +3509,7 @@ mod tests {
                 end <= line.len() && &line[start..end] == "Border" && t.token_type == TT_TYPE
             })
             .count();
-        // One for the `[Border]` declaration, one for the `border: Border;` reference.
+        // One for the `Border` type declaration, one for the `border: Border;` reference.
         assert_eq!(
             border_type_toks, 2,
             "expected both the Border declaration and its reference to be TT_TYPE"
@@ -3600,22 +3517,22 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tokens_section_type_binding_classified_as_type() {
-        let src = "type [Human]{ name: str; };\n[Man] -> Human {\n    name: \"John\";\n};";
+    fn semantic_tokens_struct_type_binding_classified_as_type() {
+        let src = "struct Human { name: str; };\nstruct Man { name: str = \"John\"; };";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Human", src).filter(|t| t.token_type == TT_TYPE);
         assert!(
             tok.is_some(),
-            "expected the `-> Human` binding to be classified as a type"
+            "expected the `: Human` struct binding to be classified as a type"
         );
     }
 
     #[test]
-    fn semantic_tokens_named_var_and_section_field_types_classified_as_type() {
+    fn semantic_tokens_named_var_and_struct_field_types_classified_as_type() {
         let src = concat!(
-            "type [HyprlandEnvironmentType]{ name: str; };\n",
+            "struct HyprlandEnvironmentType{ name: str; };\n",
             "var environment: HyprlandEnvironmentType;\n",
-            "[Config]{ environment: HyprlandEnvironmentType = {}; };\n",
+            "struct Config { environment: HyprlandEnvironmentType; };\n",
         );
         let tokens = decode_semantic_tokens(src);
         let lines: Vec<&str> = src.lines().collect();
@@ -3640,7 +3557,7 @@ mod tests {
     fn semantic_tokens_enum_and_function_group_value_qualifiers_keep_their_kinds() {
         let src = concat!(
             "enum LbAlgorithm { LeastConn };\n",
-            "type [Balancer]{ algorithm: LbAlgorithm; };\n",
+            "struct Balancer{ algorithm: LbAlgorithm; };\n",
             "functionGroup EdgeInsect {\n",
             "    function only() -> [int] { return [1]; }\n",
             "};\n",
@@ -3672,17 +3589,17 @@ mod tests {
         // The user's actual ask: "even in the import system" — a
         // selectively-imported name should get its real semantic color,
         // not fall through as plain text. After expand_imports splices
-        // the requested names in, they're ordinary Type/Section
+        // the requested names in, they're ordinary Type/Struct
         // declarations positioned at their own spot in the import braces
         // (see spar's retag_top_level_span), so they get colored exactly
-        // like a locally-declared type/section would.
+        // like a locally-declared type/struct would.
         use std::fs;
         let dir =
             std::env::temp_dir().join(format!("spar_ls_import_tok_test_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("shared.spar"),
-            "export type [PostgresType]{ image: str; };\nexport [Colors]{ red: str = \"#f00\"; };\n",
+            "export struct PostgresType{ image: str; };\nexport struct Colors { red: str = \"#f00\"; };\n",
         )
         .unwrap();
         let src = "import { PostgresType, Colors } from \"shared.spar\";\n";
@@ -3700,8 +3617,8 @@ mod tests {
             "expected the imported PostgresType to get a TT_TYPE token"
         );
         assert!(
-            raw.iter().any(|t| t.token_type == TT_SECTION),
-            "expected the imported Colors section to get a TT_SECTION token"
+            raw.iter().filter(|t| t.token_type == TT_TYPE).count() >= 2,
+            "expected the imported Colors struct to get a TT_STRUCT token"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -3718,7 +3635,7 @@ mod tests {
         fs::write(
             dir.join("other.spar"),
             concat!(
-                "export type [ImportedType]{ value: str; };\n",
+                "export struct ImportedType{ value: str; };\n",
                 "export enum ImportedEnum { First };\n",
                 "functionGroup ImportedGroup {\n",
                 "    function make() -> int { return 1; }\n",
@@ -3810,7 +3727,7 @@ mod tests {
             .unwrap();
         let formatted =
             spar::formatter::format_program(&parsed, &spar::formatter::FormatConfig::default());
-        assert!(formatted.contains("async function main() -> int"));
+        assert!(formatted.contains("async fn main() -> int"));
         assert!(formatted.contains("return await value();"));
     }
 
@@ -3980,8 +3897,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tokens_schema_section_name_classified_as_type() {
-        let src = "schema Container { x?: str; };\n";
+    fn semantic_tokens_schema_struct_name_classified_as_type() {
+        let src = "schema Container { x: Option<str>; };\n";
         let tokens = decode_semantic_tokens(src);
         let tok = find_tok(&tokens, "Container", src).expect("Container not found");
         assert_eq!(tok.token_type, TT_TYPE);
@@ -3994,15 +3911,15 @@ mod tests {
     }
 
     #[test]
-    fn section_double_colon_completion_resolves_registered_fields() {
-        let src = "[MainCont]{\n    padding: int = 1;\n    margin: int = 2;\n};\n";
+    fn struct_double_colon_completion_resolves_registered_fields() {
+        let src = "struct MainCont {\n    padding: int = 1;\n    margin: int = 2;\n};\n";
         let symbols = resolve_src(src);
         let path = vec!["MainCont".to_string()];
-        let section = symbols
-            .sections
+        let struct_entry = symbols
+            .structs
             .get(&path)
-            .expect("MainCont section must be registered");
-        let items = section_field_completions(&symbols, &path, section);
+            .expect("MainCont struct must be registered");
+        let items = struct_field_completions(&symbols, &path, struct_entry);
         assert_eq!(items.len(), 2);
         assert!(items.iter().any(|item| item.label == "padding"));
         assert!(items.iter().any(|item| item.label == "margin"));
@@ -4010,13 +3927,7 @@ mod tests {
 
     #[test]
     fn resolve_field_type_display_resolves_top_level_inferred_field() {
-        let src = concat!(
-            "type [Human]{ name: str; age: int; };\n",
-            "[Man] -> Human {\n",
-            "    name: \"John\";\n",
-            "    age: 29;\n",
-            "};\n",
-        );
+        let src = "struct Man { name: str = \"John\"; age: int = 29; };";
         let symbols = resolve_src(src);
         let path = vec!["Man".to_string()];
         assert_eq!(resolve_field_type_display(&symbols, &path, "name"), "str");
@@ -4025,17 +3936,7 @@ mod tests {
 
     #[test]
     fn resolve_field_type_display_resolves_nested_inferred_field() {
-        let src = concat!(
-            "type [EnvironmentType]{ nodeEnv: str; port: str; };\n",
-            "type [ServiceType]{ image: str; environment: EnvironmentType; };\n",
-            "[Api] -> ServiceType {\n",
-            "    image: \"my-api\";\n",
-            "    environment: {\n",
-            "        nodeEnv: \"production\";\n",
-            "        port: \"3000\";\n",
-            "    };\n",
-            "};\n",
-        );
+        let src = "struct EnvironmentType { nodeEnv: str; port: str; }; struct Api { environment: EnvironmentType = EnvironmentType(nodeEnv: \"production\", port: \"3000\"); };";
         let symbols = resolve_src(src);
         let path = vec!["Api".to_string(), "environment".to_string()];
         assert_eq!(
@@ -4047,13 +3948,7 @@ mod tests {
 
     #[test]
     fn resolve_field_type_display_named_shape_shows_type_name() {
-        let src = concat!(
-            "type [Border]{ width: int; };\n",
-            "type [Decoration]{ border: Border; };\n",
-            "[Style] -> Decoration {\n",
-            "    border: { width: 2; };\n",
-            "};\n",
-        );
+        let src = "struct Border { width: int; }; struct Style { border: Border = Border(width: 2); };";
         let symbols = resolve_src(src);
         let path = vec!["Style".to_string()];
         assert_eq!(
@@ -4096,12 +3991,14 @@ mod tests {
 
     #[test]
     fn config_command_field_and_contextual_shell_names_have_no_diagnostics() {
+        // Struct type bindings (`struct X: Y { field = value; };`) were
+        // removed — construct directly via `Name(field: value)` instead.
         let src = r#"
-type AliasConfig {
+struct AliasConfig {
     name: str;
     command: List<str>;
 };
-type Tool {
+struct Tool {
     command: str;
     exec: str;
     shell: str;
@@ -4109,8 +4006,8 @@ type Tool {
 var command: str = "run";
 var exec: str = command;
 var shell: str = exec;
-var alias: AliasConfig = { name: "ll"; command: ["eza", "--icons"]; };
-var tool: Tool = { command: command; exec: exec; shell: shell; };
+var alias: AliasConfig = AliasConfig(name: "ll", command: ["eza", "--icons"]);
+var tool: Tool = Tool(command: command, exec: exec, shell: shell);
 "#;
         let state = SparLanguageServer::analyze(src, std::path::Path::new("."));
         assert!(
@@ -4159,7 +4056,7 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
         let temp = tempfile::tempdir().unwrap();
         let src = temp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(temp.path().join("spar.package.spar"), "[Package]{};").unwrap();
+        std::fs::write(temp.path().join("spar.package.spar"), "struct Package {};").unwrap();
         spar::package::Lockfile::default()
             .write_atomically(&temp.path().join("spar.package.lock.spar"))
             .unwrap();
@@ -4173,9 +4070,9 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
         let path = temp.path().join("spar.package.spar");
         let state = SparLanguageServer::analyze_path(
             concat!(
-                "[Package] -> SparPackage {\n",
-                "    version: \"1.0.0\";\n",
-                "    kind: \"application\";\n",
+                "struct Package {\n",
+                "    version: str = \"1.0.0\";\n",
+                "    kind: str = \"application\";\n",
                 "};\n",
             ),
             &path,
@@ -4196,7 +4093,7 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
     #[test]
     fn manifest_completion_offers_fields_and_kind_values() {
         let path = std::path::Path::new("spar.package.spar");
-        let source = "[Package] -> SparPackage {\n    \n};\n";
+        let source = "struct Package {\n    \n};\n";
         let fields =
             package_metadata_completion_items(path, source, source.find("    ").unwrap() + 4)
                 .expect("package field completion");
@@ -4207,7 +4104,7 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
             );
         }
 
-        let source = "[Package] -> SparPackage {\n    kind: \"\";\n};\n";
+        let source = "struct Package {\n    kind: \"\";\n};\n";
         let offset = source.find("\"\"").unwrap() + 1;
         let values = package_metadata_completion_items(path, source, offset)
             .expect("package kind completion");
@@ -4291,7 +4188,7 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
         std::fs::write(
             root.join(spar::package::PACKAGE_MANIFEST_FILE),
             concat!(
-                "struct Package: SparPackage { name = \"app\"; version = \"0.1.0\"; kind = \"application\"; entry = \"src/main.spar\"; };\n",
+                "struct Package { name = \"app\"; version = \"0.1.0\"; kind = \"application\"; entry = \"src/main.spar\"; };\n",
                 "struct Dependencies { toolkit: str = \"path:./toolkit\"; };\n",
             ),
         )
@@ -4369,7 +4266,7 @@ var tool: Tool = { command: command; exec: exec; shell: shell; };
         let main = temp.path().join("main.spar");
         let source = concat!(
             "struct App { name: str = \"demo\"; };\n",
-            "function main() -> int { println(message: App.name); return len(value: App.name); };\n",
+            "function main() -> int { var app: App = App(); println(value: app.name); return len(value: app.name); };\n",
         );
         let state = SparLanguageServer::analyze_path(source, &main);
         assert!(

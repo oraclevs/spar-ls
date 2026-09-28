@@ -3,7 +3,7 @@
 fn keyword_items() -> Vec<CompletionItem> {
     [
         // declaration keywords
-        "var", "export", "private", "import", "dynamic", "as", "struct", "type", "function",
+        "var", "export", "private", "import", "dynamic", "as", "struct", "type", "fn", "function",
         "schema", "task", "try", "catch",
         // control keywords
         "if", "else", "for", "in", "break", "continue", "return", "mut", // literals
@@ -25,19 +25,22 @@ fn package_metadata_completion_items(
 ) -> Option<Vec<CompletionItem>> {
     let file_name = path.file_name()?.to_str()?;
     let prefix = source.get(..offset)?;
-    let section = ["Package", "Dependencies", "Overrides", "Lock"]
+    let (struct_at, manifest_struct) = ["Package", "Dependencies", "Overrides", "Lock"]
         .into_iter()
-        .filter_map(|name| prefix.rfind(&format!("[{name}]")).map(|at| (at, name)))
-        .max_by_key(|(at, _)| *at)?
-        .1;
-    let section_prefix = &prefix[prefix.rfind(&format!("[{section}]")).unwrap_or(0)..];
-    if section_prefix.matches('{').count() <= section_prefix.matches('}').count() {
+        .filter_map(|name| {
+            prefix
+                .rfind(&format!("struct {name}"))
+                .map(|at| (at, name))
+        })
+        .max_by_key(|(at, _)| *at)?;
+    let struct_prefix = &prefix[struct_at..];
+    if struct_prefix.matches('{').count() <= struct_prefix.matches('}').count() {
         return None;
     }
 
     let current_line = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
     if file_name == spar::package::PACKAGE_MANIFEST_FILE
-        && section == "Package"
+        && manifest_struct == "Package"
         && current_line.contains("kind:")
     {
         return Some(value_items(&["application", "library", "config"]));
@@ -46,7 +49,7 @@ fn package_metadata_completion_items(
         return Some(value_items(&["github", "path"]));
     }
 
-    let fields: &[(&str, &str)] = match (file_name, section) {
+    let fields: &[(&str, &str)] = match (file_name, manifest_struct) {
         (spar::package::PACKAGE_MANIFEST_FILE, "Package") => &[
             ("name", "name: \"${1:package-name}\";"),
             ("version", "version: \"${1:0.1.0}\";"),
@@ -69,7 +72,7 @@ fn package_metadata_completion_items(
         fields
             .iter()
             .filter(|(label, _)| {
-                label.contains(' ') || !section_prefix.contains(&format!("{label}:"))
+                label.contains(' ') || !struct_prefix.contains(&format!("{label}:"))
             })
             .map(|(label, insert_text)| CompletionItem {
                 label: (*label).to_string(),
@@ -229,7 +232,7 @@ fn atomic_pipeline_input_type(
                 return Some(entry.ret.clone());
             }
             let path = vec![name.to_string()];
-            if symbols.sections.get(&path).is_some_and(|section| section.canonical) {
+            if symbols.structs.get(&path).is_some() {
                 return Some(SparType::Named(name.to_string()));
             }
         }
@@ -277,7 +280,8 @@ fn bind_pipeline_type_parameters(
                 if params.len() == actual_params.len() =>
             {
                 params.iter().zip(actual_params).all(|(expected, actual)| {
-                    bind_pipeline_type_parameters(expected, actual, bindings)
+                    expected.name == actual.name
+                        && bind_pipeline_type_parameters(&expected.ty, &actual.ty, bindings)
                 }) && bind_pipeline_type_parameters(return_type, actual_return, bindings)
             }
             _ => false,
@@ -302,7 +306,10 @@ fn substitute_pipeline_type(ty: &SparType, bindings: &HashMap<String, SparType>)
         SparType::Function { params, return_type } => SparType::Function {
             params: params
                 .iter()
-                .map(|param| substitute_pipeline_type(param, bindings))
+                .map(|param| spar::ast::CallableParamType {
+                    name: param.name.clone(),
+                    ty: substitute_pipeline_type(&param.ty, bindings),
+                })
                 .collect(),
             return_type: Box::new(substitute_pipeline_type(return_type, bindings)),
         },
@@ -335,14 +342,14 @@ fn pipeline_callable_result(ty: &SparType, input: &SparType) -> Option<(Vec<Spar
     };
     let first = params.first()?;
     let mut bindings = HashMap::new();
-    if !bind_pipeline_type_parameters(first, input, &mut bindings) {
+    if !bind_pipeline_type_parameters(&first.ty, input, &mut bindings) {
         return None;
     }
     Some((
         params
             .iter()
             .skip(1)
-            .map(|param| substitute_pipeline_type(param, &bindings))
+            .map(|param| substitute_pipeline_type(&param.ty, &bindings))
             .collect(),
         substitute_pipeline_type(return_type, &bindings),
     ))
@@ -463,7 +470,7 @@ fn structured_pipe_contextual_diagnostic(
             Some(GlobalEntry::Var {
                 ty: SparType::Function { params, .. },
                 ..
-            }) => params.first().cloned(),
+            }) => params.first().map(|param| param.ty.clone()),
             _ => None,
         }
     }?;
@@ -587,10 +594,10 @@ fn top_level_start(item: &TopLevelItem) -> usize {
         TopLevelItem::Import(d) => d.span.start,
         TopLevelItem::Var(d) => d.span.start,
         TopLevelItem::Dynamic(d) => d.span.start,
-        TopLevelItem::Section(d) => d.span.start,
+        TopLevelItem::Struct(d) => d.span.start,
         TopLevelItem::Impl(d) => d.span.start,
         TopLevelItem::Function(d) => d.span.start,
-        TopLevelItem::SchemaSection(d) => d.span.start,
+        TopLevelItem::Schema(d) => d.span.start,
         TopLevelItem::Type(d) => d.span.start,
         TopLevelItem::SchemaFrom(d) => d.span.start,
         TopLevelItem::Enum(d) => d.span.start,
@@ -983,9 +990,9 @@ fn member_completion_items(
         return Some(function_completion_items(&group.functions, false));
     }
 
-    let section_path = vec![base.to_string()];
-    if let Some(section) = symbols.sections.get(&section_path) {
-        return Some(section_field_completions(symbols, &section_path, section));
+    let struct_path = vec![base.to_string()];
+    if symbols.structs.contains_key(&struct_path) {
+        return Some(Vec::new());
     }
 
     let named_kind = match symbols.globals.get(base) {
@@ -1031,7 +1038,7 @@ fn member_completion_items(
 }
 
 fn type_keyword_items() -> Vec<CompletionItem> {
-    ["int", "float", "str", "bool", "section"]
+    ["int", "float", "str", "bool", "Any", "Record", "List", "Map", "Option", "Result"]
         .iter()
         .map(|kw| CompletionItem {
             label: kw.to_string(),
@@ -1050,8 +1057,8 @@ fn constructor_completion_items(
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     let mut seen = HashSet::new();
-    for (path, section) in &symbols.sections {
-        if path.len() != 1 || !section.canonical {
+    for (path, struct_entry) in &symbols.structs {
+        if path.len() != 1 {
             continue;
         }
         let owner = &path[0];
@@ -1156,7 +1163,7 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>, snippet
 /// `Devices::` and `EdgeInsect::` completions — enum variant access and
 /// function-group member access are both `::`-namespaced in Spar (see
 /// `Devices::Android`, `EdgeInsect::only()`), never `.`, so this lives
-/// alongside `section_field_completions` rather than `member_completion_items`.
+/// alongside `struct_field_completions` rather than `member_completion_items`.
 fn enum_or_group_path_completions(symbols: &SymbolTable, name: &str) -> Option<Vec<CompletionItem>> {
     if let Some(entry) = symbols.enums.get(name) {
         return Some(
@@ -1177,20 +1184,20 @@ fn enum_or_group_path_completions(symbols: &SymbolTable, name: &str) -> Option<V
     None
 }
 
-fn section_field_completions(
+fn struct_field_completions(
     symbols: &SymbolTable,
     path: &[String],
-    section: &SectionEntry,
+    struct_entry: &StructEntry,
 ) -> Vec<CompletionItem> {
-    section
+    struct_entry
         .fields
         .iter()
         .map(|(name, entry)| {
-            if entry.ty == Some(SparType::Section) {
+            if entry.ty == Some(SparType::InlineRecord) {
                 CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::MODULE),
-                    detail: Some("section".to_string()),
+                    detail: Some("Record".to_string()),
                     insert_text: Some(format!("{}::", name)),
                     ..Default::default()
                 }

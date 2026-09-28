@@ -57,12 +57,12 @@ fn document_symbol(
     }
 }
 
-fn field_document_symbols(source: &str, items: &[spar::ast::SectionItem]) -> Vec<DocumentSymbol> {
+fn field_document_symbols(source: &str, items: &[spar::ast::ObjectItem]) -> Vec<DocumentSymbol> {
     let mut out = Vec::new();
     for item in items {
-        let spar::ast::SectionItem::Field(field) = item else { continue; };
+        let spar::ast::ObjectItem::Field(field) = item else { continue; };
         let children = match &field.value {
-            Some(spar::ast::FieldValue::Nested(items)) => field_document_symbols(source, items),
+            Some(spar::ast::FieldValue::Object(items)) => field_document_symbols(source, items),
             _ => Vec::new(),
         };
         out.push(document_symbol(
@@ -206,16 +206,15 @@ fn document_symbols(state: &DocumentState) -> Vec<DocumentSymbol> {
                     children,
                 ));
             }
-            TopLevelItem::Section(section) => {
-                let name = section.path.join("::");
+            TopLevelItem::Struct(decl) => {
                 out.push(document_symbol(
                     &state.source,
-                    name,
-                    SymbolKind::MODULE,
-                    &section.span,
+                    decl.name.clone(),
+                    SymbolKind::STRUCT,
+                    &decl.span,
                     None,
-                    Some("section".to_string()),
-                    field_document_symbols(&state.source, &section.items),
+                    Some("struct".to_string()),
+                    field_document_symbols(&state.source, &decl.items),
                 ));
             }
             TopLevelItem::FunctionGroup(group) => {
@@ -259,7 +258,7 @@ fn document_symbols(state: &DocumentState) -> Vec<DocumentSymbol> {
                 ));
             }
             TopLevelItem::Import(_)
-            | TopLevelItem::SchemaSection(_)
+            | TopLevelItem::Schema(_)
             | TopLevelItem::SchemaFrom(_)
             | TopLevelItem::Statement(_) => {}
         }

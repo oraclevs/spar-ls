@@ -27,7 +27,7 @@ fn expr_span(expr: &spar::ast::Expr) -> &Span {
 /// Find the smallest spanned expression containing the cursor. Literal nodes
 /// have no independent span in the AST, so their enclosing expression is used.
 fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::ast::Expr> {
-    use spar::ast::{Expr, FieldValue, ReturnValue, SectionItem, StringPart};
+    use spar::ast::{Expr, FieldValue, ReturnValue, ObjectItem, StringPart};
     fn search(e: &Expr, off: usize) -> Option<&Expr> {
         let contains = !matches!(e, Expr::Literal(_)) && expr_span(e).start <= off && off <= expr_span(e).end;
         if !contains { return None; }
@@ -51,7 +51,7 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
                 search(input, off).or_else(|| search(stage, off))
             }
             Expr::String(s) => s.parts.iter().find_map(|p| if let StringPart::Expr(x)=p { search(x,off) } else { None }),
-            Expr::Object(items, _) => items.iter().find_map(|i| match i { SectionItem::Field(f) => match &f.value { Some(FieldValue::Expr(x)) => search(x,off), _=>None }, SectionItem::Spread(s)=>search(&s.expr,off) }),
+            Expr::Object(items, _) => items.iter().find_map(|i| match i { ObjectItem::Field(f) => match &f.value { Some(FieldValue::Expr(x)) => search(x,off), _=>None }, ObjectItem::Spread(s)=>search(&s.expr,off) }),
             Expr::Literal(_)
             | Expr::NamespaceRef(_)
             | Expr::Shell(_)
@@ -69,7 +69,6 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
             FuncStmt::Break(_) | FuncStmt::Continue(_) => None,
             FuncStmt::Return(ReturnValue::Void, _) => None,
             FuncStmt::Return(ReturnValue::Expr(e),_) => search(e,off),
-            FuncStmt::Return(ReturnValue::SectionBlock(fs),_) => fs.iter().find_map(|f|search(&f.value,off)),
             FuncStmt::If(i) => search(&i.condition,off).or_else(||stmts(&i.then_stmts,off)).or_else(||stmts(&i.else_stmts,off)),
             FuncStmt::For(statement) => search(&statement.iterable,off).or_else(||stmts(&statement.body,off)),
             FuncStmt::Try(statement) => stmts(&statement.body, off)
@@ -79,7 +78,7 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
     program.items.iter().find_map(|item| match item {
         TopLevelItem::Var(v) => v.value.as_ref().and_then(|e|search(e,offset)),
         TopLevelItem::Dynamic(v) => v.value.as_ref().and_then(|e|search(e,offset)),
-        TopLevelItem::Section(s) => s.items.iter().find_map(|i| match i { SectionItem::Field(f)=>match &f.value {Some(FieldValue::Expr(e))=>search(e,offset), _=>None}, SectionItem::Spread(s)=>search(&s.expr,offset)}),
+        TopLevelItem::Struct(s) => s.items.iter().find_map(|i| match i { ObjectItem::Field(f)=>match &f.value {Some(FieldValue::Expr(e))=>search(e,offset), _=>None}, ObjectItem::Spread(s)=>search(&s.expr,offset)}),
         TopLevelItem::Function(f) => stmts(&f.body.stmts,offset),
         TopLevelItem::Impl(imp) => imp
             .methods
@@ -206,13 +205,13 @@ pub fn find_index_elem_type_at_offset(
                 })
             }
             Expr::Object(items, _) => {
-                use spar::ast::{FieldValue, SectionItem};
+                use spar::ast::{FieldValue, ObjectItem};
                 items.iter().find_map(|item| match item {
-                    SectionItem::Field(f) => match &f.value {
+                    ObjectItem::Field(f) => match &f.value {
                         Some(FieldValue::Expr(e)) => expr_index_elem(e, symbols, offset),
                         _ => None,
                     },
-                    SectionItem::Spread(sp) => expr_index_elem(&sp.expr, symbols, offset),
+                    ObjectItem::Spread(sp) => expr_index_elem(&sp.expr, symbols, offset),
                 })
             }
             Expr::FieldAccess { base, .. } => expr_index_elem(base, symbols, offset),
@@ -252,13 +251,6 @@ pub fn find_index_elem_type_at_offset(
                     ReturnValue::Expr(e) => {
                         if let Some(t) = expr_index_elem(e, symbols, offset) {
                             return Some(t);
-                        }
-                    }
-                    ReturnValue::SectionBlock(fields) => {
-                        for rf in fields {
-                            if let Some(t) = expr_index_elem(&rf.value, symbols, offset) {
-                                return Some(t);
-                            }
                         }
                     }
                 },
@@ -342,36 +334,23 @@ pub fn find_index_elem_type_at_offset(
 
 fn format_hover_global(name: &str, entry: &GlobalEntry) -> String {
     let ty_str = match entry {
-        GlobalEntry::Var {
-            ty,
-            optional,
-            exported,
-            ..
-        } => {
-            let base = format_spar_type(ty);
-            let opt_marker = if *optional { "?" } else { "" };
+        GlobalEntry::Var { ty, exported, .. } => {
             let export_prefix = if *exported { "export " } else { "" };
-            format!("{export_prefix}{}{opt_marker}", base)
+            format!("{export_prefix}{}", format_spar_type(ty))
         }
-        GlobalEntry::Dynamic { optional, .. } => {
-            if *optional {
-                "dynamic?".to_string()
-            } else {
-                "dynamic".to_string()
-            }
-        }
+        GlobalEntry::Dynamic { .. } => "dynamic".to_string(),
     };
     format!("```spar\n(var) {}: {}\n```", name, ty_str)
 }
 
-fn format_hover_section(symbols: &SymbolTable, path: &[String], section: &SectionEntry) -> String {
-    let section_label = path.join(".");
-    let field_list: String = section
+fn format_hover_struct(symbols: &SymbolTable, path: &[String], struct_entry: &StructEntry) -> String {
+    let struct_label = path.join(".");
+    let field_list: String = struct_entry
         .fields
         .iter()
         .map(|(name, fentry)| {
-            if fentry.ty == Some(SparType::Section) {
-                format!("  {}: section  // → {}::{}", name, section_label, name)
+            if fentry.ty == Some(SparType::InlineRecord) {
+                format!("  {}: Record  // dynamic field of {}::{}", name, struct_label, name)
             } else {
                 let ty_str = fentry
                     .ty
@@ -383,7 +362,7 @@ fn format_hover_section(symbols: &SymbolTable, path: &[String], section: &Sectio
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("```spar\n[{}]{{\n{}\n}}\n```", section_label, field_list)
+    format!("```spar\nstruct {} {{\n{}\n}}\n```", struct_label, field_list)
 }
 
 fn format_hover_function(name: &str, entry: &FunctionEntry) -> String {
@@ -394,7 +373,7 @@ fn format_hover_function(name: &str, entry: &FunctionEntry) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "```spar\nfunction {}({}) -> {}\n```",
+        "```spar\nfn {}({}) -> {}\n```",
         name,
         params_str,
         format_spar_type(&entry.ret)
@@ -406,16 +385,14 @@ fn format_hover_type(name: &str, entry: &TypeEntry) -> String {
         .fields
         .iter()
         .map(|f| {
-            format!(
-                "  {}{}: {}",
-                f.name,
-                if f.optional { "?" } else { "" },
-                format_type_field_shape(&f.shape)
-            )
+            format!("  {}: {}", f.name, format_type_field_shape(&f.shape))
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("```spar\ntype [{name}] {{\n{field_list}\n}}\n```")
+    let parameters = if entry.type_parameters.is_empty() { String::new() } else {
+        format!("<{}>", entry.type_parameters.iter().map(|parameter| parameter.name.as_str()).collect::<Vec<_>>().join(", "))
+    };
+    format!("```spar\nstruct {name}{parameters} {{\n{field_list}\n}};\n```")
 }
 
 fn format_hover_enum(name: &str, entry: &EnumEntry) -> String {
@@ -429,7 +406,7 @@ fn format_hover_enum_variant(enum_name: &str, variant: &str) -> String {
     format!("```spar\n{enum_name}::{variant}  // variant of enum {enum_name}\n```")
 }
 
-/// `type [Name]`/`enum Name`/`functionGroup Name` — bare declaration hover,
+/// `type Name`/`enum Name`/`functionGroup Name` — bare declaration hover,
 /// or a qualified `Name::member` reference (`EnumName::Variant`,
 /// `GroupName::function`). Pulled out of the main `hover()` dispatch so it's
 /// directly unit-testable without a `SparLanguageServer`/`Client` instance.
@@ -479,7 +456,7 @@ fn format_hover_function_group(name: &str, entry: &FunctionGroupEntry) -> String
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "  function {member_name}({params}) -> {}",
+                "  fn {member_name}({params}) -> {}",
                 format_spar_type(&f.ret)
             )
         })

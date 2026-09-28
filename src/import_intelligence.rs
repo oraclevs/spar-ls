@@ -94,24 +94,14 @@ fn selective_import_completion_items(
                     ..Default::default()
                 });
             }
-            TopLevelItem::Section(decl)
-                if decl.exported && !decl.private && !type_only && decl.path.len() == 1 =>
-            {
-                let name = &decl.path[0];
+            TopLevelItem::Struct(decl) if decl.exported && !decl.private => {
+                let name = &decl.name;
                 if already.contains(name) { continue; }
-                let indexed_kind = if decl.canonical {
-                    IndexedSymbolKind::Struct
-                } else {
-                    IndexedSymbolKind::Section
-                };
+                let indexed_kind = IndexedSymbolKind::Struct;
                 items.push(CompletionItem {
                     label: name.clone(),
-                    kind: Some(if decl.canonical {
-                        CompletionItemKind::STRUCT
-                    } else {
-                        CompletionItemKind::MODULE
-                    }),
-                    detail: Some(if decl.canonical { "struct" } else { "section" }.to_string()),
+                    kind: Some(CompletionItemKind::STRUCT),
+                    detail: Some("struct".to_string()),
                     filter_text: Some(name.clone()),
                     data: Some(completion_data(
                         import_symbol_id(&uri, indexed_kind, name, &decl.span),

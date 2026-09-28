@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn unified_struct_declaration_completion_only_offers_static_methods() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let source = "struct Item { value: int; }; impl Item { fn create() -> Item { return Item(value: 1); }; fn read(self) -> int { return self.value; }; };";
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let items = typed_member_items_indexed("Item.", 5, state.effective_symbols().unwrap(), &index, &uri).unwrap();
+    let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+    assert_eq!(labels, ["create"]);
+}
+
+#[test]
+fn unified_struct_generic_constructor_signature_substitutes_fields() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let declaration = "struct Box<T> { value: T; label: str = \"\"; };";
+    let state = SparLanguageServer::analyze(declaration, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let source = "Box<int>(value: 1, ";
+    let help = signature_help_at(&state, &index, &uri, source, source.len()).expect("generic constructor signature");
+    assert!(help.signatures[0].label.contains("value: int"), "{}", help.signatures[0].label);
+    assert!(help.signatures[0].label.contains("label: str ="));
+    let items = named_argument_completion_items(&state, &index, &uri, "Box<int>(", 9).unwrap();
+    assert_eq!(items[0].label, "value:");
+}
+
+#[test]
+fn unified_struct_option_field_without_default_is_required_in_editor() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze("struct Item { value: Option<int>; };", std::path::Path::new("/workspace"));
+    let semantic = state.semantic_snapshot().unwrap();
+    let fields = semantic.fields_for_type(&spar::ast::SparType::Named("Item".into()));
+    assert_eq!(fields.len(), 1);
+    assert!(!fields[0].has_default);
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    for source in ["struct Box<", "Box<int>(value:", "Item(value:"] {
+        let _ = signature_help_at(&state, &index, &uri, source, source.len());
+    }
+}
+
+#[test]
 fn minimal_client_support_does_not_assume_optional_resolve_features() {
     let params = InitializeParams::default();
     let support = ClientFeatureSupport::from_initialize(&params);
@@ -48,7 +90,7 @@ fn workspace_index_preserves_exports_and_callable_metadata() {
     let source = concat!(
         "function build(input: str, mode: str = \"debug\") -> int { return 0; };\n",
         "private function secret() -> int { return 1; };\n",
-        "export type Config { name: str; };\n",
+        "export struct Config { name: str; };\n",
         "export enum Mode { Fast, Safe };\n",
     );
     let uri = Url::parse("file:///workspace/main.spar").unwrap();
@@ -80,7 +122,7 @@ impl User {
     function create(name: str) -> User { return User(name: name); };
     private function secret(mut self) -> str { return self.name; };
 };
-export var transform: fn(int) -> int = fn(value: int) -> int => value + 1;
+export var transform: fn(value: int) -> int = |value: int| value + 1;
 "#;
     let uri = Url::parse("file:///workspace/models.spar").unwrap();
     let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
@@ -313,8 +355,8 @@ fn task25_call_context_keeps_dotted_method_callee() {
 }
 
 #[test]
-fn task25_callable_values_get_positional_signature_help_without_named_completion() {
-    let source = r#"export var transform: fn(int) -> int = fn(value: int) -> int => value + 1;"#;
+fn task25_callable_values_get_named_signature_help_and_named_completion() {
+    let source = r#"export var transform: fn(value: int) -> int = |value: int| value + 1;"#;
     let uri = Url::parse("file:///workspace/main.spar").unwrap();
     let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
     let mut index = WorkspaceIndex::default();
@@ -325,7 +367,9 @@ fn task25_callable_values_get_positional_signature_help_without_named_completion
     assert!(help.signatures[0]
         .label
         .contains("transform(value: int) -> int"));
-    assert!(named_argument_completion_items(&state, &index, &uri, &call, call.len()).is_none());
+    let items = named_argument_completion_items(&state, &index, &uri, &call, call.len())
+        .expect("named argument completion");
+    assert!(items.iter().any(|item| item.label == "value:"), "{items:?}");
 }
 
 #[test]
@@ -338,9 +382,9 @@ fn editor_context_recovers_selective_imports_and_paths() {
         }
     ));
     assert!(matches!(
-        context_from_marked("import type { Con| } from \"./types.spar\";"),
+        context_from_marked("import { Con| } from \"./types.spar\";"),
         EditorContext::SelectiveImport {
-            type_only: true,
+            type_only: false,
             ..
         }
     ));
@@ -378,7 +422,7 @@ fn import_completion_filters_type_only_private_and_duplicates() {
     std::fs::write(
         &module,
         concat!(
-            "export type Config { name: str; };\n",
+            "export struct Config { name: str; };\n",
             "export enum Mode { Fast, Safe };\n",
             "function build(input: str) -> int { return 0; };\n",
             "private function secret() -> int { return 0; };\n",
@@ -441,7 +485,7 @@ fn package_selective_import_completion_uses_lockfile_exports() {
         concat!(
             "function readText(path: str) -> str { return path; };\n",
             "private function secret() -> int { return 0; };\n",
-            "export type Options { encoding: str; };\n",
+            "export struct Options { encoding: str; };\n",
         ),
     )
     .unwrap();
@@ -525,7 +569,7 @@ fn named_argument_completion_omits_supplied_and_sorts_required_first() {
 #[test]
 fn document_symbol_response_has_hierarchy_and_flat_fallback() {
     let source = concat!(
-        "export type Config { name: str; };\n",
+        "export struct Config { name: str; };\n",
         "function build(input: str) -> int { return 0; };\n",
         "export enum Mode { Fast, Safe };\n",
     );
@@ -1271,7 +1315,7 @@ fn builtin_types_and_functions_carry_default_library() {
     let source = concat!(
         "import pkg { writeText } from \"std/fs\";\n",
         "function f(a: int) -> int { return a; };\n",
-        "var n: int = int(\"1\");\n",
+        "var n: int = int(value: \"1\");\n",
         "var m: int = f(a: 2);\n",
         "writeText(path: \"a\", content: \"b\");\n",
     );
@@ -1324,7 +1368,7 @@ fn builtin_types_and_functions_carry_default_library() {
 #[test]
 fn generic_type_arguments_and_type_parameters_are_typed() {
     let source = concat!(
-        "type Thing { n: int; };\n",
+        "struct Thing { n: int; };\n",
         "var xs: List<Thing> = [];\n",
         "function identity<T>(value: T) -> T { return value; };\n",
     );
@@ -1653,7 +1697,7 @@ fn declaration_and_control_keywords_are_different_token_types() {
     let source = concat!(
         "export var a: int = 1;\n",
         "function f() -> int { if a > 0 { return 1; } return 0; };\n",
-        "type Thing { n: int; };\n",
+        "struct Thing { n: int; };\n",
     );
     let tokens = rendered_tokens(source);
     let ty = |word: &str| {
@@ -1662,7 +1706,7 @@ fn declaration_and_control_keywords_are_different_token_types() {
             .find(|(text, _, _)| text == word)
             .map(|(_, ty, _)| *ty)
     };
-    for word in ["export", "var", "function", "type"] {
+    for word in ["export", "var", "function", "struct"] {
         assert_eq!(
             ty(word),
             Some(TT_DECLARATION_KEYWORD),
@@ -1723,7 +1767,7 @@ fn document_symbol_ranges_always_contain_their_names_and_children() {
         "function startup() -> shell {\n",
         "    return shell { pwd; };\n",
         "};\n",
-        "type Thing { n: int; };\n",
+        "struct Thing { n: int; };\n",
         "export var top: int = 1;\n",
     );
     let state = SparLanguageServer::analyze(source, std::path::Path::new("."));
@@ -1763,11 +1807,11 @@ fn imported_shell_functions_do_not_leak_tokens_onto_the_import_line() {
             "    };\n",
             "};\n",
             "function other() -> int { return 1; };\n",
-            "type Widget { n: int; };\n",
+            "struct Widget { n: int; };\n",
         ),
     )
     .unwrap();
-    let source = "import {\n    build,\n    other\n} from \"lib.spar\";\nimport type { Widget } from \"lib.spar\";\nvar n: int = other();\n";
+    let source = "import {\n    build,\n    other\n} from \"lib.spar\";\nimport { Widget } from \"lib.spar\";\nvar n: int = other();\n";
     let state = SparLanguageServer::analyze(source, dir.path());
     assert!(state.ast.is_some(), "fixture must compile");
     let tokens = rendered_tokens_in(source, dir.path());
@@ -1797,17 +1841,17 @@ fn imported_shell_functions_do_not_leak_tokens_onto_the_import_line() {
 }
 
 const HUMAN_SOURCE: &str = concat!(
-    "type Human {\n",
-    "    name: str;\n",
-    "    age: int;\n",
+    "struct Human {\n",
+    "    name: str = \"Unknown\";\n",
+    "    age: int = 0;\n",
     "};\n",
     "var people: List<Human> = [\n",
-    "    { name: \"Mike\"; age: 5; }\n",
+    "    Human(name: \"Mike\", age: 5)\n",
     "];\n",
     "var person: Human = people[0];\n",
-    "function looper(people: List<Human>) -> int {\n",
+    "fn looper(people: List<Human>) -> int {\n",
     "    for person in people {\n",
-    "        println(message: person.name);\n",
+    "        println(value: person.name);\n",
     "        return 6;\n",
     "    }\n",
     "    return 0;\n",
@@ -1861,24 +1905,24 @@ fn member_labels(source_with_marker: &str) -> Option<Vec<String>> {
 fn member_completion_after_a_loop_variable_inside_call_arguments() {
     // The screenshot case: `person` is a `for` binding over List<Human>.
     let source = HUMAN_SOURCE.replace(
-        "println(message: person.name);",
-        "println(message: person.|);",
+        "println(value: person.name);",
+        "println(value: person.|);",
     );
     assert_eq!(
         member_labels(&source),
-        Some(vec!["name".to_string(), "age".to_string()])
+        Some(vec!["name".to_string(), "age".to_string(), "toString".to_string(), "typeName".to_string()])
     );
 }
 
 #[test]
 fn member_completion_filters_nothing_for_a_partial_member_name() {
     let source = HUMAN_SOURCE.replace(
-        "println(message: person.name);",
-        "println(message: person.na|);",
+        "println(value: person.name);",
+        "println(value: person.na|);",
     );
     assert_eq!(
         member_labels(&source),
-        Some(vec!["name".to_string(), "age".to_string()])
+        Some(vec!["name".to_string(), "age".to_string(), "toString".to_string(), "typeName".to_string()])
     );
 }
 
@@ -1890,7 +1934,7 @@ fn member_completion_through_parameters_locals_and_index_chains() {
     );
     assert_eq!(
         member_labels(&params),
-        Some(vec!["name".to_string(), "age".to_string()])
+        Some(vec!["name".to_string(), "age".to_string(), "toString".to_string(), "typeName".to_string()])
     );
 
     let inferred = HUMAN_SOURCE.replace(
@@ -1899,7 +1943,7 @@ fn member_completion_through_parameters_locals_and_index_chains() {
     );
     assert_eq!(
         member_labels(&inferred),
-        Some(vec!["name".to_string(), "age".to_string()])
+        Some(vec!["name".to_string(), "age".to_string(), "toString".to_string(), "typeName".to_string()])
     );
 
     let indexed = HUMAN_SOURCE.replace(
@@ -1908,7 +1952,7 @@ fn member_completion_through_parameters_locals_and_index_chains() {
     );
     assert_eq!(
         member_labels(&indexed),
-        Some(vec!["name".to_string(), "age".to_string()])
+        Some(vec!["name".to_string(), "age".to_string(), "toString".to_string(), "typeName".to_string()])
     );
 }
 
@@ -1931,13 +1975,98 @@ fn member_completion_ignores_numbers_and_spreads() {
 }
 
 #[test]
+fn task12_nested_named_struct_member_completion_uses_compiler_field_semantics() {
+    let source = r#"
+struct Address {
+    country: str = "Nigeria";
+    city: str = "Awka";
+};
+struct User {
+    name: str = "Mike";
+    address: Address = Address();
+};
+fn demo(user: User) -> str {
+    return user.address.city;
+};
+"#;
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let symbols = state.effective_symbols().expect("symbols");
+    let probe = source.replace("user.address.city", "user.address.");
+    let offset = probe.find("user.address.").unwrap() + "user.address.".len();
+    let items = typed_member_items(&probe, offset, symbols).expect("member completion");
+    let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+    assert!(labels.contains(&"country".to_string()), "{labels:?}");
+    assert!(labels.contains(&"city".to_string()), "{labels:?}");
+}
+
+#[test]
+fn task12_type_display_uses_option_and_record_not_struct() {
+    assert_eq!(
+        format_spar_type(&SparType::Applied {
+            name: "Option".into(),
+            arguments: vec![SparType::Named("Address".into())],
+        }),
+        "Option<Address>"
+    );
+    assert_eq!(format_spar_type(&SparType::InlineRecord), "Record");
+}
+
+#[test]
+fn task12_keyword_completion_prefers_fn_and_does_not_offer_removed_section_keyword() {
+    let labels = keyword_items().into_iter().map(|item| item.label).collect::<Vec<_>>();
+    assert!(labels.contains(&"fn".to_string()), "{labels:?}");
+    assert!(labels.contains(&"struct".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"section".to_string()), "{labels:?}");
+}
+
+#[test]
+fn task12_builtin_member_completion_covers_primitives_and_map() {
+    let source = r#"
+fn demo() -> void {
+    var count: int = 1;
+    var flags: Map<str, bool> = {};
+};
+"#;
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let symbols = state.effective_symbols().expect("symbols");
+    let int_probe = source.replace("};\n", "    count.\n};\n");
+    let int_offset = int_probe.find("count.").unwrap() + "count.".len();
+    let int_items = typed_member_items(&int_probe, int_offset, symbols).expect("int members");
+    assert!(!int_items.is_empty(), "int native methods should be completed");
+
+    let map_probe = source.replace("};\n", "    flags.\n};\n");
+    let map_offset = map_probe.find("flags.").unwrap() + "flags.".len();
+    let map_items = typed_member_items(&map_probe, map_offset, symbols).expect("map members");
+    let labels = map_items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+    assert!(labels.contains(&"get".to_string()), "{labels:?}");
+    assert!(labels.contains(&"insert".to_string()), "{labels:?}");
+}
+
+#[test]
+fn task12_native_method_signature_help_uses_resolved_receiver_generics() {
+    let source = r#"
+fn demo() -> void {
+    var mut values: Map<str, bool> = {};
+};
+"#;
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let index = WorkspaceIndex::default();
+    let call = source.replace("};\n", "    values.get(\n};\n");
+    let offset = call.find("values.get(").unwrap() + "values.get(".len();
+    let help = signature_help_at(&state, &index, &uri, &call, offset)
+        .expect("native method signature help");
+    assert!(help.signatures[0].label.contains("get(key: str) -> Option<bool>"), "{:?}", help.signatures[0].label);
+}
+
+#[test]
 fn one_broken_statement_does_not_recolor_the_rest_of_the_file() {
     // While typing `person.` the file does not parse. Everything outside that one
     // statement must keep its full semantic tokens (this is what caused the
     // whole-file color flip while typing).
     let broken = HUMAN_SOURCE.replace(
-        "println(message: person.name);",
-        "println(message: person.);",
+        "println(value: person.name);",
+        "println(value: person.);",
     );
     let state = SparLanguageServer::analyze(&broken, std::path::Path::new("."));
     assert!(state.ast.is_none(), "fixture must not parse");
@@ -1961,8 +2090,8 @@ fn one_broken_statement_does_not_recolor_the_rest_of_the_file() {
 fn several_broken_statements_still_leave_the_healthy_ones_colored() {
     let broken = HUMAN_SOURCE
         .replace(
-            "println(message: person.name);",
-            "println(message: person.);",
+            "println(value: person.name);",
+            "println(value: person.);",
         )
         .replace("var person: Human = people[0];", "var person: Human = ;");
     let tokens = rendered_tokens(&broken);
@@ -1986,13 +2115,14 @@ fn references_to_a_type_include_uses_inside_type_annotations() {
     let target = semantic_target_at(
         &uri,
         &state,
-        position_of(HUMAN_SOURCE, "type Human", 6),
+        position_of(HUMAN_SOURCE, "struct Human", 7),
         &index,
     )
     .expect("target");
     let occurrences = semantic_occurrences_in_document(&uri, &state, &target, &index);
-    // declaration + `List<Human>` (global) + `List<Human>` (parameter) + `var person: Human`
-    assert_eq!(occurrences.len(), 4, "{occurrences:?}");
+    // declaration + `List<Human>` (global) + `Human(...)` constructor call +
+    // `var person: Human` + `List<Human>` (parameter)
+    assert_eq!(occurrences.len(), 5, "{occurrences:?}");
 }
 
 #[test]
@@ -2136,8 +2266,8 @@ impl Team {
 function demo() -> str {
     var user: User = User();
     var team: Team = Team();
-    var first: str = user.label("Ms ");
-    var second: str = team.label("Team ");
+    var first: str = user.label(prefix: "Ms ");
+    var second: str = team.label(prefix: "Team ");
     return first + second;
 };
 "#;
@@ -2171,7 +2301,7 @@ function demo() -> str {
 
 #[test]
 fn task26_closure_parameter_definition_references_rename_and_hover_are_local() {
-    let source = "var transform: fn(int) -> int = fn(value: int) -> int => value + 1;\n";
+    let source = "var transform: fn(value: int) -> int = |value: int| value + 1;\n";
     let uri = Url::parse("file:///workspace/main.spar").unwrap();
     let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
     let mut index = WorkspaceIndex::default();
@@ -2181,7 +2311,11 @@ fn task26_closure_parameter_definition_references_rename_and_hover_are_local() {
     let pos = byte_offset_to_lsp_position(source, use_byte);
     let definition =
         indexed_definition_at(&uri, &state, pos, &index).expect("closure parameter definition");
-    let decl_byte = source.find("value: int").unwrap();
+    // `fn(value: int) -> int` in the type annotation now also spells
+    // "value: int" (named function-type parameters), so the first match is
+    // no longer the closure's own parameter — that's the last one, inside
+    // `|value: int| ...`.
+    let decl_byte = source.rfind("value: int").unwrap();
     assert_eq!(
         definition.range.start,
         byte_offset_to_lsp_position(source, decl_byte)
@@ -2302,7 +2436,7 @@ function demo() -> shell {
     return shell {
         printf 'name,age\nObi,24\n'
             | from csv
-            |> where(fn(row) => row.age > 20)
+            |> where(predicate: |row: Record| row.age > 20)
             |> to json;
     };
 };
@@ -2407,13 +2541,17 @@ fn task28_formatter_round_trips_impl_closure_and_structured_pipe_syntax() {
         "struct User { name: str = \"Obi\"; };\n",
         "impl User { function label(self, prefix: str) -> str { return prefix + self.name; }; };\n",
         "var users: List<User> = [];\n",
-        "var names: List<str> = users |> map(fn(user: User) -> str => user.name);\n",
+        "var names: List<str> = users |> map(transform: fn(user: User) -> str => user.name);\n",
     );
 
     let formatted = format_document_source(source).expect("Task 28 syntax must be formatter-safe");
     assert!(formatted.contains("impl User"), "{formatted}");
+    // The canonical formatter normalizes the legacy `fn(...) => expr` closure
+    // to the pipe-closure form (`|params| -> ret expr`, no `=>` for an
+    // expression body) — this asserts the round trip lands there, not that
+    // the legacy spelling survives verbatim.
     assert!(
-        formatted.contains("fn(user: User) -> str => user.name"),
+        formatted.contains("transform: |user: User| -> str user.name"),
         "{formatted}"
     );
     assert!(formatted.contains("|> map("), "{formatted}");
@@ -2582,3 +2720,4 @@ struct User { name: str = "Obi"; age: int = 24; };
         "{table:?}"
     );
 }
+

@@ -27,7 +27,6 @@ enum IndexedSymbolKind {
     Type,
     Enum,
     EnumVariant,
-    Section,
     Field,
     FunctionGroup,
     FunctionGroupMember,
@@ -46,7 +45,6 @@ impl IndexedSymbolKind {
             Self::Type => "type",
             Self::Enum => "enum",
             Self::EnumVariant => "enum-variant",
-            Self::Section => "section",
             Self::Field => "field",
             Self::FunctionGroup => "function-group",
             Self::FunctionGroupMember => "function-group-member",
@@ -64,7 +62,7 @@ impl IndexedSymbolKind {
             Self::Type => SymbolKind::CLASS,
             Self::Enum => SymbolKind::ENUM,
             Self::EnumVariant => SymbolKind::ENUM_MEMBER,
-            Self::Section | Self::FunctionGroup => SymbolKind::MODULE,
+            Self::FunctionGroup => SymbolKind::MODULE,
             Self::Field => SymbolKind::FIELD,
             Self::Task => SymbolKind::FUNCTION,
         }
@@ -229,33 +227,19 @@ fn signature_from_entry(
 fn signature_from_callable_type(
     name: &str,
     ty: &spar::ast::SparType,
-    raw_decl: Option<&spar::ast::VarDecl>,
+    _raw_decl: Option<&spar::ast::VarDecl>,
     origin: Option<String>,
 ) -> Option<CallableSignature> {
     let spar::ast::SparType::Function { params, return_type } = ty else {
         return None;
     };
-    let closure_names = raw_decl
-        .and_then(|decl| decl.value.as_ref())
-        .and_then(|value| match value {
-            spar::ast::Expr::Closure { params: closure_params, .. }
-                if closure_params.len() == params.len() => {
-                Some(closure_params.iter().map(|param| param.name.clone()).collect::<Vec<_>>())
-            }
-            _ => None,
-        });
     Some(CallableSignature {
         name: name.to_string(),
         params: params
             .iter()
-            .enumerate()
-            .map(|(index, ty)| CallableParam {
-                name: closure_names
-                    .as_ref()
-                    .and_then(|names| names.get(index))
-                    .cloned()
-                    .unwrap_or_else(|| format!("arg{}", index + 1)),
-                ty: format_spar_type(ty),
+            .map(|param| CallableParam {
+                name: param.name.clone(),
+                ty: format_spar_type(&param.ty),
                 has_default: false,
                 default_repr: None,
             })
@@ -263,7 +247,7 @@ fn signature_from_callable_type(
         return_type: format_spar_type(return_type),
         is_async: false,
         origin,
-        argument_style: CallableArgumentStyle::Positional,
+        argument_style: CallableArgumentStyle::Named,
     })
 }
 
@@ -272,21 +256,25 @@ fn impl_owner_name(ty: &spar::ast::SparType) -> Option<String> {
         spar::ast::SparType::Named(name) => Some(name.clone()),
         spar::ast::SparType::Applied { name, .. } => Some(name.clone()),
         spar::ast::SparType::Str => Some("str".to_string()),
+        spar::ast::SparType::Int => Some("int".to_string()),
+        spar::ast::SparType::Float => Some("float".to_string()),
+        spar::ast::SparType::Bool => Some("bool".to_string()),
         spar::ast::SparType::List(_) => Some("List".to_string()),
+        spar::ast::SparType::InlineRecord => Some("Record".to_string()),
         _ => None,
     }
 }
 
 fn constructor_signature(
     name: &str,
-    decl: &spar::ast::SectionDecl,
+    decl: &spar::ast::StructDecl,
     origin: Option<String>,
 ) -> CallableSignature {
     let params = decl
         .items
         .iter()
         .filter_map(|item| match item {
-            spar::ast::SectionItem::Field(field) => Some(CallableParam {
+            spar::ast::ObjectItem::Field(field) => Some(CallableParam {
                 name: field.name.clone(),
                 ty: field
                     .ty
@@ -296,10 +284,10 @@ fn constructor_signature(
                 has_default: field.value.is_some(),
                 default_repr: field.value.as_ref().map(|value| match value {
                     spar::ast::FieldValue::Expr(expr) => spar::formatter::format_expression(expr),
-                    spar::ast::FieldValue::Nested(_) => "{ … }".to_string(),
+                    spar::ast::FieldValue::Object(_) => "{ … }".to_string(),
                 }),
             }),
-            spar::ast::SectionItem::Spread(_) => None,
+            spar::ast::ObjectItem::Spread(_) => None,
         })
         .collect();
     CallableSignature {
@@ -344,8 +332,8 @@ fn documentation_cursor(source: &str, declaration_start: usize) -> usize {
         return line_start;
     }
     let allowed = [
-        "export", "private", "async", "struct", "function", "var", "dynamic",
-        "type", "enum", "section", "schema", "task",
+        "export", "private", "async", "struct", "fn", "function", "var", "dynamic",
+        "type", "enum", "schema", "task",
     ];
     if prefix
         .split_whitespace()
@@ -446,13 +434,11 @@ impl WorkspaceIndex {
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
-        let raw_sections = raw_program
+        let raw_structs = raw_program
             .items
             .iter()
             .filter_map(|item| match item {
-                TopLevelItem::Section(decl) => {
-                    decl.path.first().cloned().map(|name| (name, decl.clone()))
-                }
+                TopLevelItem::Struct(decl) => Some((decl.name.clone(), decl.clone())),
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
@@ -685,20 +671,16 @@ impl WorkspaceIndex {
             }
         }
 
-        for (path, entry) in &symbols.sections {
+        for (path, entry) in &symbols.structs {
             if path.len() != 1 {
                 continue;
             }
             let name = path[0].clone();
-            if !raw_sections.contains_key(&name) {
+            if !raw_structs.contains_key(&name) {
                 continue;
             }
             let range = span_to_lsp_range(&state.source, &entry.span);
-            let kind = if entry.canonical {
-                IndexedSymbolKind::Struct
-            } else {
-                IndexedSymbolKind::Section
-            };
+            let kind = IndexedSymbolKind::Struct;
             push_symbol(IndexedSymbol {
                 id: SymbolId::new(uri, kind, &name, &entry.span),
                 name: name.clone(),
@@ -712,13 +694,13 @@ impl WorkspaceIndex {
                 private: entry.private,
                 signature: None,
                 method_receiver: None,
-                detail: Some(if entry.canonical { "struct" } else { "section" }.to_string()),
-                documentation: raw_sections
+                detail: Some("struct".to_string()),
+                documentation: raw_structs
                     .get(&name)
                     .and_then(|decl| leading_documentation(&state.source, decl.span.start)),
             });
-            if entry.canonical {
-                if let Some(decl) = raw_sections.get(&name) {
+            {
+                if let Some(decl) = raw_structs.get(&name) {
                     let constructor = constructor_signature(&name, decl, Some(uri.to_string()));
                     push_symbol(IndexedSymbol {
                         id: SymbolId::new(
@@ -745,9 +727,9 @@ impl WorkspaceIndex {
             }
         }
 
-        for (section_name, decl) in &raw_sections {
+        for (struct_name, decl) in &raw_structs {
             for item in &decl.items {
-                let spar::ast::SectionItem::Field(field) = item else {
+                let spar::ast::ObjectItem::Field(field) = item else {
                     continue;
                 };
                 let range = span_to_lsp_range(&state.source, &field.span);
@@ -755,16 +737,16 @@ impl WorkspaceIndex {
                     id: SymbolId::new(
                         uri,
                         IndexedSymbolKind::Field,
-                        &format!("{section_name}::{}", field.name),
+                        &format!("{struct_name}::{}", field.name),
                         &field.span,
                     ),
                     name: field.name.clone(),
-                    semantic_path: format!("{section_name}::{}", field.name),
+                    semantic_path: format!("{struct_name}::{}", field.name),
                     kind: IndexedSymbolKind::Field,
                     uri: uri.clone(),
                     range,
                     selection_range: range,
-                    container_name: Some(section_name.clone()),
+                    container_name: Some(struct_name.clone()),
                     exported: false,
                     private: decl.private,
                     signature: None,
@@ -803,7 +785,7 @@ impl WorkspaceIndex {
                 {
                     signature.params.remove(0);
                 }
-                signature.argument_style = CallableArgumentStyle::Positional;
+                signature.argument_style = CallableArgumentStyle::Named;
                 let receiver = if !entry.has_receiver {
                     IndexedMethodReceiver::Static
                 } else if entry.receiver_mutable {
@@ -1045,21 +1027,25 @@ impl WorkspaceIndex {
     }
 
     fn visible_callable_named(&self, current_uri: &Url, name: &str) -> Option<&IndexedSymbol> {
+        // A plain top-level `fn`/`function` declaration is indexed as
+        // `Function`; a closure-valued `var`/`dynamic` global is indexed as
+        // `Callable` (see `replace_document`). Both are invocable by name at
+        // a call site, so both must be considered here.
+        let is_callable = |kind: IndexedSymbolKind| {
+            matches!(kind, IndexedSymbolKind::Callable | IndexedSymbolKind::Function)
+        };
         if let Some(local) = self.modules.get(current_uri).and_then(|module| {
-            module.symbols.iter().find(|symbol| {
-                symbol.kind == IndexedSymbolKind::Callable && symbol.name == name
-            })
+            module
+                .symbols
+                .iter()
+                .find(|symbol| is_callable(symbol.kind) && symbol.name == name)
         }) {
             return Some(local);
         }
         self.modules
             .values()
             .flat_map(|module| module.exports.iter())
-            .find(|symbol| {
-                symbol.kind == IndexedSymbolKind::Callable
-                    && symbol.name == name
-                    && !symbol.private
-            })
+            .find(|symbol| is_callable(symbol.kind) && symbol.name == name && !symbol.private)
     }
 
     fn search(&self, query: &str) -> Vec<&IndexedSymbol> {

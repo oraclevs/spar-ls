@@ -92,28 +92,7 @@ fn element_type(ty: &SparType) -> Option<SparType> {
 }
 
 fn field_type_of(symbols: &SymbolTable, ty: &SparType, field: &str) -> Option<SparType> {
-    let SparType::Named(name) = ty else {
-        return None;
-    };
-    // A field of a dynamic Record is itself dynamic.
-    if name == "Record" {
-        return Some(ty.clone());
-    }
-    if let Some(entry) = symbols.types.get(name) {
-        let field = entry.fields.iter().find(|candidate| candidate.name == field)?;
-        return match &field.shape {
-            spar::ast::TypeFieldShape::Primitive(ty) => Some(ty.clone()),
-            spar::ast::TypeFieldShape::Named(name) => Some(SparType::Named(name.clone())),
-            spar::ast::TypeFieldShape::TypeParameter(name) => Some(SparType::TypeParameter(name.clone())),
-            spar::ast::TypeFieldShape::Applied { name, arguments } => {
-                Some(SparType::Applied { name: name.clone(), arguments: arguments.clone() })
-            }
-            spar::ast::TypeFieldShape::Section(_) => None,
-        };
-    }
-    let path = vec![name.clone()];
-    let section = symbols.sections.get(&path)?;
-    section.fields.get(field)?.ty.clone()
+    spar::SemanticSnapshot::new(symbols.clone()).field_type(ty, field)
 }
 
 fn type_of_chain(chain: &Chain, scope: &[ScopeName], symbols: &SymbolTable, depth: usize) -> Option<SparType> {
@@ -151,33 +130,23 @@ fn type_of_chain(chain: &Chain, scope: &[ScopeName], symbols: &SymbolTable, dept
 
 
 fn owner_name_for_type(ty: &SparType) -> Option<&str> {
-    match ty {
-        SparType::Named(name) | SparType::Applied { name, .. } => Some(name.as_str()),
-        SparType::Str => Some("str"),
-        SparType::List(_) => Some("List"),
-        _ => None,
-    }
+    spar::semantics::owner_name_for_type(ty)
 }
 
 /// Methods the runtime provides for built-in types (`str`, `List`, `Table`,
 /// `Record`, ...), which have no `impl` in any source file.
-fn builtin_method_completion_items(symbols: &SymbolTable, owner: &str) -> Vec<CompletionItem> {
-    let Some(methods) = symbols.methods.get(owner) else {
-        return Vec::new();
-    };
-    methods
-        .iter()
-        .filter(|(_, entry)| {
-            entry.native_method.is_some() && entry.has_receiver && !entry.function.is_private
-        })
-        .map(|(name, entry)| {
-            // The receiver is the first parameter; callers do not write it.
-            let params = entry
-                .function
-                .params
+fn builtin_method_completion_items(symbols: &SymbolTable, ty: &SparType) -> Vec<CompletionItem> {
+    spar::SemanticSnapshot::new(symbols.clone())
+        .methods_for_type(ty)
+        .into_iter()
+        .filter(|method| method.is_native && !method.is_static)
+        .map(|method| {
+            let name = method.callable.name;
+            let params = method
+                .callable
+                .parameters
                 .iter()
-                .skip(1)
-                .map(|(param, ty)| format!("{param}: {}", spar::typechecker::display_type(ty)))
+                .map(|param| format!("{}: {}", param.name, format_spar_type(&param.ty)))
                 .collect::<Vec<_>>();
             CompletionItem {
                 label: name.clone(),
@@ -185,7 +154,7 @@ fn builtin_method_completion_items(symbols: &SymbolTable, owner: &str) -> Vec<Co
                 detail: Some(format!(
                     "{name}({}) -> {}",
                     params.join(", "),
-                    spar::typechecker::display_type(&entry.function.ret)
+                    format_spar_type(&method.callable.return_type)
                 )),
                 insert_text: Some(name.clone()),
                 insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
@@ -236,32 +205,18 @@ fn merge_member_items(mut fields: Vec<CompletionItem>, mut methods: Vec<Completi
     fields
 }
 fn type_field_completion_items(symbols: &SymbolTable, ty: &SparType) -> Vec<CompletionItem> {
-    let SparType::Named(name) = ty else {
-        return Vec::new();
-    };
-    if let Some(entry) = symbols.types.get(name) {
-        return entry
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(position, field)| CompletionItem {
-                label: field.name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                detail: Some(format!(
-                    "{}{}",
-                    format_type_field_shape(&field.shape),
-                    if field.optional { " (optional)" } else { "" }
-                )),
-                sort_text: Some(format!("{position:03}")),
-                ..Default::default()
-            })
-            .collect();
-    }
-    let path = vec![name.clone()];
-    let Some(section) = symbols.sections.get(&path) else {
-        return Vec::new();
-    };
-    section_field_completions(symbols, &path, section)
+    let fields = spar::SemanticSnapshot::new(symbols.clone()).fields_for_type(ty);
+    fields
+        .iter()
+        .enumerate()
+        .map(|(position, field)| CompletionItem {
+            label: field.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(format_spar_type(&field.ty)),
+            sort_text: Some(format!("{position:03}")),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Completion after `receiver.` (or `receiver.par|`). `Some(items)` means the
@@ -287,7 +242,7 @@ fn typed_member_items_indexed(
                     .map(|owner| indexed_method_completion_items(index, uri, owner, false))
                     .unwrap_or_default();
                 if let Some(owner) = owner_name_for_type(&ty) {
-                    for item in builtin_method_completion_items(symbols, owner) {
+                    for item in builtin_method_completion_items(symbols, &ty) {
                         if !methods.iter().any(|existing| existing.label == item.label) {
                             methods.push(item);
                         }
@@ -299,17 +254,12 @@ fn typed_member_items_indexed(
         });
     }
 
-    // `Struct.` is a static-method receiver. Preserve legacy canonical-section
-    // field completion while adding only receiver-less impl functions.
+    // A declaration exposes only receiver-less methods. Fields require an instance.
     if receiver.chain.steps.is_empty() {
         let owner = receiver.chain.root.as_str();
         let path = vec![owner.to_string()];
-        if let Some(section) = symbols.sections.get(&path) {
-            if section.canonical {
-                let fields = section_field_completions(symbols, &path, section);
-                let methods = indexed_method_completion_items(index, uri, owner, true);
-                return Some(merge_member_items(fields, methods));
-            }
+        if symbols.structs.contains_key(&path) {
+            return Some(indexed_method_completion_items(index, uri, owner, true));
         }
         let upto = &source[..receiver.after_dot];
         return member_completion_items(upto, receiver.after_dot, symbols).or(Some(Vec::new()));

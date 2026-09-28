@@ -62,6 +62,12 @@ impl DocumentState {
             .or(self.repaired_symbols.as_ref())
     }
 
+    fn semantic_snapshot(&self) -> Option<spar::SemanticSnapshot> {
+        self.effective_symbols()
+            .cloned()
+            .map(spar::SemanticSnapshot::new)
+    }
+
     fn effective_import_symbols(&self) -> &HashMap<String, SymbolTable> {
         if !self.import_symbols.is_empty() {
             &self.import_symbols

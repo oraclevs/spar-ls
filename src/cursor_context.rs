@@ -341,20 +341,23 @@ fn call_context(source: &str, offset: usize) -> Option<EditorContext> {
     let before = &masked[..open];
     let end = before.trim_end().len();
     let mut start = end;
+    let mut angle_depth = 0usize;
     while start > 0 {
         let b = before.as_bytes()[start - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'.' {
+        if b == b'>' { angle_depth += 1; start -= 1; continue; }
+        if b == b'<' && angle_depth > 0 { angle_depth -= 1; start -= 1; continue; }
+        if angle_depth > 0 || b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'.' {
             start -= 1;
         } else {
             break;
         }
     }
     let callee = before[start..end].trim().to_string();
-    if callee.is_empty() || matches!(callee.as_str(), "if" | "for" | "function" | "task" | "shell") {
+    if callee.is_empty() || matches!(callee.as_str(), "if" | "for" | "fn" | "function" | "task" | "shell") {
         return None;
     }
     let leading = before[..start].trim_end();
-    if leading.ends_with("function") || leading.ends_with("task") {
+    if leading.ends_with("fn") || leading.ends_with("function") || leading.ends_with("task") {
         return None;
     }
     let args_source = &prefix[open + 1..];

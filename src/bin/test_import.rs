@@ -1,4 +1,4 @@
-use spar::ast::{FieldValue, SectionItem, TopLevelItem};
+use spar::ast::{FieldValue, ObjectItem, TopLevelItem};
 use spar::lexer::Lexer;
 use spar::parser::Parser;
 
@@ -13,14 +13,14 @@ fn check(label: &str, src: &str) {
             }
             Ok(program) => {
                 for item in &program.items {
-                    if let TopLevelItem::Section(s) = item {
-                        if s.path.first().map(|x| x.as_str()) == Some("Database") {
+                    if let TopLevelItem::Struct(s) = item {
+                        if s.name == "Database" {
                             for si in &s.items {
-                                if let SectionItem::Field(fd) = si {
+                                if let ObjectItem::Field(fd) = si {
                                     if fd.name == "replica" {
-                                        if let Some(FieldValue::Nested(sub)) = &fd.value {
+                                        if let Some(FieldValue::Object(sub)) = &fd.value {
                                             for si in sub {
-                                                let SectionItem::Field(sf) = si else { continue };
+                                                let ObjectItem::Field(sf) = si else { continue };
                                                 if sf.name == "asker" {
                                                     println!(
                                                         "{}: asker.value = {:?}",
@@ -28,7 +28,7 @@ fn check(label: &str, src: &str) {
                                                         sf.value.as_ref().map(|v| match v {
                                                             FieldValue::Expr(_) =>
                                                                 "Expr".to_string(),
-                                                            FieldValue::Nested(n) =>
+                                                            FieldValue::Object(n) =>
                                                                 format!("Nested({})", n.len()),
                                                         })
                                                     );
@@ -46,7 +46,7 @@ fn check(label: &str, src: &str) {
                         }
                     }
                 }
-                println!("{}: Database section or replica field not found", label);
+                println!("{}: Database struct or replica field not found", label);
             }
         },
     }
@@ -59,8 +59,8 @@ fn main() {
     });
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
-    // Get just the Database section block
-    let db_start = src.find("[Database]").unwrap();
+    // Get just the Database struct block
+    let db_start = src.find("struct Database").unwrap();
     let db_end = src[db_start..].find("\n};").unwrap() + db_start + 3;
     let db_block = &src[db_start..db_end];
     println!("Block:\n{}\n", db_block);

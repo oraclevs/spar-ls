@@ -673,6 +673,6 @@ mod tests {
 
     #[test]
     fn identifiers_named_task_at_depth_are_ignored() {
-        assert!(at("section S {\n    task: 1;\n    |").is_none());
+        assert!(at("struct S {\n    task: 1;\n    |").is_none());
     }
 }
