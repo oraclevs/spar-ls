@@ -305,21 +305,29 @@ fn raw_program_for_source(source: &str) -> Option<Program> {
     parse_with_statement_repair(source)
 }
 
-fn normalize_documentation_comment(text: &str) -> String {
+/// Only a `///` line (or `/** ... */` block) counts as documentation — a
+/// plain `//`/`/* */` comment is an implementation note, not part of the
+/// declaration's public docs, so it returns `None` rather than empty text.
+fn normalize_documentation_comment(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    if let Some(line) = trimmed.strip_prefix("//") {
-        return line.trim_start().to_string();
+    if let Some(line) = trimmed.strip_prefix("///") {
+        return Some(line.trim_start().to_string());
     }
-    if let Some(block) = trimmed.strip_prefix("/*").and_then(|value| value.strip_suffix("*/")) {
-        return block
-            .lines()
-            .map(|line| line.trim().trim_start_matches('*').trim_start())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
+    if let Some(block) = trimmed
+        .strip_prefix("/**")
+        .and_then(|value| value.strip_suffix("*/"))
+    {
+        return Some(
+            block
+                .lines()
+                .map(|line| line.trim().trim_start_matches('*').trim_start())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string(),
+        );
     }
-    trimmed.to_string()
+    None
 }
 
 fn documentation_cursor(source: &str, declaration_start: usize) -> usize {
@@ -366,7 +374,12 @@ fn leading_documentation(source: &str, declaration_start: usize) -> Option<Strin
         if !gap.chars().all(char::is_whitespace) || gap.chars().filter(|ch| *ch == '\n').count() > 1 {
             break;
         }
-        let text = normalize_documentation_comment(&comment.text);
+        // A non-doc comment (plain `//` or `/* */`) breaks the block: it's
+        // not part of the declaration's docs, and an earlier `///` block
+        // separated from the declaration by one doesn't count either.
+        let Some(text) = normalize_documentation_comment(&comment.text) else {
+            break;
+        };
         if !text.is_empty() {
             parts.push(text);
         }

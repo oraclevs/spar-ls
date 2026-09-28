@@ -2664,17 +2664,49 @@ fn task28_auto_import_uses_value_import_for_constructible_structs() {
 }
 
 #[test]
+fn triple_slash_doc_comments_are_stripped_correctly_and_plain_slash_slash_is_not_documentation() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let source = concat!(
+        "/// Adds two numbers together.\n",
+        "function add(a: int, b: int) -> int { return a + b; };\n",
+        "\n",
+        "// Just an implementation note, not documentation.\n",
+        "function helper() -> int { return 1; };\n",
+    );
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+
+    let add = index.find_by_name("add").into_iter().next().expect("add");
+    assert_eq!(
+        add.documentation.as_deref(),
+        Some("Adds two numbers together."),
+        "a /// doc comment must be stripped down to its text, no stray leading '/'"
+    );
+
+    let helper = index
+        .find_by_name("helper")
+        .into_iter()
+        .next()
+        .expect("helper");
+    assert_eq!(
+        helper.documentation, None,
+        "a plain // comment is an implementation note, not documentation"
+    );
+}
+
+#[test]
 fn task28_import_completion_and_resolve_expose_leading_documentation() {
     let temp = tempfile::tempdir().unwrap();
     let lib_path = temp.path().join("lib.spar");
     let source = concat!(
-        "// Build a friendly greeting for a user.\n",
+        "/// Build a friendly greeting for a user.\n",
         "function greet(name: str) -> str { return \"hello \" + name; };\n",
         "\n",
-        "// Canonical user value used by callers.\n",
+        "/// Canonical user value used by callers.\n",
         "export struct User { name: str = \"Obi\"; };\n",
         "impl User {\n",
-        "    // Render the public user label.\n",
+        "    /// Render the public user label.\n",
         "    function label(self) -> str { return self.name; };\n",
         "};\n",
     );
