@@ -3,7 +3,7 @@
 fn keyword_items() -> Vec<CompletionItem> {
     [
         // declaration keywords
-        "var", "export", "private", "import", "dynamic", "as", "struct", "type", "fn", "function",
+        "var", "const", "export", "private", "import", "dynamic", "as", "struct", "type", "fn", "function",
         "schema", "task", "try", "catch",
         // control keywords
         "if", "else", "for", "while", "loop", "in", "break", "continue", "return", "mut", // literals

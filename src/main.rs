@@ -3351,7 +3351,7 @@ mod tests {
     #[test]
     fn phase0_keywords_are_completed() {
         let labels: Vec<String> = keyword_items().into_iter().map(|item| item.label).collect();
-        for keyword in ["mut", "break", "continue", "while", "loop"] {
+        for keyword in ["mut", "break", "continue", "while", "loop", "const"] {
             assert!(
                 labels.iter().any(|label| label == keyword),
                 "missing {keyword}"
@@ -4169,7 +4169,7 @@ impl SparLanguageServer {
         // Case 1: global variable hover
         if !word.is_empty() {
             if let Some(entry) = symbols.globals.get(&word) {
-                let value = format_hover_global(&word, entry);
+                let value = format_hover_global(&word, entry, symbols.constants.get(&word));
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,

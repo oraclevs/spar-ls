@@ -349,7 +349,7 @@ pub fn find_index_elem_type_at_offset(
 
 // ── Hover formatters ──────────────────────────────────────────────────────────
 
-fn format_hover_global(name: &str, entry: &GlobalEntry) -> String {
+fn format_hover_global(name: &str, entry: &GlobalEntry, constant: Option<&spar::ConfigValue>) -> String {
     let ty_str = match entry {
         GlobalEntry::Var { ty, exported, .. } => {
             let export_prefix = if *exported { "export " } else { "" };
@@ -357,7 +357,26 @@ fn format_hover_global(name: &str, entry: &GlobalEntry) -> String {
         }
         GlobalEntry::Dynamic { .. } => "dynamic".to_string(),
     };
-    format!("```spar\n(var) {}: {}\n```", name, ty_str)
+    match constant {
+        Some(value) => format!(
+            "```spar\n(const) {}: {} = {}\n```",
+            name,
+            ty_str,
+            const_display(value)
+        ),
+        None => format!("```spar\n(var) {}: {}\n```", name, ty_str),
+    }
+}
+
+/// A folded constant as it would be written in source.
+fn const_display(value: &spar::ConfigValue) -> String {
+    match value {
+        spar::ConfigValue::Int(v) => v.to_string(),
+        spar::ConfigValue::Float(v) => format!("{v:?}"),
+        spar::ConfigValue::Bool(v) => v.to_string(),
+        spar::ConfigValue::Str(v) => format!("{v:?}"),
+        _ => "…".to_string(),
+    }
 }
 
 /// A declaration's own file, when known — hover on a symbol imported from

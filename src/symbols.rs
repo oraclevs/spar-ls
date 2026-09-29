@@ -88,7 +88,7 @@ fn document_symbols(state: &DocumentState) -> Vec<DocumentSymbol> {
             TopLevelItem::Var(var) => out.push(document_symbol(
                 &state.source,
                 var.name.clone(),
-                SymbolKind::VARIABLE,
+                if var.is_const { SymbolKind::CONSTANT } else { SymbolKind::VARIABLE },
                 &var.span,
                 None,
                 Some(format_spar_type(&var.ty)),

@@ -251,7 +251,7 @@ fn local_names_at(source: &str, offset: usize) -> Vec<ScopeName> {
                     index = position;
                 }
             }
-            Token::Var => {
+            Token::Var | Token::KwConst => {
                 let mut cursor = index + 1;
                 if tokens.get(cursor).copied() == Some(&Token::KwMut) {
                     cursor += 1;

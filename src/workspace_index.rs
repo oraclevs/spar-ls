@@ -340,7 +340,7 @@ fn documentation_cursor(source: &str, declaration_start: usize) -> usize {
         return line_start;
     }
     let allowed = [
-        "export", "private", "async", "struct", "fn", "function", "var", "dynamic",
+        "export", "private", "async", "struct", "fn", "function", "var", "const", "dynamic",
         "type", "enum", "schema", "task",
     ];
     if prefix

@@ -2908,3 +2908,52 @@ fn completion_sees_locals_and_member_types_inside_while_and_loop_bodies() {
         .expect("str members inside a while body");
     assert!(labels.iter().any(|l| l == "length"), "{labels:?}");
 }
+
+const CONST_SOURCE: &str = concat!(
+    "export const MAX_TRIES: int = 3;\n",
+    "function main() -> int {\n",
+    "    const step: int = MAX_TRIES * 2;\n",
+    "    var mut total: int = 0;\n",
+    "    total = total + step + MAX_TRIES;\n",
+    "    return total;\n",
+    "};\n",
+);
+
+#[test]
+fn definition_and_symbols_understand_const_declarations() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(CONST_SOURCE, std::path::Path::new("/workspace"));
+    assert!(state.errors.is_empty(), "{:?}", state.errors);
+    let location = definition_at(&uri, &state, position_of(CONST_SOURCE, "total + step", 8)).expect("definition of step");
+    assert_eq!(location.range.start.line, 2, "{:?}", location.range);
+    let location = definition_at(&uri, &state, position_of(CONST_SOURCE, "step + MAX_TRIES;", 9)).expect("definition of MAX_TRIES");
+    assert_eq!(location.range.start.line, 0, "{:?}", location.range);
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    assert!(
+        workspace_symbols(&index, "MAX_TRIES").iter().any(|s| s.name == "MAX_TRIES"),
+        "top-level const must be a workspace symbol"
+    );
+}
+
+#[test]
+fn const_hover_shows_the_folded_value() {
+    let state = SparLanguageServer::analyze(CONST_SOURCE, std::path::Path::new("/workspace"));
+    let symbols = state.effective_symbols().expect("symbols");
+    let entry = symbols.globals.get("MAX_TRIES").expect("global");
+    let text = format_hover_global("MAX_TRIES", entry, symbols.constants.get("MAX_TRIES"));
+    assert!(text.contains("(const) MAX_TRIES: export int = 3") || text.contains("(const) MAX_TRIES:"), "{text}");
+    assert!(text.contains("= 3"), "{text}");
+}
+
+#[test]
+fn completion_offers_local_consts() {
+    let names = local_name_list(concat!(
+        "function f() -> int {\n",
+        "    const step: int = 2;\n",
+        "    |\n",
+        "    return step;\n",
+        "};\n",
+    ));
+    assert!(names.contains(&"step".to_string()), "{names:?}");
+}

@@ -1291,7 +1291,7 @@ fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
                 after_hash_bracket = false;
                 (TT_DECLARATION_KEYWORD, MOD_NONE)
             }
-            Token::Var | Token::KwMut | Token::Export | Token::Import | Token::As
+            Token::Var | Token::KwConst | Token::KwMut | Token::Export | Token::Import | Token::As
             | Token::Dynamic | Token::Private | Token::KwAsync | Token::KwFunction
             | Token::KwStruct => (TT_DECLARATION_KEYWORD, MOD_NONE),
             Token::KwAwait | Token::KwReturn | Token::KwIf | Token::KwElse | Token::KwFor
