@@ -32,10 +32,10 @@ pub fn error_hint(error: &SparError) -> Option<&str> {
 
 pub fn spar_error_to_diagnostic(error: &SparError) -> Diagnostic {
     let span = error_span(error);
-    let message = match error_hint(error) {
+    let message = spar::naming::demangle(&match error_hint(error) {
         Some(hint) => format!("{}\nHint: {}", error_message(error), hint),
         None => error_message(error).to_string(),
-    };
+    });
     let start = Position {
         line: span.line.saturating_sub(1),
         character: span.col.saturating_sub(1),

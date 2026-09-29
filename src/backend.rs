@@ -151,12 +151,27 @@ impl SparLanguageServer {
     /// Symbols for a file that does not compile, taken from a copy with the
     /// offending statements blanked.
     fn repaired_symbols(source: &str, mut options: CompileOptions) -> Option<SymbolTable> {
-        let repaired = repair_source(source)?;
-        if repaired == source {
-            return None;
-        }
+        let mut text = repair_source(source)?;
         options.evaluate = false;
-        Compiler::new(options).compile(&repaired).symbols
+        // A resolve error (unknown name, wrong argument count) discards the whole symbol table, and
+        // with it every completion and hover. Blank the failing statement and try again so the rest
+        // of the file keeps its intelligence while the user fixes it.
+        for _ in 0..6 {
+            let compilation = Compiler::new(options.clone()).compile(&text);
+            if let Some(symbols) = compilation.symbols {
+                return Some(symbols);
+            }
+            let start = compilation.errors.iter().find_map(|e| match e {
+                SparError::ResolveError { span, .. } if span.end > span.start => Some(span.start),
+                _ => None,
+            })?;
+            let blanked = blank_statement_around(&text, start);
+            if blanked == text {
+                return None;
+            }
+            text = blanked;
+        }
+        None
     }
 
     async fn publish_diagnostics(&self, uri: Url, diags: Vec<Diagnostic>) {

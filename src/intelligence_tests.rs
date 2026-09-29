@@ -2824,3 +2824,32 @@ struct User { name: str = "Obi"; age: int = 24; };
 
 
 
+
+#[test]
+fn call_result_receiver_completes_members_from_checker_types() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let source = "struct Shelf { id: int; name: str; };\nimpl Shelf { fn label(self) -> str { return self.name; }; };\nfn make(id: int) -> Shelf { return Shelf(id: id, name: \"n\"); };\nfn main() -> int {\n    var s = make(id: 1).;\n    return 0;\n};\n";
+    let offset = source.find("make(id: 1).").unwrap() + "make(id: 1).".len();
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    let mut index = WorkspaceIndex::default();
+    index.replace_document(&uri, &state);
+    let items = typed_member_items_with_types(&state, offset, state.effective_symbols().expect("symbols"), &index, &uri)
+        .expect("member items");
+    let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"label") && labels.contains(&"name"), "{labels:?}");
+}
+
+#[test]
+fn resolve_errors_do_not_disable_semantic_features() {
+    let source = "struct Shelf { id: int; };\nfn total(shelf: Shelf) -> int { return shelf.id; };\nfn main() -> int {\n    var v = total();\n    return 0;\n};\n";
+    let state = SparLanguageServer::analyze(source, std::path::Path::new("/workspace"));
+    assert!(state.effective_symbols().is_some(), "a resolve error must not discard every symbol");
+}
+
+#[test]
+fn mangled_import_names_never_reach_display_text() {
+    assert_eq!(
+        format_spar_type(&SparType::List(Box::new(SparType::Named("SparModulec5a597130d9698afShelve".into())))),
+        "List<Shelve>"
+    );
+}

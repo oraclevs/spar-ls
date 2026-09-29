@@ -139,7 +139,7 @@ fn format_type_field_shape(shape: &spar::ast::TypeFieldShape) -> String {
         spar::ast::TypeFieldShape::InlineRecord(_) => "Record".to_string(),
         // A Named shape's own type name is more useful than a bare
         // "struct" — e.g. "PostgresType" tells the reader where to look.
-        spar::ast::TypeFieldShape::Named(name) => name.clone(),
+        spar::ast::TypeFieldShape::Named(name) => spar::naming::demangle(name),
         spar::ast::TypeFieldShape::TypeParameter(name) => name.clone(),
         spar::ast::TypeFieldShape::Applied { name, arguments } => format!(
             "{}<{}>",
@@ -412,6 +412,7 @@ include!("shell_semantic.rs");
 include!("decoder_intelligence.rs");
 include!("scope_completion.rs");
 include!("member_completion.rs");
+include!("typed_intel.rs");
 // ── Import hover / completion helpers ────────────────────────────────────────
 
 fn format_import_hover(alias: &str, sym: &SymbolTable) -> String {
@@ -926,760 +927,19 @@ impl LanguageServer for SparLanguageServer {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let pos = params.text_document_position_params.position;
-
-        let docs = self.documents.lock().await;
-        let state = match docs.get(&uri) {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        let decoder_offset = lsp_pos_to_byte_offset(&state.source, pos);
-        if let Some(value) =
-            attribute_intelligence::attribute_hover_at(&state.source, decoder_offset)
-        {
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: None,
-            }));
-        }
-        if let Some(value) = decoder_hover_at(&state.source, decoder_offset) {
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: None,
-            }));
-        }
-
-        let symbols = match state.effective_symbols() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        let word = word_at_position(&state.source, pos);
-
-        if !word.is_empty() {
-            if let Some(program) = &state.ast {
-                let offset = lsp_pos_to_byte_offset(&state.source, pos);
-                if let Some(value) = task_hover_at_offset(program, &state.source, offset, &word) {
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value,
-                        }),
-                        range: None,
-                    }));
-                }
-            }
-
-            if let Some(value) = local_binding_hover_at(state, pos) {
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-
-            let index = self.workspace_index.lock().await;
-            if let Some(value) = indexed_method_hover_at(&uri, state, pos, &index) {
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 0: import alias hover
-        if !word.is_empty() {
-            let imp_sym = state.effective_import_symbols();
-            if let Some(imported_sym) = imp_sym.get(word.as_str()) {
-                let value = format_import_hover(&word, imported_sym);
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 0b: word is a struct/field inside an import path (e.g. hover on `Minor` in `base::Minor::port`)
-        if !word.is_empty() {
-            if let Some(prefix) = path_prefix_before_word(&state.source, pos) {
-                let imp_syms = state.effective_import_symbols();
-                if let Some(imported_sym) = imp_syms.get(&prefix[0]) {
-                    if prefix.len() == 1 {
-                        // hovering on struct name: base::[Minor]
-                        let sec_path = vec![word.clone()];
-                        if let Some(struct_entry) = imported_sym.structs.get(&sec_path) {
-                            let value = format_hover_struct(imported_sym, &sec_path, struct_entry, None);
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value,
-                                }),
-                                range: None,
-                            }));
-                        }
-                        // hovering on exported var name: base::[namespace]
-                        if let Some(spar::resolver::GlobalEntry::Var { ty, .. }) =
-                            imported_sym.globals.get(&word)
-                        {
-                            let value = format!(
-                                "```spar\nexport var {}: {}\n```",
-                                word,
-                                format_spar_type(ty)
-                            );
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value,
-                                }),
-                                range: None,
-                            }));
-                        }
-                        // hovering on function name: base::[main]
-                        if let Some(entry) = imported_sym.functions.get(&word) {
-                            if !entry.is_private {
-                                let params = entry
-                                    .params
-                                    .iter()
-                                    .map(|(n, t)| format!("{}: {}", n, format_spar_type(t)))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                let value = format!(
-                                    "```spar\nfn {}({}) -> {}\n```",
-                                    word,
-                                    params,
-                                    format_spar_type(&entry.ret)
-                                );
-                                return Ok(Some(Hover {
-                                    contents: HoverContents::Markup(MarkupContent {
-                                        kind: MarkupKind::Markdown,
-                                        value,
-                                    }),
-                                    range: None,
-                                }));
-                            }
-                        }
-                    } else {
-                        // hovering on field: base::StructName::[fieldName]
-                        let sec_path = prefix[1..].to_vec();
-                        if let Some(struct_entry) = imported_sym.structs.get(&sec_path) {
-                            if let Some(field) = struct_entry.fields.get(&word) {
-                                let ty_str =
-                                    field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| {
-                                        resolve_field_type_display(imported_sym, &sec_path, &word)
-                                    });
-                                let value = format!("```spar\n{}: {}\n```", word, ty_str);
-                                return Ok(Some(Hover {
-                                    contents: HoverContents::Markup(MarkupContent {
-                                        kind: MarkupKind::Markdown,
-                                        value,
-                                    }),
-                                    range: None,
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Case 0c: word is a field in a same-file path like Server::rateLimit::[enabled]
-        if !word.is_empty() {
-            if let Some(prefix) = path_prefix_before_word(&state.source, pos) {
-                let imp_syms = state.effective_import_symbols();
-                if !imp_syms.contains_key(&prefix[0]) {
-                    let prefix_owned: Vec<String> = prefix.to_vec();
-                    if let Some(struct_entry) = symbols.structs.get(&prefix_owned) {
-                        if let Some(field) = struct_entry.fields.get(&word) {
-                            let ty_str =
-                                field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| {
-                                    resolve_field_type_display(symbols, &prefix_owned, &word)
-                                });
-                            let value = format!(
-                                "```spar\n(field) {}: {} in `[{}]`\n```",
-                                word,
-                                ty_str,
-                                prefix_owned.join(".")
-                            );
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value,
-                                }),
-                                range: None,
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Case 1: global variable hover
-        if !word.is_empty() {
-            if let Some(entry) = symbols.globals.get(&word) {
-                let value = format_hover_global(&word, entry);
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 2: top-level struct name (path == [word])
-        if !word.is_empty() {
-            let top_key = vec![word.clone()];
-            if let Some(struct_entry) = symbols.structs.get(&top_key) {
-                let value = format_hover_struct(symbols, &top_key, struct_entry, Some(&state.source));
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 3: nested struct — word matches a non-first segment of any path
-        if !word.is_empty() {
-            for (path, struct_entry) in &symbols.structs {
-                if path.len() > 1
-                    && path.last().map(|s| s.as_str()) == Some(word.as_str())
-                    && !is_internal_dependency_name(&path[0])
-                {
-                    let value = format_hover_struct(symbols, path, struct_entry, Some(&state.source));
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value,
-                        }),
-                        range: None,
-                    }));
-                }
-            }
-        }
-
-        // Case 4: struct field — word matches a field name in the struct the
-        // cursor is textually inside. Deliberately does NOT fall back to an
-        // ambiguous scan across every struct sharing that field name here —
-        // more precise mechanisms (function/type/enum names, then type-checker
-        // expression inference) get a chance first; seeing the wrong struct's
-        // field type is worse than briefly falling through. The ambiguous
-        // fallback still runs, as an actual last resort, right before `Ok(None)`.
-        if !word.is_empty() {
-            let offset = lsp_pos_to_byte_offset(&state.source, pos);
-            // Find the innermost struct whose span contains the cursor.
-            let containing_path: Option<Vec<String>> = state.ast.as_ref().and_then(|prog| {
-                use spar::ast::TopLevelItem;
-                prog.items
-                    .iter()
-                    .filter_map(|item| {
-                        if let TopLevelItem::Struct(sd) = item {
-                            if sd.span.start <= offset && offset <= sd.span.end {
-                                Some(vec![sd.name.clone()])
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .next_back() // innermost (last) enclosing struct
-            });
-
-            let field_hover = containing_path.as_ref().and_then(|path| {
-                symbols
-                    .structs
-                    .get(path)
-                    .and_then(|sec| sec.fields.get(&word).map(|field| (path.clone(), field)))
-            });
-
-            if let Some((path, field)) = field_hover {
-                let ty_str = field
-                    .ty
-                    .as_ref()
-                    .map(format_spar_type)
-                    .unwrap_or_else(|| resolve_field_type_display(symbols, &path, &word));
-                let value = format!(
-                    "```spar\n(field) {}: {} in `[{}]`\n```",
-                    word,
-                    ty_str,
-                    path.join(".")
-                );
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 5: user-defined function
-        if !word.is_empty() {
-            if let Some(entry) = symbols.functions.get(&word) {
-                let value = format_hover_function(&word, entry, Some(&state.source));
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 5b/5c/5d: `struct Name { ... }`, `enum Name { ... }` (bare or
-        // `Name::Variant`), and `functionGroup Name { ... }` (bare or
-        // `Name::member`) declarations/references.
-        if !word.is_empty() {
-            if let Some(value) = hover_type_enum_group(symbols, &state.source, pos, &word) {
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 6: `if` keyword — report branch presence from AST
-        if word == "if" {
-            if let Some(ast) = &state.ast {
-                let offset = lsp_pos_to_byte_offset(&state.source, pos);
-                let has_else = find_if_at_offset(ast, offset).unwrap_or(false);
-                let desc = if has_else {
-                    "then + else branches"
-                } else {
-                    "then only (no else)"
-                };
-                let value = format!("```spar\nif/else — {}\n```", desc);
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 7: `for` keyword — list comprehension
-        if word == "for" {
-            let value = "```spar\nfor x in list { expr } — list comprehension\n```".to_string();
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: None,
-            }));
-        }
-
-        // Case 8: any expression whose type the typechecker can infer.
-        if let Some(ast) = &state.ast {
-            let offset = lsp_pos_to_byte_offset(&state.source, pos);
-            if let Some(expr) = find_expression_at_offset(ast, offset) {
-                if let Some(ty) = TypeChecker::infer_expression(expr, symbols) {
-                    let value = format!("```spar\n(expression): {}\n```", format_spar_type(&ty));
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value,
-                        }),
-                        range: None,
-                    }));
-                }
-            }
-        }
-
-        // Case 9: index expression — find `[...]` at cursor and return element type
-        if let Some(ast) = &state.ast {
-            let offset = lsp_pos_to_byte_offset(&state.source, pos);
-            if let Some(elem_ty) = find_index_elem_type_at_offset(ast, symbols, offset) {
-                let value = format!("```spar\n: {}\n```", format_spar_type(&elem_ty));
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        // Case 10 (last resort): a field name matching some struct, anywhere
-        // in the program, when nothing more precise recognized the cursor.
-        // Ambiguous when multiple structs share a field name — kept as the
-        // lowest-priority fallback rather than deleted outright, since a
-        // possibly-wrong struct beats no hover at all.
-        if !word.is_empty() {
-            if let Some((path, field)) = symbols
-                .structs
-                .iter()
-                .find_map(|(path, sec)| sec.fields.get(&word).map(|field| (path.clone(), field)))
-            {
-                let ty_str = field
-                    .ty
-                    .as_ref()
-                    .map(format_spar_type)
-                    .unwrap_or_else(|| resolve_field_type_display(symbols, &path, &word));
-                let value = format!(
-                    "```spar\n(field) {}: {} in `[{}]`\n```",
-                    word,
-                    ty_str,
-                    path.join(".")
-                );
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        Ok(None)
+        self.hover_raw(params).await.map(clean_lsp::hover)
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let uri = params.text_document_position.text_document.uri;
-        let pos = params.text_document_position.position;
-
-        let docs = self.documents.lock().await;
-        let state = match docs.get(&uri) {
-            Some(s) => s,
-            None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
-        };
-
-        if is_cursor_in_block_comment(&state.source, pos) {
-            return Ok(None);
-        }
-
-        let offset = lsp_pos_to_byte_offset(&state.source, pos);
-        if let Some(items) =
-            attribute_intelligence::attribute_completion_items(&state.source, offset)
-        {
-            return Ok(Some(CompletionResponse::Array(items)));
-        }
-        if let Some(items) = decoder_completion_items(&state.source, offset) {
-            return Ok(Some(CompletionResponse::Array(items)));
-        }
-        if let Ok(path) = uri.to_file_path() {
-            if let Some(items) = package_metadata_completion_items(&path, &state.source, offset) {
-                return Ok(Some(CompletionResponse::Array(items)));
-            }
-        }
-
-        let context = editor_context(&state.source, state.ast.as_ref(), offset);
-
-        // `|>` is a typed expression boundary, so stage completion is narrower
-        // than ordinary expression completion: only callables whose first
-        // parameter accepts the piped value are offered. This path is text
-        // tolerant and therefore works while the stage itself is incomplete.
-        if !matches!(
-            context,
-            EditorContext::Suppressed
-                | EditorContext::ImportPath { .. }
-                | EditorContext::SelectiveImport { .. }
-        ) {
-            if let Some(symbols) = state.effective_symbols() {
-                let snippets = self.client_features.lock().await.completion_snippets;
-                if let Some(items) =
-                    structured_pipe_completion_items(&state.source, offset, symbols, snippets)
-                {
-                    return Ok(Some(CompletionResponse::Array(items)));
-                }
-            }
-        }
-
-        let structured_pipe_trigger = params.context.as_ref().is_some_and(|ctx| {
-            ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
-                && ctx.trigger_character.as_deref() == Some(">")
-        });
-        if structured_pipe_trigger {
-            // `>` is registered only so `|>` can request completion. A plain
-            // comparison/generic closer should not pop the full expression list.
-            return Ok(None);
-        }
-
-        // Punctuation triggers ("(", ",", quote, "/") only help inside calls and
-        // imports; elsewhere they would pop a full list after every comma.
-        let punctuation_trigger = params.context.as_ref().is_some_and(|ctx| {
-            ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
-                && matches!(
-                    ctx.trigger_character.as_deref(),
-                    Some("(" | "," | "\"" | "/")
-                )
-        });
-        if punctuation_trigger && matches!(context, EditorContext::Expression) {
-            return Ok(None);
-        }
-        // `receiver.` (also `receiver.par|`) is a member access wherever it appears,
-        // including inside call arguments: offer the receiver type's members only.
-        if !matches!(
-            context,
-            EditorContext::Suppressed
-                | EditorContext::ImportPath { .. }
-                | EditorContext::SelectiveImport { .. }
-        ) {
-            if let Some(symbols) = state.effective_symbols() {
-                let index = self.workspace_index.lock().await;
-                if let Some(items) =
-                    typed_member_items_indexed(&state.source, offset, symbols, &index, &uri)
-                {
-                    return Ok(Some(CompletionResponse::Array(items)));
-                }
-            }
-        }
-        match &context {
-            EditorContext::Suppressed => return Ok(None),
-            EditorContext::ImportPath { prefix, package } => {
-                let base = base_dir_from_uri(&uri);
-                let items = import_path_completion_items(&base, prefix, *package);
-                return Ok(Some(CompletionResponse::Array(items)));
-            }
-            EditorContext::SelectiveImport {
-                type_only,
-                package,
-                path,
-                already,
-                close_at,
-            } => {
-                let base = base_dir_from_uri(&uri);
-                if let Some(path) = path {
-                    if let Some(items) = selective_import_completion_items(
-                        &base, path, *package, *type_only, already,
-                    ) {
-                        return Ok(Some(CompletionResponse::Array(items)));
-                    }
-                } else {
-                    let items = import_export_discovery_items(
-                        &base,
-                        *package,
-                        *type_only,
-                        already,
-                        &state.source,
-                        offset,
-                        *close_at,
-                    );
-                    if !items.is_empty() {
-                        return Ok(Some(CompletionResponse::Array(items)));
-                    }
-                }
-            }
-            EditorContext::CallArguments { .. } => {
-                let index = self.workspace_index.lock().await;
-                if let Some(items) =
-                    named_argument_completion_items(state, &index, &uri, &state.source, offset)
-                {
-                    return Ok(Some(CompletionResponse::Array(items)));
-                }
-            }
-            _ => {}
-        }
-
-        // Task positions are classified from the text alone, so they work even
-        // when the file doesn't parse or resolve (no symbols yet).
-        if let Some(items) = task_completion_items(&state.source, state.effective_symbols(), offset)
-        {
-            return Ok(Some(CompletionResponse::Array(items)));
-        }
-
-        let symbols = match state.effective_symbols() {
-            Some(s) => s,
-            None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
-        };
-
-        if let Some(items) = member_completion_items(&state.source, offset, symbols) {
-            return Ok(Some(CompletionResponse::Array(items)));
-        }
-
-        // Case 1: after `path::` — enumerate struct fields, enum variants,
-        // function-group members, or imported symbols
-        if let Some(path) = path_before_cursor(&state.source, pos) {
-            if let Some(struct_entry) = symbols.structs.get(&path) {
-                return Ok(Some(CompletionResponse::Array(struct_field_completions(
-                    symbols, &path, struct_entry,
-                ))));
-            }
-
-            if path.len() == 1 {
-                if let Some(items) = enum_or_group_path_completions(symbols, &path[0]) {
-                    return Ok(Some(CompletionResponse::Array(items)));
-                }
-            }
-
-            if symbols.imports.contains_key(&path[0]) {
-                if let Some(imported_sym) = state.effective_import_symbols().get(&path[0]) {
-                    if path.len() == 1 {
-                        // base:: → top-level exported symbols of imported file
-                        return Ok(Some(CompletionResponse::Array(import_completion_items(
-                            imported_sym,
-                        ))));
-                    } else {
-                        // base::StructName:: → fields of that struct in imported file
-                        let struct_path = path[1..].to_vec();
-                        if let Some(struct_entry) = imported_sym.structs.get(&struct_path) {
-                            return Ok(Some(CompletionResponse::Array(struct_field_completions(
-                                imported_sym,
-                                &struct_path,
-                                struct_entry,
-                            ))));
-                        }
-                    }
-                }
-                return Ok(Some(CompletionResponse::Array(vec![])));
-            }
-
-            return Ok(Some(CompletionResponse::Array(vec![])));
-        }
-
-        // Case 2: after bare `:` — type annotation position → offer type keywords
-        // `f(a: |)` has a colon too, but it is a named argument, not a type annotation.
-        let in_call_value = matches!(
-            &context,
-            EditorContext::CallArguments {
-                value_of: Some(_),
-                ..
-            }
-        );
-        if !in_call_value && is_in_type_position(&state.source, pos) {
-            return Ok(Some(CompletionResponse::Array(type_keyword_items())));
-        }
-
-        // Case 3: default expression position — tiered so locals rank first.
-        let snippets = self.client_features.lock().await.completion_snippets;
-        let mut items: Vec<CompletionItem> =
-            scope_completion_items(&local_names_at(&state.source, offset));
-        {
-            let index = self.workspace_index.lock().await;
-            items.extend(constructor_completion_items(
-                symbols, &index, &uri, snippets,
-            ));
-        }
-        items.extend(run_interpolation_params(&state.source, offset));
-        items.extend(
-            function_completion_items(&symbols.functions, snippets)
-                .into_iter()
-                .map(|item| {
-                    let tier = if BUILTIN_FUNCTION_NAMES.contains(&item.label.as_str()) {
-                        3
-                    } else {
-                        1
-                    };
-                    with_tier(item, tier)
-                }),
-        );
-        for (name, entry) in &symbols.globals {
-            if is_internal_dependency_name(name) {
-                continue;
-            }
-            let detail = match entry {
-                spar::resolver::GlobalEntry::Var { ty, .. } => Some(format_spar_type(ty)),
-                spar::resolver::GlobalEntry::Dynamic { .. } => Some("dynamic".to_string()),
-            };
-            items.push(with_tier(
-                CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    detail,
-                    ..Default::default()
-                },
-                1,
-            ));
-        }
-        for alias in symbols.imports.keys() {
-            items.push(with_tier(
-                CompletionItem {
-                    label: alias.clone(),
-                    kind: Some(CompletionItemKind::MODULE),
-                    ..Default::default()
-                },
-                2,
-            ));
-        }
-        items.extend(builtin_items().into_iter().map(|item| with_tier(item, 3)));
-        items.extend(
-            type_keyword_items()
-                .into_iter()
-                .map(|item| with_tier(item, 4)),
-        );
-        items.extend(keyword_items().into_iter().map(|item| with_tier(item, 9)));
-
-        // In `f(param: |)`, locals whose type matches the parameter come first.
-        {
-            let index = self.workspace_index.lock().await;
-            if let Some(expected) = expected_value_type(state, &index, &uri, &state.source, offset)
-            {
-                for item in &mut items {
-                    let is_local = item
-                        .sort_text
-                        .as_deref()
-                        .is_some_and(|text| text.starts_with("0_"));
-                    if is_local && item.detail.as_deref() == Some(expected.as_str()) {
-                        item.sort_text = Some(format!("00_{}", item.label));
-                    }
-                }
-            }
-        }
-
-        // A local may shadow a same-named global/function: keep the best-ranked
-        // (lowest tier) entry per label.
-        items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
-        let mut seen = HashSet::new();
-        items.retain(|item| seen.insert(item.label.clone()));
-
-        Ok(Some(CompletionResponse::Array(items)))
+        self.completion_raw(params).await.map(clean_lsp::completion)
     }
 
     async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
-        let features = self.client_features.lock().await.clone();
-        let index = self.workspace_index.lock().await;
-        Ok(enrich_completion_from_index(
-            item,
-            &index,
-            features.completion_resolve_detail,
-            features.completion_resolve_documentation,
-        ))
+        self.completion_resolve_raw(item).await.map(clean_lsp::completion_resolve)
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let pos = params.text_document_position_params.position;
-        let docs = self.documents.lock().await;
-        let Some(state) = docs.get(&uri) else {
-            return Ok(None);
-        };
-        let offset = lsp_pos_to_byte_offset(&state.source, pos);
-        let index = self.workspace_index.lock().await;
-        Ok(signature_help_at(
-            state,
-            &index,
-            &uri,
-            &state.source,
-            offset,
-        ))
+        self.signature_help_raw(params).await.map(clean_lsp::signature_help)
     }
 
     async fn document_symbol(
@@ -4604,5 +3864,876 @@ var tool: Tool = Tool(command: command, exec: exec, shell: shell);
             find_tok(&tokens, "raw", src).unwrap().token_type,
             TT_PROPERTY
         );
+    }
+}
+
+impl SparLanguageServer {
+    pub(crate) async fn hover_raw(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let docs = self.documents.lock().await;
+        let state = match docs.get(&uri) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let decoder_offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(value) =
+            attribute_intelligence::attribute_hover_at(&state.source, decoder_offset)
+        {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }));
+        }
+        if let Some(value) = decoder_hover_at(&state.source, decoder_offset) {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }));
+        }
+
+        let symbols = match state.effective_symbols() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let word = word_at_position(&state.source, pos);
+
+        if !word.is_empty() {
+            if let Some(program) = &state.ast {
+                let offset = lsp_pos_to_byte_offset(&state.source, pos);
+                if let Some(value) = task_hover_at_offset(program, &state.source, offset, &word) {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+
+            {
+                let spans = typed_map_for(state);
+                let byte = lsp_pos_to_byte_offset(&state.source, pos);
+                let typed = member_hover(state, symbols, &spans, byte)
+                    .or_else(|| named_argument_hover(state, symbols, &spans, byte));
+                if let Some(value) = typed {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }),
+                        range: None,
+                    }));
+                }
+            }
+
+            if let Some(value) = local_binding_hover_at(state, pos) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+
+            let index = self.workspace_index.lock().await;
+            if let Some(value) = indexed_method_hover_at(&uri, state, pos, &index) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 0: import alias hover
+        if !word.is_empty() {
+            let imp_sym = state.effective_import_symbols();
+            if let Some(imported_sym) = imp_sym.get(word.as_str()) {
+                let value = format_import_hover(&word, imported_sym);
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 0b: word is a struct/field inside an import path (e.g. hover on `Minor` in `base::Minor::port`)
+        if !word.is_empty() {
+            if let Some(prefix) = path_prefix_before_word(&state.source, pos) {
+                let imp_syms = state.effective_import_symbols();
+                if let Some(imported_sym) = imp_syms.get(&prefix[0]) {
+                    if prefix.len() == 1 {
+                        // hovering on struct name: base::[Minor]
+                        let sec_path = vec![word.clone()];
+                        if let Some(struct_entry) = imported_sym.structs.get(&sec_path) {
+                            let value = format_hover_struct(imported_sym, &sec_path, struct_entry, None);
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value,
+                                }),
+                                range: None,
+                            }));
+                        }
+                        // hovering on exported var name: base::[namespace]
+                        if let Some(spar::resolver::GlobalEntry::Var { ty, .. }) =
+                            imported_sym.globals.get(&word)
+                        {
+                            let value = format!(
+                                "```spar\nexport var {}: {}\n```",
+                                word,
+                                format_spar_type(ty)
+                            );
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value,
+                                }),
+                                range: None,
+                            }));
+                        }
+                        // hovering on function name: base::[main]
+                        if let Some(entry) = imported_sym.functions.get(&word) {
+                            if !entry.is_private {
+                                let params = entry
+                                    .params
+                                    .iter()
+                                    .map(|(n, t)| format!("{}: {}", n, format_spar_type(t)))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let value = format!(
+                                    "```spar\nfn {}({}) -> {}\n```",
+                                    word,
+                                    params,
+                                    format_spar_type(&entry.ret)
+                                );
+                                return Ok(Some(Hover {
+                                    contents: HoverContents::Markup(MarkupContent {
+                                        kind: MarkupKind::Markdown,
+                                        value,
+                                    }),
+                                    range: None,
+                                }));
+                            }
+                        }
+                    } else {
+                        // hovering on field: base::StructName::[fieldName]
+                        let sec_path = prefix[1..].to_vec();
+                        if let Some(struct_entry) = imported_sym.structs.get(&sec_path) {
+                            if let Some(field) = struct_entry.fields.get(&word) {
+                                let ty_str =
+                                    field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| {
+                                        resolve_field_type_display(imported_sym, &sec_path, &word)
+                                    });
+                                let value = format!("```spar\n{}: {}\n```", word, ty_str);
+                                return Ok(Some(Hover {
+                                    contents: HoverContents::Markup(MarkupContent {
+                                        kind: MarkupKind::Markdown,
+                                        value,
+                                    }),
+                                    range: None,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Case 0c: word is a field in a same-file path like Server::rateLimit::[enabled]
+        if !word.is_empty() {
+            if let Some(prefix) = path_prefix_before_word(&state.source, pos) {
+                let imp_syms = state.effective_import_symbols();
+                if !imp_syms.contains_key(&prefix[0]) {
+                    let prefix_owned: Vec<String> = prefix.to_vec();
+                    if let Some(struct_entry) = symbols.structs.get(&prefix_owned) {
+                        if let Some(field) = struct_entry.fields.get(&word) {
+                            let ty_str =
+                                field.ty.as_ref().map(format_spar_type).unwrap_or_else(|| {
+                                    resolve_field_type_display(symbols, &prefix_owned, &word)
+                                });
+                            let value = format!(
+                                "```spar\n(field) {}: {} in `[{}]`\n```",
+                                word,
+                                ty_str,
+                                prefix_owned.join(".")
+                            );
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value,
+                                }),
+                                range: None,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Case 1: global variable hover
+        if !word.is_empty() {
+            if let Some(entry) = symbols.globals.get(&word) {
+                let value = format_hover_global(&word, entry);
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 2: top-level struct name (path == [word])
+        if !word.is_empty() {
+            let top_key = vec![word.clone()];
+            if let Some(struct_entry) = symbols.structs.get(&top_key) {
+                let value = format_hover_struct(symbols, &top_key, struct_entry, Some(&state.source));
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 3: nested struct — word matches a non-first segment of any path
+        if !word.is_empty() {
+            for (path, struct_entry) in &symbols.structs {
+                if path.len() > 1
+                    && path.last().map(|s| s.as_str()) == Some(word.as_str())
+                    && !is_internal_dependency_name(&path[0])
+                {
+                    let value = format_hover_struct(symbols, path, struct_entry, Some(&state.source));
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+        }
+
+        // Case 4: struct field — word matches a field name in the struct the
+        // cursor is textually inside. Deliberately does NOT fall back to an
+        // ambiguous scan across every struct sharing that field name here —
+        // more precise mechanisms (function/type/enum names, then type-checker
+        // expression inference) get a chance first; seeing the wrong struct's
+        // field type is worse than briefly falling through. The ambiguous
+        // fallback still runs, as an actual last resort, right before `Ok(None)`.
+        if !word.is_empty() {
+            let offset = lsp_pos_to_byte_offset(&state.source, pos);
+            // Find the innermost struct whose span contains the cursor.
+            let containing_path: Option<Vec<String>> = state.ast.as_ref().and_then(|prog| {
+                use spar::ast::TopLevelItem;
+                prog.items
+                    .iter()
+                    .filter_map(|item| {
+                        if let TopLevelItem::Struct(sd) = item {
+                            if sd.span.start <= offset && offset <= sd.span.end {
+                                Some(vec![sd.name.clone()])
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .next_back() // innermost (last) enclosing struct
+            });
+
+            let field_hover = containing_path.as_ref().and_then(|path| {
+                symbols
+                    .structs
+                    .get(path)
+                    .and_then(|sec| sec.fields.get(&word).map(|field| (path.clone(), field)))
+            });
+
+            if let Some((path, field)) = field_hover {
+                let ty_str = field
+                    .ty
+                    .as_ref()
+                    .map(format_spar_type)
+                    .unwrap_or_else(|| resolve_field_type_display(symbols, &path, &word));
+                let value = format!(
+                    "```spar\n(field) {}: {} in `[{}]`\n```",
+                    word,
+                    ty_str,
+                    path.join(".")
+                );
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 5: user-defined function
+        if !word.is_empty() {
+            if let Some(entry) = symbols.functions.get(&word) {
+                let value = format_hover_function(&word, entry, Some(&state.source));
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 5b/5c/5d: `struct Name { ... }`, `enum Name { ... }` (bare or
+        // `Name::Variant`), and `functionGroup Name { ... }` (bare or
+        // `Name::member`) declarations/references.
+        if !word.is_empty() {
+            if let Some(value) = hover_type_enum_group(symbols, &state.source, pos, &word) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 6: `if` keyword — report branch presence from AST
+        if word == "if" {
+            if let Some(ast) = &state.ast {
+                let offset = lsp_pos_to_byte_offset(&state.source, pos);
+                let has_else = find_if_at_offset(ast, offset).unwrap_or(false);
+                let desc = if has_else {
+                    "then + else branches"
+                } else {
+                    "then only (no else)"
+                };
+                let value = format!("```spar\nif/else — {}\n```", desc);
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 7: `for` keyword — list comprehension
+        if word == "for" {
+            let value = "```spar\nfor x in list { expr } — list comprehension\n```".to_string();
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }));
+        }
+
+        // Case 8: any expression whose type the typechecker can infer.
+        if let Some(ast) = &state.ast {
+            let offset = lsp_pos_to_byte_offset(&state.source, pos);
+            if let Some(expr) = find_expression_at_offset(ast, offset) {
+                if let Some(ty) = TypeChecker::infer_expression(expr, symbols) {
+                    let value = format!("```spar\n(expression): {}\n```", format_spar_type(&ty));
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+        }
+
+        // Case 9: index expression — find `[...]` at cursor and return element type
+        if let Some(ast) = &state.ast {
+            let offset = lsp_pos_to_byte_offset(&state.source, pos);
+            if let Some(elem_ty) = find_index_elem_type_at_offset(ast, symbols, offset) {
+                let value = format!("```spar\n: {}\n```", format_spar_type(&elem_ty));
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        // Case 10 (last resort): a field name matching some struct, anywhere
+        // in the program, when nothing more precise recognized the cursor.
+        // Ambiguous when multiple structs share a field name — kept as the
+        // lowest-priority fallback rather than deleted outright, since a
+        // possibly-wrong struct beats no hover at all.
+        if !word.is_empty() {
+            if let Some((path, field)) = symbols
+                .structs
+                .iter()
+                .find_map(|(path, sec)| sec.fields.get(&word).map(|field| (path.clone(), field)))
+            {
+                let ty_str = field
+                    .ty
+                    .as_ref()
+                    .map(format_spar_type)
+                    .unwrap_or_else(|| resolve_field_type_display(symbols, &path, &word));
+                let value = format!(
+                    "```spar\n(field) {}: {} in `[{}]`\n```",
+                    word,
+                    ty_str,
+                    path.join(".")
+                );
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+
+        {
+            let spans = typed_map_for(state);
+            let byte = lsp_pos_to_byte_offset(&state.source, pos);
+            if let Some(value) = typed_identifier_hover(state, &spans, byte) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }),
+                    range: None,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn completion_raw(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+
+        let docs = self.documents.lock().await;
+        let state = match docs.get(&uri) {
+            Some(s) => s,
+            None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
+        };
+
+        if is_cursor_in_block_comment(&state.source, pos) {
+            return Ok(None);
+        }
+
+        let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        if let Some(items) =
+            attribute_intelligence::attribute_completion_items(&state.source, offset)
+        {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
+        if let Some(items) = decoder_completion_items(&state.source, offset) {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
+        if let Ok(path) = uri.to_file_path() {
+            if let Some(items) = package_metadata_completion_items(&path, &state.source, offset) {
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+        }
+
+        let repaired_ast = effective_ast(state);
+        let context = editor_context(&state.source, repaired_ast.as_deref(), offset);
+
+        // `|>` is a typed expression boundary, so stage completion is narrower
+        // than ordinary expression completion: only callables whose first
+        // parameter accepts the piped value are offered. This path is text
+        // tolerant and therefore works while the stage itself is incomplete.
+        if !matches!(
+            context,
+            EditorContext::Suppressed
+                | EditorContext::ImportPath { .. }
+                | EditorContext::SelectiveImport { .. }
+        ) {
+            if let Some(symbols) = state.effective_symbols() {
+                let snippets = self.client_features.lock().await.completion_snippets;
+                if let Some(items) =
+                    structured_pipe_completion_items(&state.source, offset, symbols, snippets)
+                {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+        }
+
+        let structured_pipe_trigger = params.context.as_ref().is_some_and(|ctx| {
+            ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
+                && ctx.trigger_character.as_deref() == Some(">")
+        });
+        if structured_pipe_trigger {
+            // `>` is registered only so `|>` can request completion. A plain
+            // comparison/generic closer should not pop the full expression list.
+            return Ok(None);
+        }
+
+        // Punctuation triggers ("(", ",", quote, "/") only help inside calls and
+        // imports; elsewhere they would pop a full list after every comma.
+        let punctuation_trigger = params.context.as_ref().is_some_and(|ctx| {
+            ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
+                && matches!(
+                    ctx.trigger_character.as_deref(),
+                    Some("(" | "," | "\"" | "/")
+                )
+        });
+        if punctuation_trigger && matches!(context, EditorContext::Expression) {
+            return Ok(None);
+        }
+        // `receiver.` (also `receiver.par|`) is a member access wherever it appears,
+        // including inside call arguments: offer the receiver type's members only.
+        if !matches!(
+            context,
+            EditorContext::Suppressed
+                | EditorContext::ImportPath { .. }
+                | EditorContext::SelectiveImport { .. }
+        ) {
+            if let Some(symbols) = state.effective_symbols() {
+                let index = self.workspace_index.lock().await;
+                if let Some(items) =
+                    typed_member_items_with_types(state, offset, symbols, &index, &uri)
+                {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+        }
+        match &context {
+            EditorContext::Suppressed => return Ok(None),
+            EditorContext::ImportPath { prefix, package } => {
+                let base = base_dir_from_uri(&uri);
+                let items = import_path_completion_items(&base, prefix, *package);
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+            EditorContext::SelectiveImport {
+                type_only,
+                package,
+                path,
+                already,
+                close_at,
+            } => {
+                let base = base_dir_from_uri(&uri);
+                if let Some(path) = path {
+                    if let Some(items) = selective_import_completion_items(
+                        &base, path, *package, *type_only, already,
+                    ) {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                } else {
+                    let items = import_export_discovery_items(
+                        &base,
+                        *package,
+                        *type_only,
+                        already,
+                        &state.source,
+                        offset,
+                        *close_at,
+                    );
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                }
+            }
+            EditorContext::CallArguments { .. } => {
+                let index = self.workspace_index.lock().await;
+                if let Some(items) =
+                    named_argument_completion_items(state, &index, &uri, &state.source, offset)
+                {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+            _ => {}
+        }
+
+        // Task positions are classified from the text alone, so they work even
+        // when the file doesn't parse or resolve (no symbols yet).
+        if let Some(items) = task_completion_items(&state.source, state.effective_symbols(), offset)
+        {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
+
+        let symbols = match state.effective_symbols() {
+            Some(s) => s,
+            None => return Ok(Some(CompletionResponse::Array(keyword_items()))),
+        };
+
+        if let Some(items) = member_completion_items(&state.source, offset, symbols) {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
+
+        // Case 1: after `path::` — enumerate struct fields, enum variants,
+        // function-group members, or imported symbols
+        if let Some(path) = path_before_cursor(&state.source, pos) {
+            if let Some(struct_entry) = symbols.structs.get(&path) {
+                return Ok(Some(CompletionResponse::Array(struct_field_completions(
+                    symbols, &path, struct_entry,
+                ))));
+            }
+
+            if path.len() == 1 {
+                if let Some(items) = enum_or_group_path_completions(symbols, &path[0]) {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+
+            if symbols.imports.contains_key(&path[0]) {
+                if let Some(imported_sym) = state.effective_import_symbols().get(&path[0]) {
+                    if path.len() == 1 {
+                        // base:: → top-level exported symbols of imported file
+                        return Ok(Some(CompletionResponse::Array(import_completion_items(
+                            imported_sym,
+                        ))));
+                    } else {
+                        // base::StructName:: → fields of that struct in imported file
+                        let struct_path = path[1..].to_vec();
+                        if let Some(struct_entry) = imported_sym.structs.get(&struct_path) {
+                            return Ok(Some(CompletionResponse::Array(struct_field_completions(
+                                imported_sym,
+                                &struct_path,
+                                struct_entry,
+                            ))));
+                        }
+                    }
+                }
+                return Ok(Some(CompletionResponse::Array(vec![])));
+            }
+
+            return Ok(Some(CompletionResponse::Array(vec![])));
+        }
+
+        // Case 2: after bare `:` — type annotation position → offer type keywords
+        // `f(a: |)` has a colon too, but it is a named argument, not a type annotation.
+        let in_call_value = matches!(
+            &context,
+            EditorContext::CallArguments {
+                value_of: Some(_),
+                ..
+            }
+        );
+        if !in_call_value && is_in_type_position(&state.source, pos) {
+            return Ok(Some(CompletionResponse::Array(type_keyword_items())));
+        }
+
+        // Case 3: default expression position — tiered so locals rank first.
+        let snippets = self.client_features.lock().await.completion_snippets;
+        let mut items: Vec<CompletionItem> =
+            scope_completion_items(&local_names_at(&state.source, offset));
+        {
+            let index = self.workspace_index.lock().await;
+            items.extend(constructor_completion_items(
+                symbols, &index, &uri, snippets,
+            ));
+        }
+        items.extend(run_interpolation_params(&state.source, offset));
+        items.extend(
+            function_completion_items(&symbols.functions, snippets)
+                .into_iter()
+                .map(|item| {
+                    let tier = if BUILTIN_FUNCTION_NAMES.contains(&item.label.as_str()) {
+                        3
+                    } else {
+                        1
+                    };
+                    with_tier(item, tier)
+                }),
+        );
+        for (name, entry) in &symbols.globals {
+            if is_internal_dependency_name(name) {
+                continue;
+            }
+            let detail = match entry {
+                spar::resolver::GlobalEntry::Var { ty, .. } => Some(format_spar_type(ty)),
+                spar::resolver::GlobalEntry::Dynamic { .. } => Some("dynamic".to_string()),
+            };
+            items.push(with_tier(
+                CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail,
+                    ..Default::default()
+                },
+                1,
+            ));
+        }
+        for alias in symbols.imports.keys() {
+            items.push(with_tier(
+                CompletionItem {
+                    label: alias.clone(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    ..Default::default()
+                },
+                2,
+            ));
+        }
+        items.extend(builtin_items().into_iter().map(|item| with_tier(item, 3)));
+        items.extend(
+            type_keyword_items()
+                .into_iter()
+                .map(|item| with_tier(item, 4)),
+        );
+        items.extend(keyword_items().into_iter().map(|item| with_tier(item, 9)));
+
+        // In `f(param: |)`, locals whose type matches the parameter come first.
+        {
+            let index = self.workspace_index.lock().await;
+            if let Some(expected) = expected_value_type(state, &index, &uri, &state.source, offset)
+            {
+                for item in &mut items {
+                    let is_local = item
+                        .sort_text
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with("0_"));
+                    if is_local && item.detail.as_deref() == Some(expected.as_str()) {
+                        item.sort_text = Some(format!("00_{}", item.label));
+                    }
+                }
+            }
+        }
+
+        // A local may shadow a same-named global/function: keep the best-ranked
+        // (lowest tier) entry per label.
+        items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+        let mut seen = HashSet::new();
+        items.retain(|item| seen.insert(item.label.clone()));
+
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    pub(crate) async fn completion_resolve_raw(&self, item: CompletionItem) -> Result<CompletionItem> {
+        let features = self.client_features.lock().await.clone();
+        let index = self.workspace_index.lock().await;
+        Ok(enrich_completion_from_index(
+            item,
+            &index,
+            features.completion_resolve_detail,
+            features.completion_resolve_documentation,
+        ))
+    }
+
+    pub(crate) async fn signature_help_raw(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(state) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = lsp_pos_to_byte_offset(&state.source, pos);
+        let index = self.workspace_index.lock().await;
+        Ok(signature_help_at(
+            state,
+            &index,
+            &uri,
+            &state.source,
+            offset,
+        ))
+    }
+}
+
+/// Last line of defence against compiler-internal names (`SparModule<hash>Name`) reaching the editor.
+mod clean_lsp {
+    use spar::naming::demangle;
+    use tower_lsp::lsp_types::*;
+
+    fn markup(c: &mut HoverContents) {
+        match c {
+            HoverContents::Markup(m) => m.value = demangle(&m.value),
+            HoverContents::Scalar(MarkedString::String(s)) => *s = demangle(s),
+            HoverContents::Scalar(MarkedString::LanguageString(l)) => l.value = demangle(&l.value),
+            HoverContents::Array(items) => {
+                for i in items {
+                    match i {
+                        MarkedString::String(s) => *s = demangle(s),
+                        MarkedString::LanguageString(l) => l.value = demangle(&l.value),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn hover(h: Option<Hover>) -> Option<Hover> {
+        h.map(|mut h| {
+            markup(&mut h.contents);
+            h
+        })
+    }
+
+    fn item(i: &mut CompletionItem) {
+        i.label = demangle(&i.label);
+        if let Some(d) = &mut i.detail {
+            *d = demangle(d);
+        }
+        if let Some(f) = &mut i.filter_text {
+            *f = demangle(f);
+        }
+        if let Some(t) = &mut i.insert_text {
+            *t = demangle(t);
+        }
+        if let Some(d) = &mut i.documentation {
+            match d {
+                Documentation::String(s) => *s = demangle(s),
+                Documentation::MarkupContent(m) => m.value = demangle(&m.value),
+            }
+        }
+        if let Some(ld) = &mut i.label_details {
+            if let Some(x) = &mut ld.detail {
+                *x = demangle(x);
+            }
+            if let Some(x) = &mut ld.description {
+                *x = demangle(x);
+            }
+        }
+    }
+
+    pub fn completion(r: Option<CompletionResponse>) -> Option<CompletionResponse> {
+        r.map(|mut r| {
+            match &mut r {
+                CompletionResponse::Array(v) => v.iter_mut().for_each(item),
+                CompletionResponse::List(l) => l.items.iter_mut().for_each(item),
+            }
+            r
+        })
+    }
+
+    pub fn completion_resolve(mut i: CompletionItem) -> CompletionItem {
+        item(&mut i);
+        i
+    }
+
+    pub fn signature_help(s: Option<SignatureHelp>) -> Option<SignatureHelp> {
+        s.map(|mut s| {
+            for sig in &mut s.signatures {
+                sig.label = demangle(&sig.label);
+                if let Some(Documentation::MarkupContent(m)) = &mut sig.documentation {
+                    m.value = demangle(&m.value);
+                }
+                for p in sig.parameters.iter_mut().flatten() {
+                    if let ParameterLabel::Simple(l) = &mut p.label {
+                        *l = demangle(l);
+                    }
+                }
+            }
+            s
+        })
     }
 }
