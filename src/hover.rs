@@ -71,6 +71,11 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
             FuncStmt::Return(ReturnValue::Expr(e),_) => search(e,off),
             FuncStmt::If(i) => search(&i.condition,off).or_else(||stmts(&i.then_stmts,off)).or_else(||stmts(&i.else_stmts,off)),
             FuncStmt::For(statement) => search(&statement.iterable,off).or_else(||stmts(&statement.body,off)),
+            FuncStmt::While(statement) => statement
+                .condition
+                .as_ref()
+                .and_then(|condition| search(condition, off))
+                .or_else(|| stmts(&statement.body, off)),
             FuncStmt::Try(statement) => stmts(&statement.body, off)
                 .or_else(|| stmts(&statement.handler, off)),
         })
@@ -267,6 +272,18 @@ pub fn find_index_elem_type_at_offset(
                 }
                 FuncStmt::For(statement) => {
                     if let Some(t) = expr_index_elem(&statement.iterable, symbols, offset) {
+                        return Some(t);
+                    }
+                    if let Some(t) = stmts_index_elem(&statement.body, symbols, offset) {
+                        return Some(t);
+                    }
+                }
+                FuncStmt::While(statement) => {
+                    if let Some(t) = statement
+                        .condition
+                        .as_ref()
+                        .and_then(|condition| expr_index_elem(condition, symbols, offset))
+                    {
                         return Some(t);
                     }
                     if let Some(t) = stmts_index_elem(&statement.body, symbols, offset) {

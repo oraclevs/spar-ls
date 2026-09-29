@@ -6,7 +6,7 @@ fn keyword_items() -> Vec<CompletionItem> {
         "var", "export", "private", "import", "dynamic", "as", "struct", "type", "fn", "function",
         "schema", "task", "try", "catch",
         // control keywords
-        "if", "else", "for", "in", "break", "continue", "return", "mut", // literals
+        "if", "else", "for", "while", "loop", "in", "break", "continue", "return", "mut", // literals
         "true", "false",
     ]
     .iter()
@@ -675,6 +675,7 @@ fn top_level_start(item: &TopLevelItem) -> usize {
             | FuncStmt::Continue(span) => span.start,
             FuncStmt::If(d) => d.span.start,
             FuncStmt::For(d) => d.span.start,
+            FuncStmt::While(d) => d.span.start,
             FuncStmt::Try(d) => d.span.start,
         },
     }

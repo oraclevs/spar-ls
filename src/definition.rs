@@ -61,6 +61,7 @@ fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -
                     }
                     walk(&statement.body, source, offset, word, found);
                 }
+                FuncStmt::While(statement) => walk(&statement.body, source, offset, word, found),
                 FuncStmt::Return(_, _)
                 | FuncStmt::Assignment { .. }
                 | FuncStmt::FieldAssignment { .. }

@@ -739,6 +739,12 @@ fn collect_stmts_tokens(
                 collect_expr_tokens(&statement.iterable, source, kinds, out);
                 collect_stmts_tokens(&statement.body, source, kinds, out);
             }
+            FS::While(statement) => {
+                if let Some(condition) = &statement.condition {
+                    collect_expr_tokens(condition, source, kinds, out);
+                }
+                collect_stmts_tokens(&statement.body, source, kinds, out);
+            }
             FS::Try(statement) => {
                 collect_stmts_tokens(&statement.body, source, kinds, out);
                 if let Some(name) = &statement.catch_name {
@@ -1289,6 +1295,7 @@ fn collect_language_words(source: &str, out: &mut Vec<RawToken>) {
             | Token::Dynamic | Token::Private | Token::KwAsync | Token::KwFunction
             | Token::KwStruct => (TT_DECLARATION_KEYWORD, MOD_NONE),
             Token::KwAwait | Token::KwReturn | Token::KwIf | Token::KwElse | Token::KwFor
+            | Token::KwWhile | Token::KwLoop
             | Token::KwIn | Token::KwBreak | Token::KwContinue | Token::KwTry
             | Token::KwCatch | Token::KwCommand | Token::KwExec => (TT_KEYWORD, MOD_NONE),
             Token::TypeStr | Token::TypeInt | Token::TypeFloat | Token::TypeBool

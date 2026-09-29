@@ -262,6 +262,12 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
                 collect_expr_refs(&statement.iterable, target, out);
                 collect_stmts_refs(&statement.body, target, out);
             }
+            FuncStmt::While(statement) => {
+                if let Some(condition) = &statement.condition {
+                    collect_expr_refs(condition, target, out);
+                }
+                collect_stmts_refs(&statement.body, target, out);
+            }
             FuncStmt::Try(statement) => {
                 collect_stmts_refs(&statement.body, target, out);
                 collect_stmts_refs(&statement.handler, target, out);
@@ -885,6 +891,12 @@ fn collect_local_bindings_from_stmts(
                     }
                 }
                 collect_local_bindings_from_expr(source, masked, &statement.iterable, out);
+                collect_local_bindings_from_stmts(source, masked, &statement.body, out);
+            }
+            FuncStmt::While(statement) => {
+                if let Some(condition) = &statement.condition {
+                    collect_local_bindings_from_expr(source, masked, condition, out);
+                }
                 collect_local_bindings_from_stmts(source, masked, &statement.body, out);
             }
             FuncStmt::Try(statement) => {

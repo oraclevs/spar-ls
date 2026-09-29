@@ -3351,7 +3351,7 @@ mod tests {
     #[test]
     fn phase0_keywords_are_completed() {
         let labels: Vec<String> = keyword_items().into_iter().map(|item| item.label).collect();
-        for keyword in ["mut", "break", "continue"] {
+        for keyword in ["mut", "break", "continue", "while", "loop"] {
             assert!(
                 labels.iter().any(|label| label == keyword),
                 "missing {keyword}"
@@ -3378,6 +3378,24 @@ mod tests {
             find_tok(&tokens, "index", src).unwrap().token_type,
             TT_VARIABLE
         );
+    }
+
+    #[test]
+    fn while_and_loop_keywords_and_conditions_receive_semantic_tokens() {
+        let src = concat!(
+            "function main() -> int {\n",
+            "    var mut count: int = 0;\n",
+            "    while count < 3 { count = count + 1; }\n",
+            "    loop { break; }\n",
+            "    return count;\n",
+            "};\n",
+        );
+        let tokens = decode_semantic_tokens(src);
+        assert_eq!(find_tok(&tokens, "while", src).unwrap().token_type, TT_KEYWORD);
+        assert_eq!(find_tok(&tokens, "loop", src).unwrap().token_type, TT_KEYWORD);
+        // the condition's `count` is a variable reference, not left untokenised
+        let line2: Vec<_> = tokens.iter().filter(|t| t.line == 2).collect();
+        assert!(line2.iter().any(|t| t.token_type == TT_VARIABLE), "no variable token on the while line");
     }
 
     #[test]

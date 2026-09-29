@@ -2853,3 +2853,58 @@ fn mangled_import_names_never_reach_display_text() {
         "List<Shelve>"
     );
 }
+
+const WHILE_SOURCE: &str = concat!(
+    "function main() -> int {\n",
+    "    var mut count: int = 0;\n",
+    "    while count < 3 {\n",
+    "        var step: int = 2;\n",
+    "        count = count + step;\n",
+    "    }\n",
+    "    loop {\n",
+    "        var bump: int = 1;\n",
+    "        count = count + bump;\n",
+    "        if count > 9 { break; }\n",
+    "    }\n",
+    "    return count;\n",
+    "};\n",
+);
+
+#[test]
+fn definition_inside_while_and_loop_bodies_finds_locals() {
+    let uri = Url::parse("file:///workspace/main.spar").unwrap();
+    let state = SparLanguageServer::analyze(WHILE_SOURCE, std::path::Path::new("/workspace"));
+    assert!(state.errors.is_empty(), "{:?}", state.errors);
+    // `step` used on line index 4, declared on line index 3 (inside the while body)
+    let use_site = position_of(WHILE_SOURCE, "count + step", 8);
+    let location = definition_at(&uri, &state, use_site).expect("definition of step");
+    assert_eq!(location.range.start.line, 3, "{:?}", location.range);
+    // `bump` inside the loop body
+    let use_site = position_of(WHILE_SOURCE, "count + bump", 8);
+    let location = definition_at(&uri, &state, use_site).expect("definition of bump");
+    assert_eq!(location.range.start.line, 7, "{:?}", location.range);
+    // `count` in the while condition resolves to the outer local
+    let use_site = position_of(WHILE_SOURCE, "count < 3", 1);
+    let location = definition_at(&uri, &state, use_site).expect("definition of count");
+    assert_eq!(location.range.start.line, 1, "{:?}", location.range);
+}
+
+#[test]
+fn completion_sees_locals_and_member_types_inside_while_and_loop_bodies() {
+    for keyword in ["while count < 3", "loop"] {
+        let names = local_name_list(&format!(
+            "function f(p: str) -> int {{\n    var mut count: int = 0;\n    {keyword} {{\n        var inner: str = p;\n        |\n        count = count + 1;\n    }}\n    return count;\n}};\n"
+        ));
+        for expected in ["p", "count", "inner"] {
+            assert!(names.contains(&expected.to_string()), "{keyword}: missing {expected}: {names:?}");
+        }
+    }
+    let source = "function f(p: str) -> int {\n    var mut n: int = 0;\n    while n < 3 {\n        var text: str = p;\n        text.|\n        n = n + 1;\n    }\n    return n;\n};\n";
+    let state = SparLanguageServer::analyze(&source.replace("        text.|\n", "        text.length();\n"), std::path::Path::new("/workspace"));
+    let symbols = state.effective_symbols().expect("symbols").clone();
+    let (marked_source, offset) = marked(source);
+    let labels = typed_member_items(&marked_source, offset, &symbols)
+        .map(|items| items.into_iter().map(|item| item.label).collect::<Vec<_>>())
+        .expect("str members inside a while body");
+    assert!(labels.iter().any(|l| l == "length"), "{labels:?}");
+}
