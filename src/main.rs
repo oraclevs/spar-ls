@@ -3482,6 +3482,57 @@ var tool: Tool = Tool(command: command, exec: exec, shell: shell);
     }
 
     #[test]
+    fn manifest_runtime_errors_are_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spar.package.spar");
+        let base = "struct Package {\n    name: str = \"a\";\n    version: str = \"1.0.0\";\n    kind: str = \"application\";\n};\n";
+        let errors = |runtime: &str| {
+            SparLanguageServer::analyze_path(&format!("{base}struct Runtime {{\n{runtime}}};\n"), &path)
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(errors("    turbo: bool = true;\n").contains("unknown runtime setting 'turbo'"));
+        assert!(errors("    jit: str = \"no\";\n").contains("must be typed `bool`"));
+        assert!(errors("    asyncWorkers: int = 0;\n").contains("positive integer"));
+        let ok = errors("    jit: bool = false;\n    asyncWorkers: int = 4;\n");
+        assert!(!ok.contains("Runtime"), "{ok}");
+    }
+
+    #[test]
+    fn manifest_runtime_completion_hover_and_values() {
+        let path = std::path::Path::new("spar.package.spar");
+        let source = "struct Runtime {\n    \n};\n";
+        let fields = package_metadata_completion_items(path, source, source.find("    ").unwrap() + 4)
+            .expect("runtime key completion");
+        for label in ["vm", "bytecode", "jit", "native", "nativeDebug", "asyncWorkers", "nativeModules"] {
+            assert!(fields.iter().any(|i| i.label == label), "missing {label}");
+        }
+        let source = "struct Runtime {\n    jit: bool = ;\n    asyncWorkers: int = 2;\n};\n";
+        let offset = source.find("= ;").unwrap() + 2;
+        let values = package_metadata_completion_items(path, source, offset).expect("bool values");
+        assert_eq!(
+            values.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            ["true", "false"]
+        );
+        // already-set keys are not offered again
+        let source = "struct Runtime {\n    jit: bool = false;\n    \n};\n";
+        let offset = source.rfind("    ").unwrap() + 4;
+        let fields = package_metadata_completion_items(path, source, offset).unwrap();
+        assert!(!fields.iter().any(|i| i.label == "jit"));
+        // hover on the key documents it and names the env var
+        let source = "struct Runtime {\n    asyncWorkers: int = 2;\n};\n";
+        let offset = source.find("asyncWorkers").unwrap() + 3;
+        let text = runtime_key_hover_at(path, source, offset).expect("hover");
+        assert!(text.contains("SPAR_ASYNC_WORKERS") && text.contains("--runtime asyncWorkers="), "{text}");
+        // not on the value
+        let offset = source.find("2;").unwrap();
+        assert!(runtime_key_hover_at(path, source, offset).is_none());
+    }
+
+    #[test]
     fn manifest_completion_offers_fields_and_kind_values() {
         let path = std::path::Path::new("spar.package.spar");
         let source = "struct Package {\n    \n};\n";
@@ -3880,6 +3931,19 @@ impl SparLanguageServer {
         let decoder_offset = lsp_pos_to_byte_offset(&state.source, pos);
         if let Some(value) =
             attribute_intelligence::attribute_hover_at(&state.source, decoder_offset)
+        {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }));
+        }
+        if let Some(value) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| runtime_key_hover_at(&path, &state.source, decoder_offset))
         {
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {

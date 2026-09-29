@@ -25,7 +25,7 @@ fn package_metadata_completion_items(
 ) -> Option<Vec<CompletionItem>> {
     let file_name = path.file_name()?.to_str()?;
     let prefix = source.get(..offset)?;
-    let (struct_at, manifest_struct) = ["Package", "Dependencies", "Overrides", "Lock"]
+    let (struct_at, manifest_struct) = ["Package", "Dependencies", "Overrides", "Runtime", "Lock"]
         .into_iter()
         .filter_map(|name| {
             prefix
@@ -44,6 +44,37 @@ fn package_metadata_completion_items(
         && current_line.contains("kind:")
     {
         return Some(value_items(&["application", "library", "config"]));
+    }
+    if file_name == spar::package::PACKAGE_MANIFEST_FILE && manifest_struct == "Runtime" {
+        let typed_key = current_line.split_once(':').map(|(key, _)| key.trim());
+        if let Some((_, "bool", _, _)) = spar::runtime_config::KEYS
+            .iter()
+            .find(|(key, ..)| Some(*key) == typed_key)
+        {
+            return Some(value_items(&["true", "false"]));
+        }
+        if typed_key.is_some() {
+            return None;
+        }
+        return Some(
+            spar::runtime_config::KEYS
+                .iter()
+                .filter(|(key, ..)| !struct_prefix.contains(&format!("{key}:")))
+                .map(|(key, ty, _, doc)| CompletionItem {
+                    label: (*key).to_string(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(format!("{ty} — replaces the matching SPAR_* environment variable")),
+                    documentation: Some(Documentation::String((*doc).to_string())),
+                    insert_text: Some(match *ty {
+                        "bool" => format!("{key}: bool = ${{1|true,false|}};"),
+                        "int" => format!("{key}: int = ${{1:1}};"),
+                        _ => format!("{key}: str = \"$1\";"),
+                    }),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                })
+                .collect(),
+        );
     }
     if file_name == spar::package::PACKAGE_LOCK_FILE && current_line.contains("sourceKind:") {
         return Some(value_items(&["github", "path"]));
@@ -83,6 +114,37 @@ fn package_metadata_completion_items(
             })
             .collect(),
     )
+}
+
+/// Hover docs for a key inside `struct Runtime` of a `spar.package.spar`.
+pub(crate) fn runtime_key_hover_at(
+    path: &std::path::Path,
+    source: &str,
+    offset: usize,
+) -> Option<String> {
+    if path.file_name()?.to_str()? != spar::package::PACKAGE_MANIFEST_FILE {
+        return None;
+    }
+    let prefix = source.get(..offset.min(source.len()))?;
+    let struct_at = prefix.rfind("struct Runtime")?;
+    let struct_prefix = &prefix[struct_at..];
+    if struct_prefix.matches('{').count() <= struct_prefix.matches('}').count() {
+        return None;
+    }
+    let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
+    let line_end = source[offset.min(source.len())..]
+        .find('\n')
+        .map_or(source.len(), |i| offset + i);
+    let line = &source[line_start..line_end];
+    let key = line.split_once(':')?.0.trim();
+    // Only when the cursor is on the key itself.
+    if offset > line_start + line.find(key)? + key.len() {
+        return None;
+    }
+    let (name, ty, env, doc) = spar::runtime_config::KEYS.iter().find(|(k, ..)| *k == key)?;
+    Some(format!(
+        "**`{name}`**: `{ty}`\n\n{doc}\n\nEnvironment variable: `{env}`. Precedence: `--runtime {name}=…` flag > environment > this manifest > default."
+    ))
 }
 
 fn value_items(values: &[&str]) -> Vec<CompletionItem> {
