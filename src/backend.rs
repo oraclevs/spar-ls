@@ -109,7 +109,7 @@ impl SparLanguageServer {
                     };
                     if matches!(
                         decl.kind,
-                        spar::ast::ImportKind::Aliased(_) | spar::ast::ImportKind::Schema
+                        spar::ast::ImportKind::Aliased(_) | spar::ast::ImportKind::Bare(_) | spar::ast::ImportKind::Schema
                     ) {
                         continue;
                     }

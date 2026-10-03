@@ -206,7 +206,7 @@ fn spliced_definition(state: &DocumentState, _current: &Url, word: &str) -> Opti
                 .iter()
                 .find(|item| item.alias.as_deref().unwrap_or(item.name.as_str()) == word)
                 .map(|item| item.name.clone()),
-            ImportKind::Aliased(_) | ImportKind::Schema => None,
+            ImportKind::Aliased(_) | ImportKind::Bare(_) | ImportKind::Schema => None,
         };
         let Some(original_name) = original_name else {
             continue;

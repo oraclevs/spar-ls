@@ -456,8 +456,9 @@ fn import_relationship(
             let TopLevelItem::Import(decl) = item else {
                 continue;
             };
-            let ImportKind::Aliased(explicit) = &decl.kind else {
-                continue;
+            let explicit = match &decl.kind {
+                ImportKind::Aliased(alias) | ImportKind::Bare(alias) => alias,
+                _ => continue,
             };
             let derived = std::path::Path::new(&decl.path)
                 .file_stem()
@@ -492,7 +493,7 @@ fn import_relationship(
                 None,
                 SpliceRelationship::Named(items.iter().map(|i| i.name.clone()).collect()),
             ),
-            ImportKind::Aliased(_) | ImportKind::Schema => (None, SpliceRelationship::None),
+            ImportKind::Aliased(_) | ImportKind::Bare(_) | ImportKind::Schema => (None, SpliceRelationship::None),
         };
     }
     (None, SpliceRelationship::None)
