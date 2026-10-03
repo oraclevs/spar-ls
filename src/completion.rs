@@ -3,10 +3,10 @@
 fn keyword_items() -> Vec<CompletionItem> {
     [
         // declaration keywords
-        "var", "const", "export", "private", "import", "dynamic", "as", "struct", "type", "fn", "function",
-        "schema", "task", "try", "catch",
-        // control keywords
-        "if", "else", "for", "while", "loop", "in", "break", "continue", "return", "mut", // literals
+        "var", "const", "export", "private", "import", "dynamic", "as", "struct", "type", "fn",
+        "function", "schema", "task", "try", "catch", // control keywords
+        "if", "else", "for", "while", "loop", "in", "break", "continue", "return",
+        "mut", // literals
         "true", "false",
     ]
     .iter()
@@ -27,11 +27,7 @@ fn package_metadata_completion_items(
     let prefix = source.get(..offset)?;
     let (struct_at, manifest_struct) = ["Package", "Dependencies", "Overrides", "Runtime", "Lock"]
         .into_iter()
-        .filter_map(|name| {
-            prefix
-                .rfind(&format!("struct {name}"))
-                .map(|at| (at, name))
-        })
+        .filter_map(|name| prefix.rfind(&format!("struct {name}")).map(|at| (at, name)))
         .max_by_key(|(at, _)| *at)?;
     let struct_prefix = &prefix[struct_at..];
     if struct_prefix.matches('{').count() <= struct_prefix.matches('}').count() {
@@ -63,7 +59,9 @@ fn package_metadata_completion_items(
                 .map(|(key, ty, _, doc)| CompletionItem {
                     label: (*key).to_string(),
                     kind: Some(CompletionItemKind::FIELD),
-                    detail: Some(format!("{ty} — replaces the matching SPAR_* environment variable")),
+                    detail: Some(format!(
+                        "{ty} — replaces the matching SPAR_* environment variable"
+                    )),
                     documentation: Some(Documentation::String((*doc).to_string())),
                     insert_text: Some(match *ty {
                         "bool" => format!("{key}: bool = ${{1|true,false|}};"),
@@ -88,10 +86,19 @@ fn package_metadata_completion_items(
             ("entry", "entry: \"${1:src/main.spar}\";"),
         ],
         (spar::package::PACKAGE_MANIFEST_FILE, "Dependencies") => &[
-            ("github dependency", "${1:alias}: str = \"github:${2:owner/repository@1.0.0}\";"),
-            ("local dependency", "${1:alias}: str = \"path:${2:../package}\";"),
+            (
+                "github dependency",
+                "${1:alias}: str = \"github:${2:owner/repository@1.0.0}\";",
+            ),
+            (
+                "local dependency",
+                "${1:alias}: str = \"path:${2:../package}\";",
+            ),
         ],
-        (spar::package::PACKAGE_MANIFEST_FILE, "Overrides") => &[("local override", "${1:alias}: str = \"path:${2:../package}\";")],
+        (spar::package::PACKAGE_MANIFEST_FILE, "Overrides") => &[(
+            "local override",
+            "${1:alias}: str = \"path:${2:../package}\";",
+        )],
         (spar::package::PACKAGE_LOCK_FILE, "Lock") => &[
             ("formatVersion", "formatVersion: 1;"),
             ("root", "root: [SparLockedDependency] = [$1];"),
@@ -141,7 +148,9 @@ pub(crate) fn runtime_key_hover_at(
     if offset > line_start + line.find(key)? + key.len() {
         return None;
     }
-    let (name, ty, env, doc) = spar::runtime_config::KEYS.iter().find(|(k, ..)| *k == key)?;
+    let (name, ty, env, doc) = spar::runtime_config::KEYS
+        .iter()
+        .find(|(k, ..)| *k == key)?;
     Some(format!(
         "**`{name}`**: `{ty}`\n\n{doc}\n\nEnvironment variable: `{env}`. Precedence: `--runtime {name}=…` flag > environment > this manifest > default."
     ))
@@ -158,7 +167,6 @@ fn value_items(values: &[&str]) -> Vec<CompletionItem> {
         })
         .collect()
 }
-
 
 // ── Structured-pipe completion ─────────────────────────────────────────────
 
@@ -285,7 +293,10 @@ fn atomic_pipeline_input_type(
     // completion type-aware without reparsing the user's incomplete statement.
     if let Some(open) = trimmed.find('(') {
         let name = trimmed[..open].trim();
-        if name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':') {
+        if name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+        {
             if let Some(entry) = symbols
                 .functions
                 .get(name)
@@ -325,22 +336,28 @@ fn bind_pipeline_type_parameters(
             _ => false,
         },
         SparType::Applied { name, arguments } => match actual {
-            SparType::Applied { name: actual_name, arguments: actual_arguments }
-                if name == actual_name && arguments.len() == actual_arguments.len() =>
-            {
-                arguments.iter().zip(actual_arguments).all(|(expected, actual)| {
+            SparType::Applied {
+                name: actual_name,
+                arguments: actual_arguments,
+            } if name == actual_name && arguments.len() == actual_arguments.len() => arguments
+                .iter()
+                .zip(actual_arguments)
+                .all(|(expected, actual)| {
                     bind_pipeline_type_parameters(expected, actual, bindings)
-                })
-            }
+                }),
             SparType::List(actual_inner) if name == "List" && arguments.len() == 1 => {
                 bind_pipeline_type_parameters(&arguments[0], actual_inner, bindings)
             }
             _ => false,
         },
-        SparType::Function { params, return_type } => match actual {
-            SparType::Function { params: actual_params, return_type: actual_return }
-                if params.len() == actual_params.len() =>
-            {
+        SparType::Function {
+            params,
+            return_type,
+        } => match actual {
+            SparType::Function {
+                params: actual_params,
+                return_type: actual_return,
+            } if params.len() == actual_params.len() => {
                 params.iter().zip(actual_params).all(|(expected, actual)| {
                     expected.name == actual.name
                         && bind_pipeline_type_parameters(&expected.ty, &actual.ty, bindings)
@@ -365,7 +382,10 @@ fn substitute_pipeline_type(ty: &SparType, bindings: &HashMap<String, SparType>)
                 .map(|argument| substitute_pipeline_type(argument, bindings))
                 .collect(),
         },
-        SparType::Function { params, return_type } => SparType::Function {
+        SparType::Function {
+            params,
+            return_type,
+        } => SparType::Function {
             params: params
                 .iter()
                 .map(|param| spar::ast::CallableParamType {
@@ -399,7 +419,11 @@ fn pipeline_function_result(
 }
 
 fn pipeline_callable_result(ty: &SparType, input: &SparType) -> Option<(Vec<SparType>, SparType)> {
-    let SparType::Function { params, return_type } = ty else {
+    let SparType::Function {
+        params,
+        return_type,
+    } = ty
+    else {
         return None;
     };
     let first = params.first()?;
@@ -565,12 +589,7 @@ fn structured_pipe_completion_items(
         return None;
     }
     let pipeline_prefix = &prefix[..current_pipe];
-    let input_type = infer_pipeline_prefix_type(
-        pipeline_prefix,
-        source,
-        statement_start,
-        symbols,
-    )?;
+    let input_type = infer_pipeline_prefix_type(pipeline_prefix, source, statement_start, symbols)?;
 
     let mut items = Vec::new();
     let mut seen = HashSet::new();
@@ -579,7 +598,10 @@ fn structured_pipe_completion_items(
         .iter()
         .chain(symbols.imported_functions.iter())
     {
-        if !name.starts_with(stage_prefix) || seen.contains(name) || is_internal_dependency_name(name) {
+        if !name.starts_with(stage_prefix)
+            || seen.contains(name)
+            || is_internal_dependency_name(name)
+        {
             continue;
         }
         let Some((remaining, output)) = pipeline_function_result(entry, &input_type) else {
@@ -613,7 +635,10 @@ fn structured_pipe_completion_items(
     }
 
     for (name, entry) in &symbols.globals {
-        if !name.starts_with(stage_prefix) || seen.contains(name) || is_internal_dependency_name(name) {
+        if !name.starts_with(stage_prefix)
+            || seen.contains(name)
+            || is_internal_dependency_name(name)
+        {
             continue;
         }
         let GlobalEntry::Var { ty, .. } = entry else {
@@ -647,7 +672,11 @@ fn structured_pipe_completion_items(
             ..Default::default()
         });
     }
-    items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text).then_with(|| a.label.cmp(&b.label)));
+    items.sort_by(|a, b| {
+        a.sort_text
+            .cmp(&b.sort_text)
+            .then_with(|| a.label.cmp(&b.label))
+    });
     Some(items)
 }
 
@@ -667,6 +696,7 @@ fn top_level_start(item: &TopLevelItem) -> usize {
         TopLevelItem::Task(d) => d.span.start,
         TopLevelItem::Statement(statement) => match statement {
             FuncStmt::LocalVar(d) => d.span.start,
+            FuncStmt::TupleBinding { span, .. } => span.start,
             FuncStmt::Assignment { span, .. }
             | FuncStmt::FieldAssignment { span, .. }
             | FuncStmt::Expression(_, span)
@@ -691,7 +721,11 @@ fn task_at_offset<'a>(
             return None;
         };
         let (body_start, body_end) = task_body_bounds(program, source, index, task)?;
-        (body_start <= offset && offset <= body_end).then_some((task.as_ref(), body_start, body_end))
+        (body_start <= offset && offset <= body_end).then_some((
+            task.as_ref(),
+            body_start,
+            body_end,
+        ))
     })
 }
 
@@ -786,12 +820,15 @@ fn native_interpolation_at_offset(
                 .find_map(|command| interpolation_in_command(command, offset)),
         })
         .or_else(|| {
-            shell.statements.iter().find_map(|statement| match statement {
-                Statement::Expression(spar::ast::Expr::Shell(inner), _) => {
-                    native_interpolation_at_offset(inner, offset)
-                }
-                _ => None,
-            })
+            shell
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    Statement::Expression(spar::ast::Expr::Shell(inner), _) => {
+                        native_interpolation_at_offset(inner, offset)
+                    }
+                    _ => None,
+                })
         })
 }
 
@@ -826,20 +863,48 @@ fn task_param_items(params: &[(String, String)]) -> Vec<CompletionItem> {
 fn in_open_interpolation(source: &str, offset: usize) -> bool {
     source
         .get(..offset)
-        .and_then(|before| before.rfind("${").map(|start| !before[start..].contains('}')))
+        .and_then(|before| {
+            before
+                .rfind("${")
+                .map(|start| !before[start..].contains('}'))
+        })
         .unwrap_or(false)
 }
 
 fn task_body_items(scope: &crate::task_context::TaskScope) -> Vec<CompletionItem> {
     let fields = [
-        ("description", "Human-readable task description", "description: \"$1\";"),
-        ("default", "Run when no task name is supplied", "default: ${1|true,false|};"),
-        ("quiet", "Command echoing (quiet by default; set false to show commands)", "quiet: ${1|true,false|};"),
-        ("private", "Hide the task from public listings", "private: ${1|true,false|};"),
+        (
+            "description",
+            "Human-readable task description",
+            "description: \"$1\";",
+        ),
+        (
+            "default",
+            "Run when no task name is supplied",
+            "default: ${1|true,false|};",
+        ),
+        (
+            "quiet",
+            "Command echoing (quiet by default; set false to show commands)",
+            "quiet: ${1|true,false|};",
+        ),
+        (
+            "private",
+            "Hide the task from public listings",
+            "private: ${1|true,false|};",
+        ),
         ("group", "Group shown in task listings", "group: \"$1\";"),
-        ("confirm", "Confirmation prompt before running", "confirm: \"$1\";"),
+        (
+            "confirm",
+            "Confirmation prompt before running",
+            "confirm: \"$1\";",
+        ),
         ("dependsOn", "Tasks that must run first", "dependsOn: [$1];"),
-        ("env", "Environment variables for commands", "env: {\n\t$0\n};"),
+        (
+            "env",
+            "Environment variables for commands",
+            "env: {\n\t$0\n};",
+        ),
         ("cwd", "Working directory for commands", "cwd: \"$1\";"),
     ];
     let mut items: Vec<CompletionItem> = fields
@@ -856,7 +921,8 @@ fn task_body_items(scope: &crate::task_context::TaskScope) -> Vec<CompletionItem
         .collect();
 
     // One `run` block per OS slot, whichever shell it uses.
-    let slot_free = |os: Option<&str>| !scope.used_os_slots.iter().any(|used| used.as_deref() == os);
+    let slot_free =
+        |os: Option<&str>| !scope.used_os_slots.iter().any(|used| used.as_deref() == os);
     let mut run_snippets: Vec<(&str, &str, &str)> = Vec::new();
     if slot_free(None) {
         run_snippets.push(("run", "Spar shell commands, any OS", "run {\n\t$0\n};"));
@@ -892,14 +958,18 @@ fn task_body_items(scope: &crate::task_context::TaskScope) -> Vec<CompletionItem
             ));
         }
     }
-    items.extend(run_snippets.into_iter().map(|(label, detail, insert_text)| CompletionItem {
-        label: label.to_string(),
-        kind: Some(CompletionItemKind::SNIPPET),
-        detail: Some(detail.to_string()),
-        insert_text: Some(insert_text.to_string()),
-        insert_text_format: Some(InsertTextFormat::SNIPPET),
-        ..Default::default()
-    }));
+    items.extend(
+        run_snippets
+            .into_iter()
+            .map(|(label, detail, insert_text)| CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::SNIPPET),
+                detail: Some(detail.to_string()),
+                insert_text: Some(insert_text.to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            }),
+    );
     items
 }
 
@@ -988,9 +1058,14 @@ fn task_completion_items(
         TaskContext::Body => Some(task_body_items(&scope)),
         TaskContext::FieldValue(field) => Some(task_field_value_items(field)),
         TaskContext::DependsOn => Some(task_dependency_items(symbols, &scope.name)),
-        TaskContext::RunHeader { shell_seen, os_seen } => {
-            Some(run_header_items(*shell_seen, *os_seen, &scope.used_os_slots))
-        }
+        TaskContext::RunHeader {
+            shell_seen,
+            os_seen,
+        } => Some(run_header_items(
+            *shell_seen,
+            *os_seen,
+            &scope.used_os_slots,
+        )),
         TaskContext::RunBody(shell) => {
             if in_open_interpolation(source, offset) {
                 // A native body's `${expr}` takes any Spar expression (its own
@@ -1073,15 +1148,15 @@ fn member_completion_items(
     if let Some(entry) = symbols.types.get(name) {
         return Some(
             entry
-            .fields
-            .iter()
-            .map(|field| CompletionItem {
-                label: field.name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                detail: Some(format_type_field_shape(&field.shape)),
-                ..Default::default()
-            })
-            .collect(),
+                .fields
+                .iter()
+                .map(|field| CompletionItem {
+                    label: field.name.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(format_type_field_shape(&field.shape)),
+                    ..Default::default()
+                })
+                .collect(),
         );
     }
 
@@ -1101,16 +1176,17 @@ fn member_completion_items(
 }
 
 fn type_keyword_items() -> Vec<CompletionItem> {
-    ["int", "float", "str", "bool", "Any", "Record", "List", "Map", "Option", "Result"]
-        .iter()
-        .map(|kw| CompletionItem {
-            label: kw.to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            ..Default::default()
-        })
-        .collect()
+    [
+        "int", "float", "str", "bool", "Any", "Record", "List", "Map", "Option", "Result",
+    ]
+    .iter()
+    .map(|kw| CompletionItem {
+        label: kw.to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        ..Default::default()
+    })
+    .collect()
 }
-
 
 fn constructor_completion_items(
     symbols: &SymbolTable,
@@ -1181,7 +1257,10 @@ fn builtin_items() -> Vec<CompletionItem> {
     .collect()
 }
 
-fn function_completion_items(functions: &HashMap<String, FunctionEntry>, snippets: bool) -> Vec<CompletionItem> {
+fn function_completion_items(
+    functions: &HashMap<String, FunctionEntry>,
+    snippets: bool,
+) -> Vec<CompletionItem> {
     functions
         .iter()
         .filter(|(name, _)| !is_internal_dependency_name(name))
@@ -1204,7 +1283,10 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>, snippet
                     .map(|(index, (param, _))| format!("{}: ${{{}}}", param, index + 1))
                     .collect::<Vec<_>>()
                     .join(", ");
-                (Some(format!("{}({})", name, args)), Some(InsertTextFormat::SNIPPET))
+                (
+                    Some(format!("{}({})", name, args)),
+                    Some(InsertTextFormat::SNIPPET),
+                )
             } else {
                 (Some(name.clone()), Some(InsertTextFormat::PLAIN_TEXT))
             };
@@ -1228,7 +1310,10 @@ fn function_completion_items(functions: &HashMap<String, FunctionEntry>, snippet
 /// function-group member access are both `::`-namespaced in Spar (see
 /// `Devices::Android`, `EdgeInsect::only()`), never `.`, so this lives
 /// alongside `struct_field_completions` rather than `member_completion_items`.
-fn enum_or_group_path_completions(symbols: &SymbolTable, name: &str) -> Option<Vec<CompletionItem>> {
+fn enum_or_group_path_completions(
+    symbols: &SymbolTable,
+    name: &str,
+) -> Option<Vec<CompletionItem>> {
     if let Some(entry) = symbols.enums.get(name) {
         return Some(
             entry

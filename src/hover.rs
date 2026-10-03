@@ -3,18 +3,23 @@
 fn expr_span(expr: &spar::ast::Expr) -> &Span {
     use spar::ast::Expr;
     match expr {
-        Expr::Literal(l) => match l { spar::ast::Literal::Int(_) | spar::ast::Literal::Float(_) | spar::ast::Literal::Bool(_) => panic!("literal span is carried by its parent") },
+        Expr::Literal(l) => match l {
+            spar::ast::Literal::Int(_)
+            | spar::ast::Literal::Float(_)
+            | spar::ast::Literal::Bool(_) => panic!("literal span is carried by its parent"),
+        },
         Expr::String(s) => &s.span,
         Expr::NamespaceRef(n) => &n.span,
         Expr::FnCall(f) => &f.span,
         Expr::BinaryOp(b) => &b.span,
-        Expr::List(_, s) | Expr::Grouped(_, s) | Expr::Object(_, s) => s,
+        Expr::List(_, s) | Expr::Tuple(_, s) | Expr::Grouped(_, s) | Expr::Object(_, s) => s,
         Expr::Call { span, .. }
         | Expr::Closure { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Await { span, .. }
         | Expr::Comprehension { span, .. }
         | Expr::Index { span, .. }
+        | Expr::TupleField { span, .. }
         | Expr::FieldAccess { span, .. }
         | Expr::MethodCall { span, .. }
         | Expr::StructuredPipe { span, .. } => span,
@@ -27,31 +32,51 @@ fn expr_span(expr: &spar::ast::Expr) -> &Span {
 /// Find the smallest spanned expression containing the cursor. Literal nodes
 /// have no independent span in the AST, so their enclosing expression is used.
 fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::ast::Expr> {
-    use spar::ast::{Expr, FieldValue, ReturnValue, ObjectItem, StringPart};
+    use spar::ast::{Expr, FieldValue, ObjectItem, ReturnValue, StringPart};
     fn search(e: &Expr, off: usize) -> Option<&Expr> {
-        let contains = !matches!(e, Expr::Literal(_)) && expr_span(e).start <= off && off <= expr_span(e).end;
-        if !contains { return None; }
+        let contains =
+            !matches!(e, Expr::Literal(_)) && expr_span(e).start <= off && off <= expr_span(e).end;
+        if !contains {
+            return None;
+        }
         let child = match e {
             Expr::BinaryOp(b) => search(&b.lhs, off).or_else(|| search(&b.rhs, off)),
-            Expr::Unary { operand, .. } | Expr::Grouped(operand, _) => search(operand, off),
+            Expr::Unary { operand, .. }
+            | Expr::Grouped(operand, _)
+            | Expr::TupleField { base: operand, .. } => search(operand, off),
             Expr::Await { value, .. } => search(value, off),
-            Expr::List(xs, _) => xs.iter().find_map(|x| search(x, off)),
+            Expr::List(xs, _) | Expr::Tuple(xs, _) => xs.iter().find_map(|x| search(x, off)),
             Expr::FnCall(f) => f.args.iter().find_map(|x| search(x, off)),
             Expr::Call { args, .. } => args.iter().find_map(|x| search(&x.value, off)),
-            Expr::Comprehension { source, body, .. } => search(source, off).or_else(|| search(body, off)),
+            Expr::Comprehension { source, body, .. } => {
+                search(source, off).or_else(|| search(body, off))
+            }
             Expr::Index { source, index, .. } => search(source, off).or_else(|| search(index, off)),
             Expr::FieldAccess { base, .. } => search(base, off),
             Expr::Closure { body, .. } => match body {
                 spar::ast::ClosureBody::Expr(body) => search(body, off),
                 spar::ast::ClosureBody::Block(body) => stmts(&body.stmts, off),
             },
-            Expr::MethodCall { receiver, args, .. } => search(receiver, off)
-                .or_else(|| args.iter().find_map(|arg| search(arg, off))),
+            Expr::MethodCall { receiver, args, .. } => {
+                search(receiver, off).or_else(|| args.iter().find_map(|arg| search(arg, off)))
+            }
             Expr::StructuredPipe { input, stage, .. } => {
                 search(input, off).or_else(|| search(stage, off))
             }
-            Expr::String(s) => s.parts.iter().find_map(|p| if let StringPart::Expr(x)=p { search(x,off) } else { None }),
-            Expr::Object(items, _) => items.iter().find_map(|i| match i { ObjectItem::Field(f) => match &f.value { Some(FieldValue::Expr(x)) => search(x,off), _=>None }, ObjectItem::Spread(s)=>search(&s.expr,off) }),
+            Expr::String(s) => s.parts.iter().find_map(|p| {
+                if let StringPart::Expr(x) = p {
+                    search(x, off)
+                } else {
+                    None
+                }
+            }),
+            Expr::Object(items, _) => items.iter().find_map(|i| match i {
+                ObjectItem::Field(f) => match &f.value {
+                    Some(FieldValue::Expr(x)) => search(x, off),
+                    _ => None,
+                },
+                ObjectItem::Spread(s) => search(&s.expr, off),
+            }),
             Expr::Literal(_)
             | Expr::NamespaceRef(_)
             | Expr::Shell(_)
@@ -62,34 +87,50 @@ fn find_expression_at_offset(program: &Program, offset: usize) -> Option<&spar::
     }
     fn stmts(ss: &[FuncStmt], off: usize) -> Option<&Expr> {
         ss.iter().find_map(|s| match s {
-            FuncStmt::LocalVar(v) => search(&v.value,off),
-            FuncStmt::Assignment { value, .. }
-            | FuncStmt::FieldAssignment { value, .. } => search(value, off),
+            FuncStmt::LocalVar(v) => search(&v.value, off),
+            FuncStmt::TupleBinding { value, .. } => search(value, off),
+            FuncStmt::Assignment { value, .. } | FuncStmt::FieldAssignment { value, .. } => {
+                search(value, off)
+            }
             FuncStmt::Expression(e, _) => search(e, off),
             FuncStmt::Break(_) | FuncStmt::Continue(_) => None,
             FuncStmt::Return(ReturnValue::Void, _) => None,
-            FuncStmt::Return(ReturnValue::Expr(e),_) => search(e,off),
-            FuncStmt::If(i) => search(&i.condition,off).or_else(||stmts(&i.then_stmts,off)).or_else(||stmts(&i.else_stmts,off)),
-            FuncStmt::For(statement) => search(&statement.iterable,off).or_else(||stmts(&statement.body,off)),
+            FuncStmt::Return(ReturnValue::Expr(e), _) => search(e, off),
+            FuncStmt::If(i) => search(&i.condition, off)
+                .or_else(|| stmts(&i.then_stmts, off))
+                .or_else(|| stmts(&i.else_stmts, off)),
+            FuncStmt::For(statement) => {
+                search(&statement.iterable, off).or_else(|| stmts(&statement.body, off))
+            }
             FuncStmt::While(statement) => statement
                 .condition
                 .as_ref()
                 .and_then(|condition| search(condition, off))
                 .or_else(|| stmts(&statement.body, off)),
-            FuncStmt::Try(statement) => stmts(&statement.body, off)
-                .or_else(|| stmts(&statement.handler, off)),
+            FuncStmt::Try(statement) => {
+                stmts(&statement.body, off).or_else(|| stmts(&statement.handler, off))
+            }
         })
     }
     program.items.iter().find_map(|item| match item {
-        TopLevelItem::Var(v) => v.value.as_ref().and_then(|e|search(e,offset)),
-        TopLevelItem::Dynamic(v) => v.value.as_ref().and_then(|e|search(e,offset)),
-        TopLevelItem::Struct(s) => s.items.iter().find_map(|i| match i { ObjectItem::Field(f)=>match &f.value {Some(FieldValue::Expr(e))=>search(e,offset), _=>None}, ObjectItem::Spread(s)=>search(&s.expr,offset)}),
-        TopLevelItem::Function(f) => stmts(&f.body.stmts,offset),
+        TopLevelItem::Var(v) => v.value.as_ref().and_then(|e| search(e, offset)),
+        TopLevelItem::Dynamic(v) => v.value.as_ref().and_then(|e| search(e, offset)),
+        TopLevelItem::Struct(s) => s.items.iter().find_map(|i| match i {
+            ObjectItem::Field(f) => match &f.value {
+                Some(FieldValue::Expr(e)) => search(e, offset),
+                _ => None,
+            },
+            ObjectItem::Spread(s) => search(&s.expr, offset),
+        }),
+        TopLevelItem::Function(f) => stmts(&f.body.stmts, offset),
         TopLevelItem::Impl(imp) => imp
             .methods
             .iter()
             .find_map(|method| stmts(&method.function.body.stmts, offset)),
-        TopLevelItem::FunctionGroup(g) => g.functions.iter().find_map(|f|stmts(&f.body.stmts,offset)),
+        TopLevelItem::FunctionGroup(g) => g
+            .functions
+            .iter()
+            .find_map(|f| stmts(&f.body.stmts, offset)),
         TopLevelItem::Statement(statement) => stmts(std::slice::from_ref(statement), offset),
         _ => None,
     })
@@ -107,8 +148,7 @@ pub fn find_if_at_offset(program: &Program, offset: usize) -> Option<bool> {
             }
             TopLevelItem::Impl(imp) => {
                 for method in &imp.methods {
-                    if let Some(has_else) =
-                        search_stmts_for_if(&method.function.body.stmts, offset)
+                    if let Some(has_else) = search_stmts_for_if(&method.function.body.stmts, offset)
                     {
                         return Some(has_else);
                     }
@@ -186,10 +226,12 @@ pub fn find_index_elem_type_at_offset(
                 .or_else(|| expr_index_elem(&b.rhs, symbols, offset)),
             Expr::Unary { operand, .. } => expr_index_elem(operand, symbols, offset),
             Expr::Await { value, .. } => expr_index_elem(value, symbols, offset),
-            Expr::List(items, _) => items
+            Expr::List(items, _) | Expr::Tuple(items, _) => items
                 .iter()
                 .find_map(|e| expr_index_elem(e, symbols, offset)),
-            Expr::Grouped(inner, _) => expr_index_elem(inner, symbols, offset),
+            Expr::Grouped(inner, _) | Expr::TupleField { base: inner, .. } => {
+                expr_index_elem(inner, symbols, offset)
+            }
             Expr::FnCall(fc) => fc
                 .args
                 .iter()
@@ -227,7 +269,10 @@ pub fn find_index_elem_type_at_offset(
                 }
             },
             Expr::MethodCall { receiver, args, .. } => expr_index_elem(receiver, symbols, offset)
-                .or_else(|| args.iter().find_map(|arg| expr_index_elem(arg, symbols, offset))),
+                .or_else(|| {
+                    args.iter()
+                        .find_map(|arg| expr_index_elem(arg, symbols, offset))
+                }),
             Expr::StructuredPipe { input, stage, .. } => expr_index_elem(input, symbols, offset)
                 .or_else(|| expr_index_elem(stage, symbols, offset)),
             Expr::Literal(_)
@@ -246,6 +291,11 @@ pub fn find_index_elem_type_at_offset(
         use spar::ast::ReturnValue;
         for stmt in stmts {
             match stmt {
+                FuncStmt::TupleBinding { value, .. } => {
+                    if let Some(t) = expr_index_elem(value, symbols, offset) {
+                        return Some(t);
+                    }
+                }
                 FuncStmt::LocalVar(lv) => {
                     if let Some(t) = expr_index_elem(&lv.value, symbols, offset) {
                         return Some(t);
@@ -327,8 +377,7 @@ pub fn find_index_elem_type_at_offset(
             }
             TopLevelItem::Impl(imp) => {
                 for method in &imp.methods {
-                    if let Some(t) =
-                        stmts_index_elem(&method.function.body.stmts, symbols, offset)
+                    if let Some(t) = stmts_index_elem(&method.function.body.stmts, symbols, offset)
                     {
                         return Some(t);
                     }
@@ -349,7 +398,11 @@ pub fn find_index_elem_type_at_offset(
 
 // ── Hover formatters ──────────────────────────────────────────────────────────
 
-fn format_hover_global(name: &str, entry: &GlobalEntry, constant: Option<&spar::ConfigValue>) -> String {
+fn format_hover_global(
+    name: &str,
+    entry: &GlobalEntry,
+    constant: Option<&spar::ConfigValue>,
+) -> String {
     let ty_str = match entry {
         GlobalEntry::Var { ty, exported, .. } => {
             let export_prefix = if *exported { "export " } else { "" };
@@ -401,7 +454,10 @@ fn format_hover_struct(
         .iter()
         .map(|(name, fentry)| {
             if fentry.ty == Some(SparType::InlineRecord) {
-                format!("  {}: Record  // dynamic field of {}::{}", name, struct_label, name)
+                format!(
+                    "  {}: Record  // dynamic field of {}::{}",
+                    name, struct_label, name
+                )
             } else {
                 let ty_str = fentry
                     .ty
@@ -441,13 +497,21 @@ fn format_hover_type(name: &str, entry: &TypeEntry, source: &str) -> String {
     let field_list: String = entry
         .fields
         .iter()
-        .map(|f| {
-            format!("  {}: {}", f.name, format_type_field_shape(&f.shape))
-        })
+        .map(|f| format!("  {}: {}", f.name, format_type_field_shape(&f.shape)))
         .collect::<Vec<_>>()
         .join("\n");
-    let parameters = if entry.type_parameters.is_empty() { String::new() } else {
-        format!("<{}>", entry.type_parameters.iter().map(|parameter| parameter.name.as_str()).collect::<Vec<_>>().join(", "))
+    let parameters = if entry.type_parameters.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<{}>",
+            entry
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
     format!(
         "```spar\nstruct {name}{parameters} {{\n{field_list}\n}};\n```{}",
@@ -670,7 +734,8 @@ fn task_hover_at_offset(
     }
 
     let (task, _, _) = task_at_offset(program, source, offset)?;
-    let spar::ast::Expr::NamespaceRef(reference) = task_interpolation_at_offset(task, offset)? else {
+    let spar::ast::Expr::NamespaceRef(reference) = task_interpolation_at_offset(task, offset)?
+    else {
         return None;
     };
     if reference.segments.len() != 1 || reference.segments[0] != word {
@@ -681,7 +746,6 @@ fn task_hover_at_offset(
         .find(|param| param.name == word)
         .map(format_hover_task_param)
 }
-
 
 fn format_hover_indexed_method(symbol: &IndexedSymbol) -> Option<String> {
     let signature = symbol.signature.as_ref()?;

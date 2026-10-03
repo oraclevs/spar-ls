@@ -1,7 +1,10 @@
 fn span_location(uri: Url, source: &str, span: &Span) -> Location {
     let (line, col) = byte_to_lsp_pos(source, span.start);
     let length = span.end.saturating_sub(span.start).max(1) as u32;
-    Location::new(uri, Range::new(Position::new(line, col), Position::new(line, col + length)))
+    Location::new(
+        uri,
+        Range::new(Position::new(line, col), Position::new(line, col + length)),
+    )
 }
 
 fn imported_uri(state: &DocumentState, alias: &str) -> Option<Url> {
@@ -11,28 +14,50 @@ fn imported_uri(state: &DocumentState, alias: &str) -> Option<Url> {
 fn symbol_span(symbols: &SymbolTable, path: &[String], word: &str) -> Option<Span> {
     if path.is_empty() {
         if let Some(entry) = symbols.globals.get(word) {
-            return Some(match entry { GlobalEntry::Var { span, .. } | GlobalEntry::Dynamic { span, .. } => span.clone() });
+            return Some(match entry {
+                GlobalEntry::Var { span, .. } | GlobalEntry::Dynamic { span, .. } => span.clone(),
+            });
         }
-        if let Some(entry) = symbols.functions.get(word) { return Some(entry.span.clone()); }
-        if let Some(entry) = symbols.types.get(word) { return Some(entry.span.clone()); }
-        if let Some(entry) = symbols.enums.get(word) { return Some(entry.span.clone()); }
-        if let Some(entry) = symbols.function_groups.get(word) { return Some(entry.span.clone()); }
-        if let Some(entry) = symbols.structs.get(&vec![word.to_string()]) { return Some(entry.span.clone()); }
+        if let Some(entry) = symbols.functions.get(word) {
+            return Some(entry.span.clone());
+        }
+        if let Some(entry) = symbols.types.get(word) {
+            return Some(entry.span.clone());
+        }
+        if let Some(entry) = symbols.enums.get(word) {
+            return Some(entry.span.clone());
+        }
+        if let Some(entry) = symbols.function_groups.get(word) {
+            return Some(entry.span.clone());
+        }
+        if let Some(entry) = symbols.structs.get(&vec![word.to_string()]) {
+            return Some(entry.span.clone());
+        }
     }
     // `Group::member` — jumps to the member function's own span (exact).
     // `EnumName::Variant` — no per-variant span exists in the AST, so this
     // jumps to the enum declaration itself rather than the specific variant.
     if path.len() == 1 {
         if let Some(entry) = symbols.function_groups.get(&path[0]) {
-            if let Some(member) = entry.functions.get(word) { return Some(member.span.clone()); }
+            if let Some(member) = entry.functions.get(word) {
+                return Some(member.span.clone());
+            }
         }
         if let Some(entry) = symbols.enums.get(&path[0]) {
-            if entry.variants.iter().any(|v| v == word) { return Some(entry.span.clone()); }
+            if entry.variants.iter().any(|v| v == word) {
+                return Some(entry.span.clone());
+            }
         }
     }
-    let struct_path = if path.is_empty() { vec![] } else { path.to_vec() };
+    let struct_path = if path.is_empty() {
+        vec![]
+    } else {
+        path.to_vec()
+    };
     if let Some(entry) = symbols.structs.get(&struct_path) {
-        if let Some(field) = entry.fields.get(word) { return Some(field.span.clone()); }
+        if let Some(field) = entry.fields.get(word) {
+            return Some(field.span.clone());
+        }
     }
     let mut complete = struct_path;
     complete.push(word.to_string());
@@ -43,20 +68,43 @@ fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -
     fn walk(stmts: &[FuncStmt], source: &str, offset: usize, word: &str, found: &mut Option<Span>) {
         for stmt in stmts {
             match stmt {
-                FuncStmt::LocalVar(v) => {
-                    if v.span.start <= offset && v.name == word {
-                        *found = Some(ident_span_in(source, &v.span, word).unwrap_or_else(|| v.span.clone()));
+                FuncStmt::TupleBinding { names, .. } => {
+                    for (name, span) in names {
+                        if span.start <= offset && name == word {
+                            *found = Some(span.clone());
+                        }
                     }
                 }
-                FuncStmt::If(i) => { walk(&i.then_stmts, source, offset, word, found); walk(&i.else_stmts, source, offset, word, found); }
+                FuncStmt::LocalVar(v) => {
+                    if v.span.start <= offset && v.name == word {
+                        *found = Some(
+                            ident_span_in(source, &v.span, word).unwrap_or_else(|| v.span.clone()),
+                        );
+                    }
+                }
+                FuncStmt::If(i) => {
+                    walk(&i.then_stmts, source, offset, word, found);
+                    walk(&i.else_stmts, source, offset, word, found);
+                }
                 FuncStmt::For(statement) => {
                     match &statement.binding {
                         spar::ast::ForBinding::Value { name, span } => {
-                            if span.start <= offset && name == word { *found = Some(span.clone()); }
+                            if span.start <= offset && name == word {
+                                *found = Some(span.clone());
+                            }
                         }
-                        spar::ast::ForBinding::Indexed { index_name, index_span, value_name, value_span } => {
-                            if index_span.start <= offset && index_name == word { *found = Some(index_span.clone()); }
-                            if value_span.start <= offset && value_name == word { *found = Some(value_span.clone()); }
+                        spar::ast::ForBinding::Indexed {
+                            index_name,
+                            index_span,
+                            value_name,
+                            value_span,
+                        } => {
+                            if index_span.start <= offset && index_name == word {
+                                *found = Some(index_span.clone());
+                            }
+                            if value_span.start <= offset && value_name == word {
+                                *found = Some(value_span.clone());
+                            }
                         }
                     }
                     walk(&statement.body, source, offset, word, found);
@@ -76,7 +124,9 @@ fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -
     // closing brace, so the real extent runs from the keyword to the body's end.
     let check = |f: &spar::ast::FunctionDecl| -> Option<Span> {
         let end = f.body.span.end.max(f.span.end);
-        if !(f.span.start <= offset && offset <= end) { return None; }
+        if !(f.span.start <= offset && offset <= end) {
+            return None;
+        }
         if let Some(p) = f.params.iter().find(|p| p.name == word) {
             // the parameter's span may start at its type; prefer the name itself
             return Some(ident_span_in(source, &p.span, word).unwrap_or_else(|| p.span.clone()));
@@ -88,16 +138,22 @@ fn local_decl_span(program: &Program, source: &str, offset: usize, word: &str) -
     for item in &program.items {
         match item {
             TopLevelItem::Function(f) => {
-                if let Some(span) = check(f) { return Some(span); }
+                if let Some(span) = check(f) {
+                    return Some(span);
+                }
             }
             TopLevelItem::FunctionGroup(group) => {
                 for f in &group.functions {
-                    if let Some(span) = check(f) { return Some(span); }
+                    if let Some(span) = check(f) {
+                        return Some(span);
+                    }
                 }
             }
             TopLevelItem::Impl(imp) => {
                 for method in &imp.methods {
-                    if let Some(span) = check(&method.function) { return Some(span); }
+                    if let Some(span) = check(&method.function) {
+                        return Some(span);
+                    }
                 }
             }
             _ => {}
@@ -119,7 +175,9 @@ fn ident_span_in(source: &str, span: &Span, name: &str) -> Option<Span> {
 /// `local_decl_span` doesn't go through `SymbolTable` either.
 fn task_decl_span(program: &Program, word: &str) -> Option<Span> {
     program.items.iter().find_map(|item| {
-        let TopLevelItem::Task(task) = item else { return None };
+        let TopLevelItem::Task(task) = item else {
+            return None;
+        };
         (task.name == word).then(|| task.name_span.clone())
     })
 }
@@ -172,7 +230,6 @@ fn spliced_definition(state: &DocumentState, _current: &Url, word: &str) -> Opti
     }
     None
 }
-
 
 fn position_in_range(pos: Position, range: &Range) -> bool {
     range.start <= pos && pos <= range.end
@@ -240,14 +297,7 @@ fn method_symbol_at_position<'a>(
     }
 
     let (callee, offset) = method_callee_at_position(&state.source, pos)?;
-    resolve_method_symbol(
-        state,
-        index,
-        uri,
-        &state.source,
-        offset,
-        &callee,
-    )
+    resolve_method_symbol(state, index, uri, &state.source, offset, &callee)
 }
 
 fn indexed_definition_at(
@@ -267,7 +317,9 @@ fn indexed_definition_at(
 
 fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Location> {
     let word = word_at_position(&state.source, pos);
-    if word.is_empty() { return None; }
+    if word.is_empty() {
+        return None;
+    }
     let program = state.ast.as_ref()?;
     let offset = lsp_pos_to_byte_offset(&state.source, pos);
     if let Some(binding) = local_binding_at_offset(state, &word, offset) {
@@ -275,7 +327,10 @@ fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Loca
             start: byte_offset_to_lsp_position(&state.source, binding.decl_start),
             end: byte_offset_to_lsp_position(&state.source, binding.decl_end),
         };
-        return Some(Location { uri: uri.clone(), range });
+        return Some(Location {
+            uri: uri.clone(),
+            range,
+        });
     }
     if let Some(span) = local_decl_span(program, &state.source, offset, &word) {
         return Some(span_location(uri.clone(), &state.source, &span));
@@ -302,7 +357,11 @@ fn definition_at(uri: &Url, state: &DocumentState, pos: Position) -> Option<Loca
         symbols
             .structs
             .iter()
-            .filter(|(path, _)| !path.first().is_some_and(|owner| is_internal_dependency_name(owner)))
+            .filter(|(path, _)| {
+                !path
+                    .first()
+                    .is_some_and(|owner| is_internal_dependency_name(owner))
+            })
             .find_map(|(_, s)| s.fields.get(&word).map(|f| f.span.clone()))
     })?;
     // Declaration spans often start at a keyword (`var`, `type`); point at the name.

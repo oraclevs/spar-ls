@@ -112,7 +112,12 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
         // `name_span` already pointing at just the trailing segment
         // ("make"), which is exactly the location a reference should
         // point at.
-        Expr::Call { name, name_span, args, .. } => {
+        Expr::Call {
+            name,
+            name_span,
+            args,
+            ..
+        } => {
             let segments: Vec<&str> = name.split("::").collect();
             let matches = match target {
                 RefTarget::Bare(word) => segments.len() == 1 && segments[0] == word,
@@ -162,12 +167,14 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
         }
         Expr::Unary { operand, .. } => collect_expr_refs(operand, target, out),
         Expr::Await { value, .. } => collect_expr_refs(value, target, out),
-        Expr::List(items, _) => {
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
             for item in items {
                 collect_expr_refs(item, target, out);
             }
         }
-        Expr::Grouped(inner, _) => collect_expr_refs(inner, target, out),
+        Expr::Grouped(inner, _) | Expr::TupleField { base: inner, .. } => {
+            collect_expr_refs(inner, target, out)
+        }
         Expr::Comprehension { source, body, .. } => {
             collect_expr_refs(source, target, out);
             collect_expr_refs(body, target, out);
@@ -196,7 +203,12 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
                 }
             }
         }
-        Expr::FieldAccess { base, field, field_span, .. } => {
+        Expr::FieldAccess {
+            base,
+            field,
+            field_span,
+            ..
+        } => {
             collect_expr_refs(base, target, out);
             if field == target.word() {
                 out.push(field_span.clone());
@@ -206,7 +218,13 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
             spar::ast::ClosureBody::Expr(body) => collect_expr_refs(body, target, out),
             spar::ast::ClosureBody::Block(body) => collect_stmts_refs(&body.stmts, target, out),
         },
-        Expr::MethodCall { receiver, method, method_span, args, .. } => {
+        Expr::MethodCall {
+            receiver,
+            method,
+            method_span,
+            args,
+            ..
+        } => {
             collect_expr_refs(receiver, target, out);
             if method == target.word() {
                 out.push(method_span.clone());
@@ -226,7 +244,11 @@ fn collect_expr_refs(expr: &spar::ast::Expr, target: RefTarget, out: &mut Vec<Sp
     }
 }
 
-fn collect_struct_item_refs(items: &[spar::ast::ObjectItem], target: RefTarget, out: &mut Vec<Span>) {
+fn collect_struct_item_refs(
+    items: &[spar::ast::ObjectItem],
+    target: RefTarget,
+    out: &mut Vec<Span>,
+) {
     use spar::ast::{FieldValue, ObjectItem};
     for item in items {
         match item {
@@ -245,11 +267,10 @@ fn collect_stmts_refs(stmts: &[FuncStmt], target: RefTarget, out: &mut Vec<Span>
     for stmt in stmts {
         match stmt {
             FuncStmt::LocalVar(v) => collect_expr_refs(&v.value, target, out),
+            FuncStmt::TupleBinding { value, .. } => collect_expr_refs(value, target, out),
             FuncStmt::Assignment { value, .. }
             | FuncStmt::FieldAssignment { value, .. }
-            | FuncStmt::Expression(value, _) => {
-                collect_expr_refs(value, target, out)
-            }
+            | FuncStmt::Expression(value, _) => collect_expr_refs(value, target, out),
             FuncStmt::Break(_) | FuncStmt::Continue(_) => {}
             FuncStmt::Return(ReturnValue::Void, _) => {}
             FuncStmt::Return(ReturnValue::Expr(e), _) => collect_expr_refs(e, target, out),
@@ -363,7 +384,9 @@ fn collect_program_refs(program: &Program, target: RefTarget, out: &mut Vec<Span
 /// `RefTarget::Bare` alone never matches a qualified `Group::member` call.
 fn local_function_group_owning<'a>(program: &'a Program, member: &str) -> Option<&'a str> {
     program.items.iter().find_map(|item| {
-        let TopLevelItem::FunctionGroup(group) = item else { return None };
+        let TopLevelItem::FunctionGroup(group) = item else {
+            return None;
+        };
         group
             .functions
             .iter()
@@ -430,16 +453,24 @@ fn import_relationship(
     };
     if let Some(program) = &state.ast {
         for item in &program.items {
-            let TopLevelItem::Import(decl) = item else { continue };
-            let ImportKind::Aliased(explicit) = &decl.kind else { continue };
+            let TopLevelItem::Import(decl) = item else {
+                continue;
+            };
+            let ImportKind::Aliased(explicit) = &decl.kind else {
+                continue;
+            };
             let derived = std::path::Path::new(&decl.path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
             let alias = explicit.clone().unwrap_or(derived);
-            let Some(resolved) = state.import_paths.get(&alias) else { continue };
-            let Ok(candidate) = resolved.canonicalize() else { continue };
+            let Some(resolved) = state.import_paths.get(&alias) else {
+                continue;
+            };
+            let Ok(candidate) = resolved.canonicalize() else {
+                continue;
+            };
             if candidate != defining_canon {
                 continue;
             }
@@ -447,8 +478,12 @@ fn import_relationship(
         }
     }
     for decl in &state.spliced_import_decls {
-        let Some(resolved) = state.spliced_import_paths.get(&decl.path) else { continue };
-        let Ok(candidate) = resolved.canonicalize() else { continue };
+        let Some(resolved) = state.spliced_import_paths.get(&decl.path) else {
+            continue;
+        };
+        let Ok(candidate) = resolved.canonicalize() else {
+            continue;
+        };
         if candidate != defining_canon {
             continue;
         }
@@ -476,20 +511,29 @@ fn compute_references(
     importers: &HashMap<PathBuf, HashSet<PathBuf>>,
     include_declaration: bool,
 ) -> Vec<Location> {
-    let Ok(defining_file) = defining_location.uri.to_file_path() else { return Vec::new() };
+    let Ok(defining_file) = defining_location.uri.to_file_path() else {
+        return Vec::new();
+    };
     let candidates = reachable_files(importers, &defining_file);
 
     let mut results = Vec::new();
     for candidate_path in candidates {
         let is_defining_file = candidate_path == defining_file;
         let (source, base_dir) = if is_defining_file {
-            (defining_source.clone(), candidate_path.parent().map(|p| p.to_path_buf()))
+            (
+                defining_source.clone(),
+                candidate_path.parent().map(|p| p.to_path_buf()),
+            )
         } else {
-            let Ok(src) = std::fs::read_to_string(&candidate_path) else { continue };
+            let Ok(src) = std::fs::read_to_string(&candidate_path) else {
+                continue;
+            };
             (src, candidate_path.parent().map(|p| p.to_path_buf()))
         };
         let Some(base_dir) = base_dir else { continue };
-        let Ok(candidate_uri) = Url::from_file_path(&candidate_path) else { continue };
+        let Ok(candidate_uri) = Url::from_file_path(&candidate_path) else {
+            continue;
+        };
 
         let state = SparLanguageServer::analyze(&source, &base_dir);
         let Some(program) = &state.ast else { continue };
@@ -534,10 +578,17 @@ fn compute_references(
 }
 
 impl SparLanguageServer {
-    async fn references_at(&self, uri: &Url, pos: Position, include_declaration: bool) -> Vec<Location> {
+    async fn references_at(
+        &self,
+        uri: &Url,
+        pos: Position,
+        include_declaration: bool,
+    ) -> Vec<Location> {
         let (word, target, defining_location, defining_source, index_snapshot) = {
             let docs = self.documents.lock().await;
-            let Some(state) = docs.get(uri) else { return Vec::new() };
+            let Some(state) = docs.get(uri) else {
+                return Vec::new();
+            };
             let word = word_at_position(&state.source, pos);
             if word.is_empty() {
                 return Vec::new();
@@ -552,8 +603,12 @@ impl SparLanguageServer {
             let defining_source = if location.uri == *uri {
                 state.source.clone()
             } else {
-                let Ok(path) = location.uri.to_file_path() else { return Vec::new() };
-                let Ok(src) = std::fs::read_to_string(path) else { return Vec::new() };
+                let Ok(path) = location.uri.to_file_path() else {
+                    return Vec::new();
+                };
+                let Ok(src) = std::fs::read_to_string(path) else {
+                    return Vec::new();
+                };
                 src
             };
             (word, target, location, defining_source, index.clone())
@@ -570,8 +625,12 @@ impl SparLanguageServer {
                 let state = if let Some(open) = docs.get(candidate_uri) {
                     open
                 } else {
-                    let Ok(path) = candidate_uri.to_file_path() else { continue };
-                    let Ok(source) = std::fs::read_to_string(&path) else { continue };
+                    let Ok(path) = candidate_uri.to_file_path() else {
+                        continue;
+                    };
+                    let Ok(source) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
                     owned = SparLanguageServer::analyze_path(&source, &path);
                     &owned
                 };
@@ -612,12 +671,9 @@ impl SparLanguageServer {
         // (`List<Human>`); add this document's semantic occurrences, deduplicated.
         let docs = self.documents.lock().await;
         if let Some(state) = docs.get(uri) {
-            for occurrence in
-                semantic_occurrences_in_document(uri, state, &target, &index_snapshot)
+            for occurrence in semantic_occurrences_in_document(uri, state, &target, &index_snapshot)
             {
-                if !include_declaration
-                    && occurrence.role == SemanticOccurrenceRole::Declaration
-                {
+                if !include_declaration && occurrence.role == SemanticOccurrenceRole::Declaration {
                     continue;
                 }
                 let location = Location {
@@ -682,9 +738,13 @@ fn find_ident_bytes_after(source: &str, start: usize, name: &str) -> Option<(usi
     let haystack = &source[start..end];
     for (relative, _) in haystack.match_indices(name) {
         let at = start + relative;
-        let before_ok = at == 0 || !source.as_bytes()[at - 1].is_ascii_alphanumeric() && source.as_bytes()[at - 1] != b'_';
+        let before_ok = at == 0
+            || !source.as_bytes()[at - 1].is_ascii_alphanumeric()
+                && source.as_bytes()[at - 1] != b'_';
         let after = at + name.len();
-        let after_ok = after >= source.len() || !source.as_bytes()[after].is_ascii_alphanumeric() && source.as_bytes()[after] != b'_';
+        let after_ok = after >= source.len()
+            || !source.as_bytes()[after].is_ascii_alphanumeric()
+                && source.as_bytes()[after] != b'_';
         if before_ok && after_ok {
             return Some((at, after));
         }
@@ -694,14 +754,18 @@ fn find_ident_bytes_after(source: &str, start: usize, name: &str) -> Option<(usi
 
 fn matching_brace(masked: &str, open: usize) -> Option<usize> {
     let bytes = masked.as_bytes();
-    if bytes.get(open) != Some(&b'{') { return None; }
+    if bytes.get(open) != Some(&b'{') {
+        return None;
+    }
     let mut depth = 0usize;
     for (index, byte) in bytes.iter().enumerate().skip(open) {
         match *byte {
             b'{' => depth += 1,
             b'}' => {
                 depth = depth.saturating_sub(1);
-                if depth == 0 { return Some(index); }
+                if depth == 0 {
+                    return Some(index);
+                }
             }
             _ => {}
         }
@@ -720,10 +784,14 @@ fn enclosing_block_bounds(masked: &str, offset: usize) -> Option<(usize, usize)>
     let mut stack = Vec::new();
     let mut best = None;
     for (index, byte) in bytes.iter().enumerate() {
-        if index > offset { break; }
+        if index > offset {
+            break;
+        }
         match *byte {
             b'{' => stack.push(index),
-            b'}' => { stack.pop(); }
+            b'}' => {
+                stack.pop();
+            }
             _ => {}
         }
     }
@@ -733,7 +801,6 @@ fn enclosing_block_bounds(masked: &str, offset: usize) -> Option<(usize, usize)>
     best
 }
 
-
 fn collect_local_bindings_from_expr(
     source: &str,
     masked: &str,
@@ -742,7 +809,9 @@ fn collect_local_bindings_from_expr(
 ) {
     use spar::ast::{ClosureBody, Expr, FieldValue, ObjectItem, StringPart};
     match expr {
-        Expr::Closure { params, body, span, .. } => {
+        Expr::Closure {
+            params, body, span, ..
+        } => {
             let scope_start = params
                 .last()
                 .map(|param| param.span.end)
@@ -781,12 +850,14 @@ fn collect_local_bindings_from_expr(
             collect_local_bindings_from_expr(source, masked, operand, out)
         }
         Expr::Await { value, .. } => collect_local_bindings_from_expr(source, masked, value, out),
-        Expr::List(items, _) => {
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
             for item in items {
                 collect_local_bindings_from_expr(source, masked, item, out);
             }
         }
-        Expr::Grouped(inner, _) => collect_local_bindings_from_expr(source, masked, inner, out),
+        Expr::Grouped(inner, _) | Expr::TupleField { base: inner, .. } => {
+            collect_local_bindings_from_expr(source, masked, inner, out)
+        }
         Expr::Call { args, .. } => {
             for arg in args {
                 collect_local_bindings_from_expr(source, masked, &arg.value, out);
@@ -797,11 +868,19 @@ fn collect_local_bindings_from_expr(
                 collect_local_bindings_from_expr(source, masked, arg, out);
             }
         }
-        Expr::Comprehension { source: input, body, .. } => {
+        Expr::Comprehension {
+            source: input,
+            body,
+            ..
+        } => {
             collect_local_bindings_from_expr(source, masked, input, out);
             collect_local_bindings_from_expr(source, masked, body, out);
         }
-        Expr::Index { source: input, index, .. } => {
+        Expr::Index {
+            source: input,
+            index,
+            ..
+        } => {
             collect_local_bindings_from_expr(source, masked, input, out);
             collect_local_bindings_from_expr(source, masked, index, out);
         }
@@ -855,11 +934,33 @@ fn collect_local_bindings_from_stmts(
 ) {
     for stmt in stmts {
         match stmt {
+            FuncStmt::TupleBinding { names, value, .. } => {
+                for (name, span) in names {
+                    let (scope_start, scope_end) = enclosing_block_bounds(masked, span.start)
+                        .unwrap_or((span.start, source.len()));
+                    out.push(LocalBinding {
+                        name: name.clone(),
+                        decl_start: span.start,
+                        decl_end: span.end,
+                        scope_start,
+                        scope_end,
+                    });
+                }
+                collect_local_bindings_from_expr(source, masked, value, out);
+            }
             FuncStmt::LocalVar(local) => {
-                if let Some((decl_start, decl_end)) = find_ident_bytes_after(source, local.span.start, &local.name) {
+                if let Some((decl_start, decl_end)) =
+                    find_ident_bytes_after(source, local.span.start, &local.name)
+                {
                     let (scope_start, scope_end) = enclosing_block_bounds(masked, decl_start)
                         .unwrap_or((decl_start, source.len()));
-                    out.push(LocalBinding { name: local.name.clone(), decl_start, decl_end, scope_start, scope_end });
+                    out.push(LocalBinding {
+                        name: local.name.clone(),
+                        decl_start,
+                        decl_end,
+                        scope_start,
+                        scope_end,
+                    });
                 }
                 collect_local_bindings_from_expr(source, masked, &local.value, out);
             }
@@ -877,16 +978,45 @@ fn collect_local_bindings_from_stmts(
                     .unwrap_or((binding_start, source.len()));
                 match &statement.binding {
                     spar::ast::ForBinding::Value { name, span } => {
-                        if let Some((decl_start, decl_end)) = find_ident_bytes_after(source, span.start, name) {
-                            out.push(LocalBinding { name: name.clone(), decl_start, decl_end, scope_start, scope_end });
+                        if let Some((decl_start, decl_end)) =
+                            find_ident_bytes_after(source, span.start, name)
+                        {
+                            out.push(LocalBinding {
+                                name: name.clone(),
+                                decl_start,
+                                decl_end,
+                                scope_start,
+                                scope_end,
+                            });
                         }
                     }
-                    spar::ast::ForBinding::Indexed { index_name, index_span, value_name, value_span } => {
-                        if let Some((decl_start, decl_end)) = find_ident_bytes_after(source, index_span.start, index_name) {
-                            out.push(LocalBinding { name: index_name.clone(), decl_start, decl_end, scope_start, scope_end });
+                    spar::ast::ForBinding::Indexed {
+                        index_name,
+                        index_span,
+                        value_name,
+                        value_span,
+                    } => {
+                        if let Some((decl_start, decl_end)) =
+                            find_ident_bytes_after(source, index_span.start, index_name)
+                        {
+                            out.push(LocalBinding {
+                                name: index_name.clone(),
+                                decl_start,
+                                decl_end,
+                                scope_start,
+                                scope_end,
+                            });
                         }
-                        if let Some((decl_start, decl_end)) = find_ident_bytes_after(source, value_span.start, value_name) {
-                            out.push(LocalBinding { name: value_name.clone(), decl_start, decl_end, scope_start, scope_end });
+                        if let Some((decl_start, decl_end)) =
+                            find_ident_bytes_after(source, value_span.start, value_name)
+                        {
+                            out.push(LocalBinding {
+                                name: value_name.clone(),
+                                decl_start,
+                                decl_end,
+                                scope_start,
+                                scope_end,
+                            });
                         }
                     }
                 }
@@ -902,10 +1032,18 @@ fn collect_local_bindings_from_stmts(
             FuncStmt::Try(statement) => {
                 collect_local_bindings_from_stmts(source, masked, &statement.body, out);
                 if let Some(name) = &statement.catch_name {
-                    if let Some((decl_start, decl_end)) = find_ident_bytes_after(source, statement.catch_span.start, name) {
-                        let (scope_start, scope_end) = next_block_bounds(masked, decl_end)
-                            .unwrap_or((decl_end, source.len()));
-                        out.push(LocalBinding { name: name.clone(), decl_start, decl_end, scope_start, scope_end });
+                    if let Some((decl_start, decl_end)) =
+                        find_ident_bytes_after(source, statement.catch_span.start, name)
+                    {
+                        let (scope_start, scope_end) =
+                            next_block_bounds(masked, decl_end).unwrap_or((decl_end, source.len()));
+                        out.push(LocalBinding {
+                            name: name.clone(),
+                            decl_start,
+                            decl_end,
+                            scope_start,
+                            scope_end,
+                        });
                     }
                 }
                 collect_local_bindings_from_stmts(source, masked, &statement.handler, out);
@@ -935,7 +1073,9 @@ fn collect_function_local_bindings(
         return;
     };
     for param in &function.params {
-        if let Some((decl_start, decl_end)) = find_ident_bytes_after(source, param.span.start, &param.name) {
+        if let Some((decl_start, decl_end)) =
+            find_ident_bytes_after(source, param.span.start, &param.name)
+        {
             out.push(LocalBinding {
                 name: param.name.clone(),
                 decl_start,
@@ -949,7 +1089,9 @@ fn collect_function_local_bindings(
 }
 
 fn local_bindings(state: &DocumentState) -> Vec<LocalBinding> {
-    let Some(program) = raw_program_for_source(&state.source) else { return Vec::new(); };
+    let Some(program) = raw_program_for_source(&state.source) else {
+        return Vec::new();
+    };
     let masked = masked_code(&state.source);
     let mut out = Vec::new();
     for item in &program.items {
@@ -1002,16 +1144,27 @@ fn local_bindings(state: &DocumentState) -> Vec<LocalBinding> {
     out
 }
 
-fn local_binding_at_offset(state: &DocumentState, name: &str, offset: usize) -> Option<LocalBinding> {
+fn local_binding_at_offset(
+    state: &DocumentState,
+    name: &str,
+    offset: usize,
+) -> Option<LocalBinding> {
     let mut candidates = local_bindings(state)
         .into_iter()
         .filter(|binding| binding.name == name)
         .filter(|binding| {
             (binding.decl_start <= offset && offset <= binding.decl_end)
-                || (binding.scope_start <= offset && offset <= binding.scope_end && binding.decl_start <= offset)
+                || (binding.scope_start <= offset
+                    && offset <= binding.scope_end
+                    && binding.decl_start <= offset)
         })
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|binding| (binding.scope_end.saturating_sub(binding.scope_start), std::cmp::Reverse(binding.decl_start)));
+    candidates.sort_by_key(|binding| {
+        (
+            binding.scope_end.saturating_sub(binding.scope_start),
+            std::cmp::Reverse(binding.decl_start),
+        )
+    });
     candidates.into_iter().next()
 }
 
@@ -1019,19 +1172,26 @@ fn identifier_occurrences(source: &str, name: &str) -> Vec<(usize, Range)> {
     let masked = masked_code(source);
     let bytes = masked.as_bytes();
     let name_bytes = name.as_bytes();
-    if name_bytes.is_empty() { return Vec::new(); }
+    if name_bytes.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut index = 0usize;
     while index + name_bytes.len() <= bytes.len() {
         if &bytes[index..index + name_bytes.len()] == name_bytes {
-            let before_ok = index == 0 || (!bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_');
+            let before_ok = index == 0
+                || (!bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_');
             let after_at = index + name_bytes.len();
-            let after_ok = after_at == bytes.len() || (!bytes[after_at].is_ascii_alphanumeric() && bytes[after_at] != b'_');
+            let after_ok = after_at == bytes.len()
+                || (!bytes[after_at].is_ascii_alphanumeric() && bytes[after_at] != b'_');
             if before_ok && after_ok {
-                out.push((index, Range {
-                    start: byte_offset_to_lsp_position(source, index),
-                    end: byte_offset_to_lsp_position(source, after_at),
-                }));
+                out.push((
+                    index,
+                    Range {
+                        start: byte_offset_to_lsp_position(source, index),
+                        end: byte_offset_to_lsp_position(source, after_at),
+                    },
+                ));
                 index = after_at;
                 continue;
             }
@@ -1059,7 +1219,9 @@ fn semantic_identifier_occurrences(state: &DocumentState, name: &str) -> Vec<(us
                     start: byte_offset_to_lsp_position(&state.source, start),
                     end: byte_offset_to_lsp_position(&state.source, end),
                 }
-            } else if let Some((ident_start, ident_end)) = find_ident_bytes_after(&state.source, start, name) {
+            } else if let Some((ident_start, ident_end)) =
+                find_ident_bytes_after(&state.source, start, name)
+            {
                 if ident_start >= end.saturating_add(1) {
                     continue;
                 }
@@ -1092,7 +1254,9 @@ fn semantic_target_at(
     index: &WorkspaceIndex,
 ) -> Option<SemanticTarget> {
     let name = word_at_position(&state.source, pos);
-    if name.is_empty() { return None; }
+    if name.is_empty() {
+        return None;
+    }
     if let Some(symbol) = method_symbol_at_position(uri, state, pos, index) {
         let declaration = Location {
             uri: symbol.uri.clone(),
@@ -1112,7 +1276,10 @@ fn semantic_target_at(
             start: byte_offset_to_lsp_position(&state.source, binding.decl_start),
             end: byte_offset_to_lsp_position(&state.source, binding.decl_end),
         };
-        let declaration = Location { uri: uri.clone(), range };
+        let declaration = Location {
+            uri: uri.clone(),
+            range,
+        };
         return Some(SemanticTarget {
             id: SymbolId(format!("{}#local:{}:{}", uri, name, binding.decl_start)),
             name,
@@ -1130,15 +1297,30 @@ fn semantic_target_at(
     let (id, declaration) = if let Some(symbol) = indexed {
         (
             symbol.id.clone(),
-            Location { uri: symbol.uri.clone(), range: symbol.selection_range },
+            Location {
+                uri: symbol.uri.clone(),
+                range: symbol.selection_range,
+            },
         )
     } else {
         (
-            SymbolId(format!("{}#definition:{}:{}:{}", definition_key.uri, name, definition_key.range.start.line, definition_key.range.start.character)),
+            SymbolId(format!(
+                "{}#definition:{}:{}:{}",
+                definition_key.uri,
+                name,
+                definition_key.range.start.line,
+                definition_key.range.start.character
+            )),
             definition_key.clone(),
         )
     };
-    Some(SemanticTarget { id, name, declaration, definition_key, local_decl_byte: None })
+    Some(SemanticTarget {
+        id,
+        name,
+        declaration,
+        definition_key,
+        local_decl_byte: None,
+    })
 }
 
 fn is_assignment_write(source: &str, range: Range) -> bool {
@@ -1156,30 +1338,34 @@ fn semantic_occurrences_in_document(
     let mut out = Vec::new();
     let indexed_target = index.find_by_id(&target.id.0);
     for (offset, range) in semantic_identifier_occurrences(state, &target.name) {
-        let matches = if indexed_target.is_some_and(|symbol| symbol.kind == IndexedSymbolKind::Method) {
-            if uri == &target.declaration.uri && range.start == target.declaration.range.start {
-                true
+        let matches =
+            if indexed_target.is_some_and(|symbol| symbol.kind == IndexedSymbolKind::Method) {
+                if uri == &target.declaration.uri && range.start == target.declaration.range.start {
+                    true
+                } else {
+                    method_symbol_at_position(uri, state, range.start, index)
+                        .is_some_and(|symbol| symbol.id == target.id)
+                }
+            } else if let Some(target_decl) = target.local_decl_byte {
+                uri == &target.declaration.uri
+                    && local_binding_at_offset(state, &target.name, offset)
+                        .is_some_and(|binding| binding.decl_start == target_decl)
             } else {
-                method_symbol_at_position(uri, state, range.start, index)
-                    .is_some_and(|symbol| symbol.id == target.id)
-            }
-        } else if let Some(target_decl) = target.local_decl_byte {
-            uri == &target.declaration.uri
-                && local_binding_at_offset(state, &target.name, offset)
-                    .is_some_and(|binding| binding.decl_start == target_decl)
-        } else {
-            let pos = range.start;
-            indexed_definition_at(uri, state, pos, index)
-                .is_some_and(|location| same_location_key(&location, &target.definition_key))
-        };
-        if !matches { continue; }
-        let role = if uri == &target.declaration.uri && range.start == target.declaration.range.start {
-            SemanticOccurrenceRole::Declaration
-        } else if is_assignment_write(&state.source, range) {
-            SemanticOccurrenceRole::Write
-        } else {
-            SemanticOccurrenceRole::Read
-        };
+                let pos = range.start;
+                indexed_definition_at(uri, state, pos, index)
+                    .is_some_and(|location| same_location_key(&location, &target.definition_key))
+            };
+        if !matches {
+            continue;
+        }
+        let role =
+            if uri == &target.declaration.uri && range.start == target.declaration.range.start {
+                SemanticOccurrenceRole::Declaration
+            } else if is_assignment_write(&state.source, range) {
+                SemanticOccurrenceRole::Write
+            } else {
+                SemanticOccurrenceRole::Read
+            };
         out.push(SemanticOccurrence { range, role });
     }
     out
