@@ -3500,6 +3500,85 @@ var tool: Tool = Tool(command: command, exec: exec, shell: shell);
     }
 
     #[test]
+    fn native_interface_resolves_opaque_types_without_loading_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("native")).unwrap();
+        std::fs::write(root.join("spar.package.spar"), concat!(
+            "struct Package { name: str = \"probe\"; version: str = \"0.1.0\"; kind: str = \"library\"; };\n",
+            "struct Native { module: str = \"nativeProbe\"; abi: str = \"spar-native-1\"; interface: str = \"native/interface.json\"; };\n",
+        )).unwrap();
+        std::fs::write(root.join("native/interface.json"), r#"{
+            "format_version": 1,
+            "module": "nativeProbe",
+            "types": ["ProbeHandle"],
+            "functions": [{"name":"open","params":[],"ret":"ProbeHandle"}]
+        }"#).unwrap();
+        let source = "import nativeProbe;\nfn open() -> ProbeHandle { return nativeProbe.open(); };\n";
+        let state = SparLanguageServer::analyze_path(source, &root.join("src/lib.spar"));
+        assert!(state.errors.is_empty(), "{:?}", state.errors);
+        let symbols = state.symbols.as_ref().expect("native symbols");
+        let items = member_completion_items("nativeProbe.", "nativeProbe.".len(), symbols).unwrap();
+        assert!(items.iter().any(|item| item.label == "open" && item.detail.as_deref() == Some("() -> ProbeHandle")));
+        let call = "nativeProbe.open()";
+        assert_eq!(native_function_hover_at(call, call.find("open").unwrap() + 2, "open", symbols).as_deref(),
+            Some("```spar\nnativeProbe.open() -> ProbeHandle\n```"));
+    }
+
+    #[test]
+    fn broken_native_interface_is_reported_by_language_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("spar.package.spar"),
+            "struct Package { name: str = \"probe\"; version: str = \"0.1.0\"; kind: str = \"library\"; };\nstruct Native { module: str = \"nativeProbe\"; abi: str = \"spar-native-1\"; interface: str = \"native/missing.json\"; };\n").unwrap();
+        let state = SparLanguageServer::analyze_path("fn main() -> int { return 0; };", &root.join("src/lib.spar"));
+        assert!(state.errors.iter().any(|e| e.to_string().contains("native interface")), "{:?}", state.errors);
+    }
+
+    #[test]
+    fn transitive_package_native_types_resolve_from_static_interface() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tcp/src")).unwrap();
+        std::fs::create_dir_all(root.join("tcp/native")).unwrap();
+        std::fs::write(root.join("spar.package.spar"),
+            "struct Package { name: str = \"app\"; version: str = \"0.1.0\"; kind: str = \"application\"; };\nstruct Dependencies { tcp: str = \"path:tcp\"; };\n").unwrap();
+        std::fs::write(root.join("tcp/spar.package.spar"),
+            "struct Package { name: str = \"tcp\"; version: str = \"0.1.0\"; kind: str = \"library\"; };\nstruct Native { module: str = \"nativeProbe\"; abi: str = \"spar-native-1\"; interface: str = \"native/interface.json\"; };\n").unwrap();
+        std::fs::write(root.join("tcp/native/interface.json"), r#"{
+            "format_version":1,"module":"nativeProbe","types":["ProbeHandle"],
+            "functions":[{"name":"open","params":[],"ret":"ProbeHandle"}]
+        }"#).unwrap();
+        std::fs::write(root.join("tcp/src/lib.spar"),
+            "import nativeProbe;\nfn open() -> ProbeHandle { return nativeProbe.open(); };\n").unwrap();
+        let mut lock = spar::package::Lockfile::default();
+        lock.root.insert("tcp".into(), "tcp@0.1.0".into());
+        lock.packages.insert("tcp@0.1.0".into(), spar::package::LockedPackage {
+            name: "tcp".into(), version: "0.1.0".into(),
+            source: spar::package::LockedSource::Path { path: root.join("tcp").to_string_lossy().into_owned() },
+            integrity: None, entry: "src/lib.spar".into(), dependencies: Default::default(),
+        });
+        lock.write_atomically(&root.join("spar.package.lock.spar")).unwrap();
+        let source = "import pkg { open } from \"tcp\";\nfn main() -> ProbeHandle { return open(); };\n";
+        let state = SparLanguageServer::analyze_path(source, &root.join("src/main.spar"));
+        assert!(state.errors.is_empty(), "{:?}", state.errors);
+    }
+
+    #[test]
+    fn native_manifest_completion_uses_camel_case_targets() {
+        let source = "struct Native {\n    \n};\n";
+        let items = package_metadata_completion_items(
+            std::path::Path::new("spar.package.spar"), source, source.find("    ").unwrap() + 4,
+        ).unwrap();
+        assert!(items.iter().any(|item| item.label == "linuxX8664Gnu"));
+        assert!(items.iter().any(|item| item.label == "interface"));
+        assert!(!items.iter().any(|item| item.label.contains('_')));
+    }
+
+    #[test]
     fn manifest_runtime_errors_are_diagnostics() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("spar.package.spar");
@@ -3987,6 +4066,17 @@ impl SparLanguageServer {
         };
 
         let word = word_at_position(&state.source, pos);
+        if let Some(value) = native_function_hover_at(
+            &state.source,
+            lsp_pos_to_byte_offset(&state.source, pos),
+            &word,
+            symbols,
+        ) {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value }),
+                range: None,
+            }));
+        }
 
         if !word.is_empty() {
             if let Some(program) = &state.ast {

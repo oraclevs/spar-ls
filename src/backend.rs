@@ -10,18 +10,38 @@ struct SparLanguageServer {
 }
 
 impl SparLanguageServer {
-    fn attach_package_locator(options: &mut CompileOptions, base_dir: &std::path::Path) {
-        let project_dir = base_dir
-            .ancestors()
-            .find(|directory| directory.join(spar::package::PACKAGE_MANIFEST_FILE).is_file());
+    fn attach_package_locator(
+        options: &mut CompileOptions,
+        base_dir: &std::path::Path,
+    ) -> Option<String> {
+        let project_dir = base_dir.ancestors().find(|directory| {
+            directory
+                .join(spar::package::PACKAGE_MANIFEST_FILE)
+                .is_file()
+        });
         if let Some(project_dir) = project_dir {
             let lock_path = project_dir.join(spar::package::PACKAGE_LOCK_FILE);
-            if let Ok(lockfile) = spar::package::Lockfile::read(&lock_path) {
-                let store =
-                    spar::package::PackageStore::new(spar::package::StorePaths::from_env());
-                options.locator = Some(spar::package::ModuleLocator::for_root(lockfile, store));
-            }
+            let locked = if let Ok(lockfile) = spar::package::Lockfile::read(&lock_path) {
+                let store = spar::package::PackageStore::new(spar::package::StorePaths::from_env());
+                options.locator = Some(spar::package::ModuleLocator::for_root(
+                    lockfile.clone(),
+                    store.clone(),
+                ));
+                Some((lockfile, store))
+            } else {
+                None
+            };
+            // Static signatures are safe to read on each edit: this never loads
+            // or executes package machine code in the editor process.
+            return spar::package::native::load_project_native_interfaces(
+                project_dir,
+                locked.as_ref().map(|(lock, store)| (lock, store)),
+                &mut options.natives,
+            )
+            .err()
+            .map(|error| error.to_string());
         }
+        None
     }
 
     fn compile_options(base_dir: &std::path::Path) -> CompileOptions {
@@ -29,17 +49,23 @@ impl SparLanguageServer {
             base_dir: base_dir.to_path_buf(),
             ..CompileOptions::default()
         };
-        Self::attach_package_locator(&mut options, base_dir);
+        let _ = Self::attach_package_locator(&mut options, base_dir);
         options
     }
 
-    fn compile_options_for_path(path: &std::path::Path) -> CompileOptions {
+    fn compile_options_for_path_with_error(
+        path: &std::path::Path,
+    ) -> (CompileOptions, Option<String>) {
         let mut options = CompileOptions::for_path(path);
-        Self::attach_package_locator(
+        let error = Self::attach_package_locator(
             &mut options,
             path.parent().unwrap_or(std::path::Path::new(".")),
         );
-        options
+        (options, error)
+    }
+
+    fn compile_options_for_path(path: &std::path::Path) -> CompileOptions {
+        Self::compile_options_for_path_with_error(path).0
     }
 
     fn analyze(source: &str, base_dir: &std::path::Path) -> DocumentState {
@@ -55,9 +81,17 @@ impl SparLanguageServer {
 
     fn analyze_path(source: &str, path: &std::path::Path) -> DocumentState {
         let base_dir = path.parent().unwrap_or(std::path::Path::new("."));
-        let compilation = Compiler::new(Self::compile_options_for_path(path)).compile(source);
+        let (options, interface_error) = Self::compile_options_for_path_with_error(path);
+        let compilation = Compiler::new(options).compile(source);
         let needs_repair = compilation.symbols.is_none();
         let mut state = Self::document_state(source, base_dir, compilation);
+        if let Some(message) = interface_error {
+            state.errors.push(SparError::TypeError {
+                message: format!("native interface: {message}"),
+                hint: None,
+                span: Span::new(0, 0, 1, 1),
+            });
+        }
         if needs_repair {
             state.repaired_symbols =
                 Self::repaired_symbols(source, Self::compile_options_for_path(path));
@@ -78,7 +112,7 @@ impl SparLanguageServer {
             let Ok(import_source) = std::fs::read_to_string(full_path) else {
                 continue;
             };
-            let mut options = CompileOptions::for_path(full_path);
+            let mut options = Self::compile_options_for_path(full_path);
             options.evaluate = false;
             options.locator = loaded.locator.clone();
             let imported = Compiler::new(options).compile(&import_source);
@@ -109,7 +143,9 @@ impl SparLanguageServer {
                     };
                     if matches!(
                         decl.kind,
-                        spar::ast::ImportKind::Aliased(_) | spar::ast::ImportKind::Bare(_) | spar::ast::ImportKind::Schema
+                        spar::ast::ImportKind::Aliased(_)
+                            | spar::ast::ImportKind::Bare(_)
+                            | spar::ast::ImportKind::Schema
                     ) {
                         continue;
                     }
@@ -117,7 +153,7 @@ impl SparLanguageServer {
                         let full_path = resolved.path;
                         spliced_import_paths.insert(decl.path.clone(), full_path.clone());
                         if let Ok(target_source) = std::fs::read_to_string(&full_path) {
-                            let mut options = CompileOptions::for_path(&full_path);
+                            let mut options = Self::compile_options_for_path(&full_path);
                             options.evaluate = false;
                             options.locator = resolved.locator;
                             let target = Compiler::new(options).compile(&target_source);
@@ -179,7 +215,10 @@ impl SparLanguageServer {
     }
 
     async fn index_document(&self, uri: &Url, state: &DocumentState) {
-        self.workspace_index.lock().await.replace_document(uri, state);
+        self.workspace_index
+            .lock()
+            .await
+            .replace_document(uri, state);
     }
 
     async fn remove_indexed_document(&self, uri: &Url) {
@@ -253,23 +292,33 @@ impl SparLanguageServer {
 
     async fn index_bundled_stdlib(&self) {
         for module in spar::bundled_stdlib_module_names() {
-            let Some(path) = spar::resolve_bundled_stdlib_import(&module) else { continue; };
-            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
+            let Some(path) = spar::resolve_bundled_stdlib_import(&module) else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let state = Self::analyze_path(&source, &path);
-            let Ok(uri) = Url::from_file_path(&path) else { continue; };
+            let Ok(uri) = Url::from_file_path(&path) else {
+                continue;
+            };
             self.index_document(&uri, &state).await;
         }
     }
 
     async fn index_visible_package_modules(&self, project_dir: &std::path::Path) {
         let lock_path = project_dir.join(spar::package::PACKAGE_LOCK_FILE);
-        let Ok(lockfile) = spar::package::Lockfile::read(&lock_path) else { return; };
+        let Ok(lockfile) = spar::package::Lockfile::read(&lock_path) else {
+            return;
+        };
         let store = spar::package::PackageStore::new(spar::package::StorePaths::from_env());
         let locator = spar::package::ModuleLocator::for_root(lockfile, store);
         let mut files = HashSet::<PathBuf>::new();
 
         fn walk_spar(dir: &std::path::Path, out: &mut HashSet<PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return; };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -281,7 +330,9 @@ impl SparLanguageServer {
         }
 
         for alias in locator.visible_import_aliases() {
-            let Some(entry) = locator.resolve_import(project_dir, &alias) else { continue; };
+            let Some(entry) = locator.resolve_import(project_dir, &alias) else {
+                continue;
+            };
             if let Some(module_root) = entry.parent() {
                 walk_spar(module_root, &mut files);
             } else {
@@ -292,9 +343,13 @@ impl SparLanguageServer {
         let mut files = files.into_iter().collect::<Vec<_>>();
         files.sort();
         for path in files {
-            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let state = Self::analyze_path(&source, &path);
-            let Ok(uri) = Url::from_file_path(&path) else { continue; };
+            let Ok(uri) = Url::from_file_path(&path) else {
+                continue;
+            };
             self.index_document(&uri, &state).await;
         }
     }
@@ -326,7 +381,11 @@ impl SparLanguageServer {
             .filter_map(|path| {
                 path.ancestors()
                     .take_while(|ancestor| ancestor.starts_with(root))
-                    .find(|ancestor| ancestor.join(spar::package::PACKAGE_MANIFEST_FILE).is_file())
+                    .find(|ancestor| {
+                        ancestor
+                            .join(spar::package::PACKAGE_MANIFEST_FILE)
+                            .is_file()
+                    })
                     .map(std::path::Path::to_path_buf)
             })
             .collect::<HashSet<_>>()

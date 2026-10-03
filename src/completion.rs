@@ -25,10 +25,17 @@ fn package_metadata_completion_items(
 ) -> Option<Vec<CompletionItem>> {
     let file_name = path.file_name()?.to_str()?;
     let prefix = source.get(..offset)?;
-    let (struct_at, manifest_struct) = ["Package", "Dependencies", "Overrides", "Runtime", "Lock"]
-        .into_iter()
-        .filter_map(|name| prefix.rfind(&format!("struct {name}")).map(|at| (at, name)))
-        .max_by_key(|(at, _)| *at)?;
+    let (struct_at, manifest_struct) = [
+        "Package",
+        "Dependencies",
+        "Overrides",
+        "Native",
+        "Runtime",
+        "Lock",
+    ]
+    .into_iter()
+    .filter_map(|name| prefix.rfind(&format!("struct {name}")).map(|at| (at, name)))
+    .max_by_key(|(at, _)| *at)?;
     let struct_prefix = &prefix[struct_at..];
     if struct_prefix.matches('{').count() <= struct_prefix.matches('}').count() {
         return None;
@@ -84,6 +91,42 @@ fn package_metadata_completion_items(
             ("version", "version: \"${1:0.1.0}\";"),
             ("kind", "kind: \"${1:application}\";"),
             ("entry", "entry: \"${1:src/main.spar}\";"),
+        ],
+        (spar::package::PACKAGE_MANIFEST_FILE, "Native") => &[
+            ("module", "module: str = \"${1:nativeModule}\";"),
+            ("abi", "abi: str = \"spar-native-1\";"),
+            (
+                "capabilities",
+                "capabilities: str = \"${1:strings,bytes,resources}\";",
+            ),
+            (
+                "interface",
+                "interface: str = \"${1:native/interface.json}\";",
+            ),
+            (
+                "linuxX8664Gnu",
+                "linuxX8664Gnu: str = \"${1:native/linux_x86_64_gnu/module.so}\";",
+            ),
+            (
+                "linuxX8664Musl",
+                "linuxX8664Musl: str = \"${1:native/linux_x86_64_musl/module.so}\";",
+            ),
+            (
+                "linuxAarch64Gnu",
+                "linuxAarch64Gnu: str = \"${1:native/linux_aarch64_gnu/module.so}\";",
+            ),
+            (
+                "macosX8664",
+                "macosX8664: str = \"${1:native/macos_x86_64/module.dylib}\";",
+            ),
+            (
+                "macosAarch64",
+                "macosAarch64: str = \"${1:native/macos_aarch64/module.dylib}\";",
+            ),
+            (
+                "windowsX8664Msvc",
+                "windowsX8664Msvc: str = \"${1:native/windows_x86_64_msvc/module.dll}\";",
+            ),
         ],
         (spar::package::PACKAGE_MANIFEST_FILE, "Dependencies") => &[
             (
@@ -1124,6 +1167,32 @@ fn member_completion_items(
         return Some(Vec::new());
     }
 
+    let mut native_functions = symbols
+        .natives
+        .iter()
+        .filter(|((module, _), signature)| module == base && !signature.private)
+        .map(|((_, name), signature)| CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some(format!(
+                "({}) -> {}",
+                signature
+                    .params
+                    .iter()
+                    .map(|(param, ty)| format!("{param}: {}", format_spar_type(ty)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                format_spar_type(&signature.ret)
+            )),
+            insert_text: Some(name.clone()),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    if !native_functions.is_empty() {
+        native_functions.sort_by(|a, b| a.label.cmp(&b.label));
+        return Some(native_functions);
+    }
+
     if let Some(group) = symbols.function_groups.get(base) {
         return Some(function_completion_items(&group.functions, false));
     }
@@ -1173,6 +1242,55 @@ fn member_completion_items(
             })
             .collect(),
     )
+}
+
+fn native_function_hover_at(
+    source: &str,
+    offset: usize,
+    word: &str,
+    symbols: &SymbolTable,
+) -> Option<String> {
+    if word.is_empty() || offset > source.len() {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut start = offset;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    if !source.get(start..)?.starts_with(word) {
+        return None;
+    }
+    let module_end = if start > 0 && bytes[start - 1] == b'.' {
+        start - 1
+    } else if start >= 2 && &bytes[start - 2..start] == b"::" {
+        start - 2
+    } else {
+        return None;
+    };
+    let mut module_start = module_end;
+    while module_start > 0
+        && (bytes[module_start - 1].is_ascii_alphanumeric() || bytes[module_start - 1] == b'_')
+    {
+        module_start -= 1;
+    }
+    let module = source.get(module_start..module_end)?;
+    let signature = symbols
+        .natives
+        .get(&(module.to_string(), word.to_string()))?;
+    if signature.private {
+        return None;
+    }
+    let params = signature
+        .params
+        .iter()
+        .map(|(name, ty)| format!("{name}: {}", format_spar_type(ty)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "```spar\n{module}.{word}({params}) -> {}\n```",
+        format_spar_type(&signature.ret)
+    ))
 }
 
 fn type_keyword_items() -> Vec<CompletionItem> {
