@@ -1295,7 +1295,7 @@ fn native_function_hover_at(
 
 fn type_keyword_items() -> Vec<CompletionItem> {
     [
-        "int", "float", "str", "bool", "Any", "Record", "List", "Map", "Option", "Result",
+        "int", "float", "str", "bool", "Any", "Record", "List", "Map", "Option", "Result", "ShellResult",
     ]
     .iter()
     .map(|kw| CompletionItem {

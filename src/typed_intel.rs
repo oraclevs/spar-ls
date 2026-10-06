@@ -203,6 +203,7 @@ fn builtin_type_doc(name: &str) -> Option<&'static str> {
         "Map" => "```spar\nMap<K, V>\n```\nKey/value map that keeps insertion order.",
         "Option" => "```spar\nOption<T>\n```\nEither `some(value: x)` or `none()`.",
         "Result" => "```spar\nResult<T, E>\n```\nEither `ok(value: x)` or `err(error: e)`.",
+        "ShellResult" => "```spar\nShellResult<T, E>\n```\nA shell function runs bare commands in its body. Return `ok(value: x)` to pipe data or `err(error: e)` to write stderr and fail.",
         "Record" => "```spar\nRecord\n```\nDynamic object whose fields are typed at runtime. Read fields with `.asStr()`, `.asInt()`, `.asFloat()`, `.asBool()`, `.asList()`.",
         "Promise" => "```spar\nPromise<T>\n```\nResult of an `async` call; use `await` to get the `T`.",
         "Table" => "```spar\nTable<Row>\n```\nRows with a schema; supports `where`, `select`, `sortBy`, `groupBy`.",
